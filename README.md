@@ -30,6 +30,7 @@ owns everything.
 | 🧵 **Per-topic sessions** | Every forum topic is an independent session — one conversation per `(chat, topic)`. |
 | ⏩ **Zero command remapping** | Unknown `/commands` go verbatim to the CLI: `/compact`, skills, anything headless. `/context`-style output is relayed. |
 | 🔘 **Buttons instead of a TUI** | Permissions, plan approval, clarifying questions — all inline buttons via one generic `can_use_tool` bridge. |
+| 💬 **Chat-native ergonomics** | Reply to any message to quote it into context; messages sent mid-turn are queued, never dropped. |
 | 🎤 **Voice messages** | Local faster-whisper, bilingual zh/en, editable 🎤 transcript. No audio leaves your machine. |
 | 🖼 **Native media** | Images ride inside the message as base64 blocks, lifecycle owned by the CLI transcript; other files get a TTL-cleaned media dir. |
 | 📟 **Live status** | One `⏳ Working…` message edited in place, morphing into the reply; elapsed ticker for long commands. |
