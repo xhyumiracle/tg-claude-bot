@@ -83,18 +83,51 @@ Telegram ── python-telegram-bot ── bot.py (stateless router)
 All session state lives in the CLI's own files. The bot holds nothing worth
 losing: kill it, redeploy it, nothing is forgotten.
 
-## Setup
+## Quick start
+
+You already run Claude Code — it's the prerequisite — so the fastest path is
+letting it install its own bridge. Paste this into Claude Code **on the machine
+that should host the bot**:
+
+> Set up https://github.com/xhyumiracle/tg-claude-bot for me: clone it, install
+> dependencies with uv (ask me whether I want voice-message support), walk me
+> through creating a bot with @BotFather and finding my numeric Telegram user
+> id, fill in `.env`, then run it (or install the systemd unit) and stay with
+> me until `/status` answers on my phone.
+
+It will drive the whole checklist below and you only tap @BotFather.
+
+### Manual setup
+
+**1. Prerequisites** — a machine with the
+[Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and
+logged in, plus [uv](https://docs.astral.sh/uv/).
+
+**2. Create your bot** — message [@BotFather](https://t.me/BotFather) →
+`/newbot` → copy the token. For use inside a group, also either disable privacy
+mode (`/setprivacy` → Disable) or make the bot a group admin, so it can see
+messages.
+
+**3. Find your user id** — message [@userinfobot](https://t.me/userinfobot);
+it replies with your numeric id.
+
+**4. Install & configure**
 
 ```bash
 git clone https://github.com/xhyumiracle/tg-claude-bot && cd tg-claude-bot
-uv sync
-cp .env.example .env   # fill in TG_BOT_TOKEN and OWNER_USER_ID at minimum
-uv run python bot.py   # or adapt and install tg-claude-bot.service
+uv sync                 # add --extra voice for local voice transcription
+cp .env.example .env    # fill in TG_BOT_TOKEN and OWNER_USER_ID at minimum
 ```
 
-Requirements: a machine where the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)
-is installed and logged in, a bot token from [@BotFather](https://t.me/BotFather),
-and your numeric Telegram user id.
+**5. Run it**
+
+```bash
+uv run python bot.py
+```
+
+DM your bot `/status` — you're live. For always-on operation, adapt the paths
+in [tg-claude-bot.service](tg-claude-bot.service) and install it as a systemd
+unit.
 
 ### Configuration
 

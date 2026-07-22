@@ -124,7 +124,12 @@ _whisper_model = None
 def _get_whisper():
     global _whisper_model
     if _whisper_model is None:
-        from faster_whisper import WhisperModel
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError:
+            raise RuntimeError(
+                "voice support not installed — run: uv sync --extra voice"
+            )
         _whisper_model = WhisperModel(
             WHISPER_MODEL, device="cpu", compute_type="int8"
         )
