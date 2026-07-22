@@ -199,7 +199,7 @@ async def ask_buttons(
     except Exception:
         log.exception("ask_buttons send failed")
         return None
-    pending_btns[token] = (fut, msg, allowed_user)
+    pending_btns[token] = (fut, msg, allowed_user, len(options))
     try:
         return await asyncio.wait_for(fut, timeout=timeout)
     except asyncio.TimeoutError:
@@ -471,7 +471,8 @@ def make_permission_cb(conv: Conversation):
         path = extract_path(tool_input)
         if tool_name in READ_TOOLS:
             # an absolute or traversing glob pattern can escape the scoped dirs
-            pat = str(tool_input.get("pattern") or "")
+            # (Glob only: Grep patterns are regexes, where ".." is legitimate)
+            pat = str(tool_input.get("pattern") or "") if tool_name == "Glob" else ""
             pat_ok = not (pat.startswith(("/", "~")) or ".." in pat)
             if pat_ok:
                 if any(is_under(path, d)
@@ -1261,17 +1262,25 @@ async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     uid = q.from_user.id if q.from_user else 0
     data = q.data or ""
     if data.startswith("bt:"):
-        _, token, idx = data.split(":", 2)
+        try:
+            _, token, idx_s = data.split(":", 2)
+            idx = int(idx_s)
+        except ValueError:
+            await q.answer()
+            return
         entry = pending_btns.get(token)
         if entry is None:
             await q.answer("Expired.")
             return
-        fut, _msg, allowed_user = entry
+        fut, _msg, allowed_user, n_opts = entry
         if uid != OWNER_ID and uid != allowed_user:
             await q.answer("This prompt isn't for you.")
             return
+        if not 0 <= idx < n_opts:
+            await q.answer()
+            return
         if not fut.done():
-            fut.set_result(int(idx))
+            fut.set_result(idx)
         await q.answer("OK")
         try:
             await q.edit_message_reply_markup(reply_markup=None)

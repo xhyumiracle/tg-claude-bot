@@ -2,7 +2,10 @@
 
 **Auditor:** Claude (Fable 5) — the model this bot bridges, reviewing its own bridge.
 **Date:** 2026-07-22
-**Scope:** full line-by-line review of `bot.py`, `tg-claude-bot.service`, setup docs, and `.env` handling, over two iterative passes with fixes between them.
+**Scope:** full line-by-line review of `bot.py`, `tg-claude-bot.service`, setup docs,
+and `.env` handling — three passes: two review-and-fix rounds, then a final-state
+verification round that (a) mechanically asserted every prior fix is present in the
+shipped tree and (b) re-reviewed the code the fixes themselves introduced.
 
 > Honest framing: this is an **AI self-audit**, not a third-party professional
 > audit. Its value is a complete, systematic pass over every trust boundary by
@@ -46,6 +49,13 @@
 | 6 | Low | Transient voice/image files in `/tmp` were world-readable | `umask 077` at startup |
 | 7 | Low | Guests couldn't answer `AskUserQuestion` buttons (owner-only check), stalling their turns | Question buttons pressable by the turn's initiator |
 | 8 | Info | Sender-prefix impersonation inside message bodies could confuse the model (never the permission layer) | Guest system prompt pins the outermost bridge prefix as the only authority |
+| 9 | Low | Button callbacks accepted an unvalidated index: a prompted user forging `callback_data` could crash the turn (`labels[idx]` out of range) | Option count stored per prompt; index parsed and bounds-checked before delivery |
+| 10 | Info | Round-2 glob gate over-matched: Grep *regex* patterns containing `..` lost auto-allow (false positive, availability only) | Gate scoped to Glob patterns; Grep regexes exempt |
+
+**Final-state verification:** after the last fix, all 10 findings were re-checked
+against the shipped tree with mechanical assertions (13 checks, all passing), and
+the fix-introduced code paths were re-reviewed. No known unfixed issues remain
+within the threat model below.
 
 ## Accepted risks (by design, documented)
 
