@@ -120,11 +120,13 @@ _LOCAL_OUT_RE = re.compile(
 )
 
 
-def _render_local_output(text: str) -> str:
-    """Telegram doesn't render markdown tables; compact them to aligned
-    monospace text and strip heading/bold markup (generic, command-agnostic)."""
+def _tg_markdown(text: str) -> str:
+    """Telegram renders neither markdown tables nor #/** markup. Applied to
+    every outgoing segment: table blocks become fenced aligned monospace,
+    headings and ** become Telegram bold; existing fences are left alone."""
     out: list = []
     table: list = []
+    in_fence = False
 
     def flush_table() -> None:
         if not table:
@@ -132,24 +134,32 @@ def _render_local_output(text: str) -> str:
         ncols = max(len(r) for r in table)
         widths = [max((len(r[i]) for r in table if i < len(r)), default=0)
                   for i in range(ncols)]
+        out.append("```")
         for r in table:
             out.append("  ".join(
                 c.ljust(widths[i]) for i, c in enumerate(r)).rstrip())
+        out.append("```")
         table.clear()
 
     for line in text.splitlines():
         s = line.strip()
-        if s.startswith("|") and s.endswith("|") and len(s) > 1:
-            if re.fullmatch(r"\|[\s:|-]+\|", s):
-                continue  # separator row
-            table.append([c.strip() for c in s.strip("|").split("|")])
+        if s.startswith("```"):
+            flush_table()
+            in_fence = not in_fence
+            out.append(line)
             continue
-        flush_table()
-        s = re.sub(r"\*\*(.+?)\*\*", r"\1", line)
-        s = re.sub(r"^\s*#+\s*", "", s)
-        out.append(s.rstrip())
+        if not in_fence:
+            if s.startswith("|") and s.endswith("|") and len(s) > 1:
+                if not re.fullmatch(r"\|[\s:|-]+\|", s):
+                    table.append([c.strip() for c in s.strip("|").split("|")])
+                continue
+            flush_table()
+            if s.startswith("#"):
+                line = re.sub(r"^\s*#+\s*(.*?)\s*$", r"*\1*", line)
+            line = re.sub(r"\*\*(.+?)\*\*", r"*\1*", line)
+        out.append(line)
     flush_table()
-    return "\n".join(out).strip()
+    return "\n".join(out)
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "large-v3-turbo")
@@ -819,7 +829,7 @@ async def run_turn(
                 buf.clear()
                 if seg.startswith("<pass>"):
                     seg = ""
-                await status.finalize(update, seg)
+                await status.finalize(update, _tg_markdown(seg))
                 status = LiveStatus()
 
             async for m in client.receive_response():
@@ -867,8 +877,7 @@ async def run_turn(
                     for t in texts:
                         for out in _LOCAL_OUT_RE.findall(t):
                             if out.strip():
-                                buf.append(
-                                    f"```\n{_render_local_output(out)}\n```")
+                                buf.append(out.strip())
             ticker_task.cancel()
             await flush_segment()
             await check_context_usage(update, conv)
