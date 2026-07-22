@@ -14,11 +14,6 @@ keep every tool and skill, answer prompts with buttons, talk by voice.
 ![No database](https://img.shields.io/badge/database-none-lightgrey.svg)
 [![Security: self-audited by Fable 5](https://img.shields.io/badge/security-audited%20by%20Fable%205-8A2BE2.svg)](SECURITY_AUDIT.md)
 
-<br>
-
-<img alt="Resume any CLI session from your phone" src="assets/demo-resume.jpg" width="46%">&nbsp;
-<img alt="Voice in, clarifying questions as buttons" src="assets/demo-question.jpg" width="46%">
-
 </div>
 
 ---
@@ -27,6 +22,10 @@ Messaging the bot is like typing `claude` in a shell: fresh session, same
 tools, skills, and config — it *is* your local CLI. `/resume` picks up any
 session you left in the terminal. The bot is a thin stateless router; the CLI
 owns everything.
+
+<p align="center">
+  <img alt="A voice message becomes a transcript, live status, and Claude's clarifying question as buttons" src="assets/demo-question.jpg" width="340">
+</p>
 
 ## ✨ Highlights
 
