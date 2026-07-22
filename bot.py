@@ -604,10 +604,39 @@ async def _context_limit(conv: Conversation) -> int:
     return 200_000
 
 
-async def check_context_usage(update: Update, conv: Conversation, usage: dict) -> None:
-    total = ((usage.get("input_tokens") or 0)
-             + (usage.get("cache_read_input_tokens") or 0)
-             + (usage.get("cache_creation_input_tokens") or 0))
+def _session_context_tokens(sid: Optional[str]) -> int:
+    """Current context size = usage of the LAST assistant API call in the transcript."""
+    if not sid:
+        return 0
+    for f in PROJECTS_ROOT.glob(f"*/{sid}.jsonl"):
+        try:
+            with f.open("rb") as fh:
+                try:
+                    fh.seek(-262144, os.SEEK_END)
+                except OSError:
+                    fh.seek(0)
+                tail = fh.read().decode("utf-8", errors="ignore")
+        except OSError:
+            return 0
+        for line in reversed(tail.splitlines()):
+            if '"usage"' not in line:
+                continue
+            try:
+                u = json.loads(line).get("message", {}).get("usage") or {}
+            except Exception:
+                continue
+            if u.get("input_tokens") is None:
+                continue
+            total = ((u.get("input_tokens") or 0)
+                     + (u.get("cache_read_input_tokens") or 0)
+                     + (u.get("cache_creation_input_tokens") or 0))
+            if total > 0:  # skip synthetic zero-usage records
+                return total
+    return 0
+
+
+async def check_context_usage(update: Update, conv: Conversation) -> None:
+    total = await asyncio.to_thread(_session_context_tokens, conv.session_id)
     if not total:
         return
     limit = await _context_limit(conv)
@@ -632,7 +661,7 @@ async def check_context_usage(update: Update, conv: Conversation, usage: dict) -
 
 async def run_turn(
     update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str,
-    blocks: Optional[list] = None,
+    blocks: Optional[list] = None, status_text: Optional[str] = None,
 ) -> None:
     conv = get_conv(update)
     if conv.lock.locked():
@@ -671,6 +700,24 @@ async def run_turn(
             else:
                 await client.query(text)
             status = LiveStatus()
+            if status_text:
+                await status.update(update, status_text)
+            turn_start = time.time()
+
+            async def _ticker() -> None:
+                while True:
+                    await asyncio.sleep(5)
+                    if status.msg is None or time.time() - status.last < 5:
+                        continue
+                    base = status.text.split(" · ")[0]
+                    stamped = f"{base} · {int(time.time() - turn_start)}s"
+                    try:
+                        await status.msg.edit_text(stamped)
+                        status.text = stamped
+                    except Exception:
+                        pass
+
+            ticker_task = asyncio.create_task(_ticker())
             buf: list[str] = []
             n_tools = 0
 
@@ -683,14 +730,10 @@ async def run_turn(
                 await status.finalize(update, seg)
                 status = LiveStatus()
 
-            turn_usage: dict = {}
             async for m in client.receive_response():
                 sid = getattr(m, "session_id", None)
                 if sid and sid != conv.session_id:
                     conv.session_id = sid
-                u = getattr(m, "usage", None)
-                if isinstance(u, dict) and u.get("input_tokens") is not None:
-                    turn_usage = u
                 if (getattr(m, "subtype", "") == "init"
                         and isinstance(getattr(m, "data", None), dict)):
                     conv.current_model = m.data.get("model") or conv.current_model
@@ -726,9 +769,14 @@ async def run_turn(
                         for out in _LOCAL_OUT_RE.findall(t):
                             if out.strip():
                                 buf.append(out.strip())
+            ticker_task.cancel()
             await flush_segment()
-            await check_context_usage(update, conv, turn_usage)
+            await check_context_usage(update, conv)
         except Exception as e:
+            try:
+                ticker_task.cancel()
+            except NameError:
+                pass
             log.exception("claude error for %s", conv.key)
             await drop_client(conv)
             if update.effective_chat.type == "private":
@@ -1257,7 +1305,8 @@ async def on_unknown_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
             await msg.reply_text(body)
         return
     log.info("passthrough %s from %s", text.split()[0], update.effective_user.id)
-    await run_turn(update, ctx, text)
+    await run_turn(update, ctx, text,
+                   status_text=f"⏳ {text.split()[0]} running…")
 
 
 async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
