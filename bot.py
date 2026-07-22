@@ -1627,6 +1627,7 @@ async def post_init(app: Application) -> None:
         BotCommand("new", "Start a new session"),
         BotCommand("status", "Show current session binding"),
         BotCommand("stop", "Interrupt the current turn (ESC)"),
+        BotCommand("esc", "Same as /stop"),
         BotCommand("model", "Set the model for this conversation"),
         BotCommand("effort", "Set effort level for this conversation"),
         BotCommand("compact", "Clear history but keep a summary in context"),
