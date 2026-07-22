@@ -12,6 +12,7 @@ keep every tool and skill, answer prompts with buttons, talk by voice.
 [![Built on claude-agent-sdk](https://img.shields.io/badge/built%20on-claude--agent--sdk-d97757.svg)](https://github.com/anthropics/claude-agent-sdk-python)
 ![Single file](https://img.shields.io/badge/single%20file-~1.6k%20lines-brightgreen.svg)
 ![No database](https://img.shields.io/badge/database-none-lightgrey.svg)
+[![Security: self-audited by Fable 5](https://img.shields.io/badge/security-audited%20by%20Fable%205-8A2BE2.svg)](SECURITY_AUDIT.md)
 
 </div>
 
@@ -149,6 +150,9 @@ All in `.env` (see [.env.example](.env.example)):
 - Session management commands are owner-gated everywhere.
 - Voice notes are transcribed locally and deleted; images follow the CLI's
   transcript retention.
+- Full threat model, verified controls, and accepted risks:
+  [SECURITY_AUDIT.md](SECURITY_AUDIT.md) — a line-by-line self-audit by the
+  model this bot bridges.
 
 ## Non-goals
 
