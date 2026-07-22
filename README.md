@@ -41,55 +41,6 @@ owns everything.
 | ♻️ **Graceful deploys** | Restarts wait until every conversation is idle; in-flight replies are never lost. |
 | 🔒 **Owner/guest profiles** | Allowlisted chats only; owner full access, guests scoped with Allow/Deny escalation to the owner. |
 
-## ⚖️ How it compares
-
-| | **tg-claude-bot** | tmux-scraping bridges | direct-API bots |
-|---|---|---|---|
-| Backend | Claude Agent SDK — structured events | live TUI + ANSI scraping | raw Anthropic API |
-| Sessions | ✅ resume *any* session in the CLI store, AI titles | ⚠️ only the live pane you attach to | ❌ its own separate history |
-| Tools, skills, MCP | ✅ everything the CLI has | ✅ | ❌ reimplemented, if at all |
-| Interactive prompts | ✅ native inline buttons — permissions, plan approval, clarifying questions | ⚠️ relayed TUI screen + simulated keypresses | n/a |
-| Voice messages | ✅ local whisper, bilingual | ❌ | cloud STT, if any |
-| Forum topics = sessions | ✅ one session per topic | ❌ | ❌ |
-| Survives bot restarts | ✅ stateless — nothing to lose | ⚠️ bridge dies with tmux | ⚠️ needs a database |
-| Moving parts | one Python file | tmux + parser + bot | bot + DB + API glue |
-
-Deliberate trade-off: no attaching to a *live* terminal (what tmux bridges
-like [ccbot](https://github.com/six-ddc/ccbot) do) — in exchange, structured
-events and statelessness.
-
-<p align="center">
-  <img alt="A voice message becomes a transcript, live status, and Claude's clarifying question as buttons" src="assets/demo-question.jpg" width="340">
-  <br>
-  <em>One turn, end to end: voice → local transcript → live status → clarifying question as buttons.</em>
-</p>
-
-## ⌨️ Commands
-
-| Command | What it does |
-|---|---|
-| `/resume` | Inline session picker (titles, project, age); `/resume <id>` binds directly |
-| `/new` | Start a fresh session in this chat/topic |
-| `/status` | Current binding: session, project, model, effort |
-| `/model` | Live model picker — real names and context windows from `/v1/models` |
-| `/effort` | Reasoning-effort picker — levels discovered from the CLI itself |
-| `/usage` | Subscription limits (5h / weekly / per-model / credits) |
-| `/whisper` | Pick the voice-transcription model |
-| `/stop` (`/esc`) | Interrupt the current turn — the CLI's ESC |
-| anything else | Forwarded verbatim to the CLI: `/compact`, `/context`, `/cost`, your skills… |
-
-`/` autocompletes in Telegram — the menu is registered via `setMyCommands`.
-
-## 🏗 Architecture
-
-```
-Telegram ── python-telegram-bot ── bot.py (stateless router)
-                                     │  claude-agent-sdk (one client per chat/topic)
-                                     └─ Claude Code CLI ── ~/.claude/projects/*.jsonl
-```
-
-All state lives in the CLI's own files; kill the bot, nothing is forgotten.
-
 ## 🚀 Quick start
 
 Claude Code is the prerequisite — so let it install its own bridge. Send it
@@ -146,6 +97,55 @@ All in `.env` (see [.env.example](.env.example)):
 | `GUEST_SYSTEM_PROMPT_FILE` | Custom system prompt for the guest profile |
 | `WHISPER_MODEL` | faster-whisper model (default `large-v3-turbo`) |
 | `TGBOT_MEDIA_TTL_DAYS` | Retention for received files (default 14) |
+
+## ⚖️ How it compares
+
+| | **tg-claude-bot** | tmux-scraping bridges | direct-API bots |
+|---|---|---|---|
+| Backend | Claude Agent SDK — structured events | live TUI + ANSI scraping | raw Anthropic API |
+| Sessions | ✅ resume *any* session in the CLI store, AI titles | ⚠️ only the live pane you attach to | ❌ its own separate history |
+| Tools, skills, MCP | ✅ everything the CLI has | ✅ | ❌ reimplemented, if at all |
+| Interactive prompts | ✅ native inline buttons — permissions, plan approval, clarifying questions | ⚠️ relayed TUI screen + simulated keypresses | n/a |
+| Voice messages | ✅ local whisper, bilingual | ❌ | cloud STT, if any |
+| Forum topics = sessions | ✅ one session per topic | ❌ | ❌ |
+| Survives bot restarts | ✅ stateless — nothing to lose | ⚠️ bridge dies with tmux | ⚠️ needs a database |
+| Moving parts | one Python file | tmux + parser + bot | bot + DB + API glue |
+
+Deliberate trade-off: no attaching to a *live* terminal (what tmux bridges
+like [ccbot](https://github.com/six-ddc/ccbot) do) — in exchange, structured
+events and statelessness.
+
+<p align="center">
+  <img alt="A voice message becomes a transcript, live status, and Claude's clarifying question as buttons" src="assets/demo-question.jpg" width="340">
+  <br>
+  <em>One turn, end to end: voice → local transcript → live status → clarifying question as buttons.</em>
+</p>
+
+## ⌨️ Commands
+
+| Command | What it does |
+|---|---|
+| `/resume` | Inline session picker (titles, project, age); `/resume <id>` binds directly |
+| `/new` | Start a fresh session in this chat/topic |
+| `/status` | Current binding: session, project, model, effort |
+| `/model` | Live model picker — real names and context windows from `/v1/models` |
+| `/effort` | Reasoning-effort picker — levels discovered from the CLI itself |
+| `/usage` | Subscription limits (5h / weekly / per-model / credits) |
+| `/whisper` | Pick the voice-transcription model |
+| `/stop` (`/esc`) | Interrupt the current turn — the CLI's ESC |
+| anything else | Forwarded verbatim to the CLI: `/compact`, `/context`, `/cost`, your skills… |
+
+`/` autocompletes in Telegram — the menu is registered via `setMyCommands`.
+
+## 🏗 Architecture
+
+```
+Telegram ── python-telegram-bot ── bot.py (stateless router)
+                                     │  claude-agent-sdk (one client per chat/topic)
+                                     └─ Claude Code CLI ── ~/.claude/projects/*.jsonl
+```
+
+All state lives in the CLI's own files; kill the bot, nothing is forgotten.
 
 ## 🔒 Security model
 
