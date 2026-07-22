@@ -1,106 +1,136 @@
+<div align="center">
+
 # tg-claude-bot
 
-A single-file Telegram ↔ Claude Code bridge: chat with your local Claude Code CLI
-sessions from Telegram, resume any session, per-topic routing, local voice
-transcription, and inline-button interactivity. ~750 lines, no database, no tmux.
+**Your local Claude Code, in your pocket.**
 
-## Features
+A single-file Telegram bridge to the Claude Code CLI: resume any session from
+your phone, keep every tool and skill, answer permission prompts with inline
+buttons, talk to it with voice messages.
 
-**Session routing**
-- `/resume` — inline-button picker over your real CLI session store
-  (`~/.claude/projects/*/*.jsonl`), showing the CLI's own AI-generated session
-  titles, project and age; `/resume <id>` binds directly
-- One conversation per `(chat, forum topic)`: every Telegram topic is an
-  independent Claude session, each resumable separately
-- `/new`, `/status`; cross-project resume (cwd auto-detected from the session file)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](pyproject.toml)
+[![Built on claude-agent-sdk](https://img.shields.io/badge/built%20on-claude--agent--sdk-d97757.svg)](https://github.com/anthropics/claude-agent-sdk-python)
+![Single file](https://img.shields.io/badge/single%20file-~1.6k%20lines-brightgreen.svg)
+![No database](https://img.shields.io/badge/database-none-lightgrey.svg)
 
-**Command passthrough, no re-mapping**
-- Unknown `/commands` are forwarded verbatim to the CLI, so `/compact`, custom
-  skills, and anything the CLI supports headlessly just works — zero per-command
-  code
-- CLI local-command output (`/context`, `/cost`, …) is captured and relayed
-- A small data-driven `SHELL_CMDS` table serves bot-side commands (e.g. `/usage`
-  via [ccusage](https://github.com/ryoppippi/ccusage)) instantly, with no LLM
-  round-trip
-- Native command menu registered via `setMyCommands` (type `/` to autocomplete)
+</div>
 
-**Interactivity as inline buttons**
-- Generic permission bridge: out-of-scope tool calls surface as Allow/Deny
-  buttons through the SDK's `can_use_tool` hook — works for every tool, no
-  per-tool code
-- Model picker for voice transcription (`/whisper`)
-- Plan-mode approval: `ExitPlanMode` surfaces the plan text with Approve / Keep
-  planning buttons; `AskUserQuestion` renders Claude's clarifying questions as
-  option buttons and injects the answers back
-- `/model` — live model switching via `set_model`, list sourced from the
-  official `/v1/models` API (real names, context windows); `/effort` — levels
-  discovered from the CLI's own runtime validator (wording-independent probe);
-  `/stop` (`/esc`) interrupts the current turn
-- `/usage` — subscription limits (5h / weekly / per-model / usage credits)
-  straight from the OAuth usage endpoint, matching the official panel
+---
 
-**Media**
-- Images travel as native base64 content blocks inside the message (no disk
-  files; lifecycle owned by the CLI's transcript retention); other files land
-  in `<cwd>/.tgbot/media/` (auto-gitignored) with opportunistic TTL cleanup
-- Context-usage warnings: 🟠 at 80% / 🔴 at 90% of the model's real context
-  window, computed from per-turn API usage
+Start a session in your terminal, walk away, and continue it from Telegram —
+same session, same context, same tools. The bot is a thin stateless router over
+the Claude Agent SDK; the CLI keeps owning sessions, tools, skills, and
+persistence. There is very little here that can break.
 
-**Voice messages**
-- Local transcription via faster-whisper (default `large-v3-turbo`; switchable
-  with `/whisper`, persisted to `.env`), bilingual zh/en including code-switching
-- Lazy model download with visible progress; transcript shown as an editable
-  `🎤` message so you can verify what was heard
+## Highlights
 
-**Message lifecycle**
-- Each assistant text segment is delivered immediately as its own message
-- Tool activity appears as a live `⏳ Working…` status message, edited in place
-  (throttled), which morphs into the next text segment — no extra notifications,
-  no token cost
-- Quote/reply context: replying to any message forwards the quoted text to the
-  agent
+| | |
+|---|---|
+| 🔁 **Resume any real session** | `/resume` opens an inline picker over your actual CLI session store (`~/.claude/projects/*.jsonl`), showing the CLI's own AI-generated titles, project, and age. Cross-project: the working directory is auto-detected from the session file. |
+| 🧵 **Per-topic sessions** | Every Telegram forum topic is an independent Claude session, each resumable separately. One conversation per `(chat, topic)`. |
+| ⏩ **Zero command remapping** | Unknown `/commands` are forwarded verbatim to the CLI — `/compact`, custom skills, anything headless just works. Local-command output (`/context`, `/cost`, …) is captured and relayed. |
+| 🔘 **Buttons instead of a TUI** | Permission requests, plan-mode approval (`ExitPlanMode`), and Claude's clarifying questions (`AskUserQuestion`) all surface as inline buttons — a generic `can_use_tool` bridge, no per-tool code. |
+| 🎤 **Voice messages** | Local transcription via faster-whisper (bilingual zh/en incl. code-switching, editable 🎤 transcript, lazy model download). No audio leaves your machine. |
+| 🖼 **Native media** | Images travel as base64 content blocks inside the message — part of the session transcript, lifecycle owned by the CLI. Other files land in an auto-gitignored media dir with TTL cleanup. |
+| 📟 **Live status** | Tool activity shows as a `⏳ Working…` message edited in place, which morphs into the reply. Long commands get an elapsed-time ticker. No notification spam, no token cost. |
+| 🎛 **CLI parity** | `/model` (live switch, list from the official `/v1/models` API), `/effort` (levels probed from the CLI's own validator), `/usage` (subscription limits from the OAuth endpoint), `/stop` to interrupt a turn. |
+| 🟠 **Context warnings** | 🟠 at 80% / 🔴 at 90% of the model's real context window, computed from per-turn API usage — same source as `/context`. |
+| ♻️ **Graceful deploys** | Touch a flag file; the bot restarts only when every conversation is idle. In-flight replies are never lost. Restarts show as one silent `♻️ → ✅` message. |
+| 🔒 **Owner/guest profiles** | Allowlisted chats only. Owner gets full access; guests get scoped read/write with button escalation to the owner for anything else. |
 
-**Operations**
-- Graceful deploys: touch a flag file; the bot restarts only when all
-  conversations are idle, so in-flight replies are never lost
-- Restart lifecycle shown as a single silent message: `♻️ Restarting…` edited to
-  `✅ Online`
-- Stateless by design: all session state lives in the CLI's own jsonl files;
-  restarts lose nothing. systemd unit included
+## How it compares
 
-**Security model**
-- Allowlisted chats only; per-chat profiles (owner: full access with
-  `bypassPermissions`; others: scoped read/write with button escalation to the
-  owner)
-- Session-management commands are owner-gated everywhere
+| | **tg-claude-bot** | tmux-scraping bridges | direct-API bots |
+|---|---|---|---|
+| Backend | Claude Agent SDK (structured events) | terminal ANSI scraping | raw Anthropic API |
+| Your real CLI sessions | ✅ resume any, with AI titles | ⚠️ attach to live panes only | ❌ separate world |
+| Tools, skills, MCP | ✅ everything the CLI has | ✅ | ❌ reimplemented, if at all |
+| Permission prompts | ✅ inline buttons | ❌ blind keypresses | n/a |
+| Survives restarts | ✅ stateless, CLI owns state | ❌ tied to tmux lifetime | needs a database |
+| Moving parts | one Python file | tmux + parser + bot | bot + DB + API glue |
+
+The trade-off is deliberate: no attaching to a *live* interactive terminal
+(that's what tmux bridges like [ccbot](https://github.com/six-ddc/ccbot) do,
+at the cost of scraping ANSI output). This bridge trades that for structured
+SDK events and statelessness.
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `/resume` | Inline session picker (titles, project, age); `/resume <id>` binds directly |
+| `/new` | Start a fresh session in this chat/topic |
+| `/status` | Current binding: session, project, model, effort |
+| `/model` | Live model picker — real names and context windows from `/v1/models` |
+| `/effort` | Reasoning-effort picker — levels discovered from the CLI itself |
+| `/usage` | Subscription limits (5h / weekly / per-model / credits) from the OAuth usage endpoint |
+| `/whisper` | Pick the voice-transcription model |
+| `/stop` (`/esc`) | Interrupt the current turn — the CLI's ESC |
+| anything else | Forwarded verbatim to the CLI: `/compact`, `/context`, `/cost`, your skills… |
+
+The command menu is registered natively (`setMyCommands`), so `/` autocompletes
+in Telegram.
 
 ## Architecture
 
 ```
-Telegram ── python-telegram-bot ── bot.py (router)
+Telegram ── python-telegram-bot ── bot.py (stateless router)
                                      │  claude-agent-sdk (one client per chat/topic)
                                      └─ Claude Code CLI ── ~/.claude/projects/*.jsonl
 ```
 
-The bot is a thin stateless router; the CLI owns sessions, tools, and
-persistence. That is where the stability comes from: there is very little here
-that can break.
+All session state lives in the CLI's own files. The bot holds nothing worth
+losing: kill it, redeploy it, nothing is forgotten.
 
 ## Setup
 
 ```bash
+git clone https://github.com/xhyumiracle/tg-claude-bot && cd tg-claude-bot
 uv sync
 cp .env.example .env   # fill in TG_BOT_TOKEN and OWNER_USER_ID at minimum
 uv run python bot.py   # or adapt and install tg-claude-bot.service
 ```
 
-All configuration lives in `.env` (see `.env.example`): owner/guest user ids,
-optional group, guest read/write scopes and system prompt, whisper model, media TTL.
+Requirements: a machine where the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code)
+is installed and logged in, a bot token from [@BotFather](https://t.me/BotFather),
+and your numeric Telegram user id.
+
+### Configuration
+
+Everything lives in `.env` (see [.env.example](.env.example)):
+
+| Variable | Purpose |
+|---|---|
+| `TG_BOT_TOKEN` | Bot token from @BotFather *(required)* |
+| `OWNER_USER_ID` | Your numeric Telegram id — full access *(required)* |
+| `GUEST_USER_IDS` | Extra user ids served with the restricted guest profile |
+| `TARGET_GROUP_ID` | A group to serve (guest profile; topics = separate sessions) |
+| `OWNER_DEFAULT_CWD` | Default working directory for new owner sessions |
+| `RESUME_SESSION_ID` | Session to bind the owner's DM to on first contact |
+| `GUEST_READ_DIRS` / `GUEST_WRITE_DIRS` | Colon-separated dirs guests may read / write |
+| `GUEST_SYSTEM_PROMPT_FILE` | Custom system prompt for the guest profile |
+| `WHISPER_MODEL` | faster-whisper model (default `large-v3-turbo`) |
+| `TGBOT_MEDIA_TTL_DAYS` | Retention for received files (default 14) |
+
+## Security model
+
+- Only allowlisted chats are served; everything else is ignored.
+- The owner runs with full permissions; guests run a scoped profile
+  (read/write limited to configured dirs, custom system prompt) and
+  out-of-scope tool calls escalate to the owner as Allow/Deny buttons.
+- Session management commands are owner-gated everywhere.
+- Voice notes are transcribed locally and deleted; images live inside the
+  CLI's own transcript retention.
 
 ## Non-goals
 
-- Attaching to a *live* interactive terminal session (tmux-based bridges like
-  [ccbot](https://github.com/six-ddc/ccbot) do this at the cost of scraping
-  ANSI output; this bridge trades that for structured SDK events)
-- Replicating TUI-only dialogs verbatim (`/config` etc.); their capabilities are
-  rebuilt as bot commands where they matter (`/model`, `/effort`, `/usage`)
+- Attaching to a *live* interactive terminal session — see the comparison
+  above; that's a different trade-off.
+- Replicating TUI-only dialogs verbatim (`/config` etc.); their capabilities
+  are rebuilt as bot commands where they matter (`/model`, `/effort`, `/usage`).
+- Being a framework. It's one file — read it, fork it, make it yours.
+
+## License
+
+[MIT](LICENSE)

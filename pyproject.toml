@@ -1,7 +1,7 @@
 [project]
 name = "tg-claude-bot"
 version = "0.1.0"
-description = "Add your description here"
+description = "Single-file Telegram bridge to the Claude Code CLI: sessions, voice, inline buttons, live status"
 requires-python = ">=3.11"
 dependencies = [
     "claude-agent-sdk>=0.1.61",
