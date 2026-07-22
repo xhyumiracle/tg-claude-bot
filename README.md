@@ -23,7 +23,7 @@ tools, skills, and config — it *is* your local CLI. `/resume` picks up any
 session you left in the terminal. The bot is a thin stateless router; the CLI
 owns everything.
 
-## Highlights
+## ✨ Highlights
 
 | | |
 |---|---|
@@ -40,7 +40,7 @@ owns everything.
 | ♻️ **Graceful deploys** | Restarts wait until every conversation is idle; in-flight replies are never lost. |
 | 🔒 **Owner/guest profiles** | Allowlisted chats only; owner full access, guests scoped with Allow/Deny escalation to the owner. |
 
-## How it compares
+## ⚖️ How it compares
 
 | | **tg-claude-bot** | tmux-scraping bridges | direct-API bots |
 |---|---|---|---|
@@ -57,7 +57,7 @@ Deliberate trade-off: no attaching to a *live* terminal (what tmux bridges
 like [ccbot](https://github.com/six-ddc/ccbot) do) — in exchange, structured
 events and statelessness.
 
-## Commands
+## ⌨️ Commands
 
 | Command | What it does |
 |---|---|
@@ -73,7 +73,7 @@ events and statelessness.
 
 `/` autocompletes in Telegram — the menu is registered via `setMyCommands`.
 
-## Architecture
+## 🏗 Architecture
 
 ```
 Telegram ── python-telegram-bot ── bot.py (stateless router)
@@ -83,7 +83,7 @@ Telegram ── python-telegram-bot ── bot.py (stateless router)
 
 All state lives in the CLI's own files; kill the bot, nothing is forgotten.
 
-## Quick start
+## 🚀 Quick start
 
 Claude Code is the prerequisite — so let it install its own bridge. Send it
 this on the machine that should host the bot:
@@ -140,7 +140,7 @@ All in `.env` (see [.env.example](.env.example)):
 | `WHISPER_MODEL` | faster-whisper model (default `large-v3-turbo`) |
 | `TGBOT_MEDIA_TTL_DAYS` | Retention for received files (default 14) |
 
-## Security model
+## 🔒 Security model
 
 - Allowlisted chats only; everything else is ignored.
 - All secrets live in `.env` (chmod 600) — never in the systemd unit, which is
@@ -154,13 +154,17 @@ All in `.env` (see [.env.example](.env.example)):
   [SECURITY_AUDIT.md](SECURITY_AUDIT.md) — a line-by-line self-audit by the
   model this bot bridges.
 
-## Non-goals
+## 🙅 Non-goals
 
 - Attaching to a *live* terminal — see the comparison above.
 - Replicating TUI-only dialogs (`/config` etc.); what matters is rebuilt as
   bot commands (`/model`, `/effort`, `/usage`).
 - Being a framework. It's one file — read it, fork it, make it yours.
 
-## License
+---
 
-[MIT](LICENSE)
+<div align="center">
+
+[MIT](LICENSE) · If this put Claude Code in your pocket, a ⭐ helps others find it.
+
+</div>

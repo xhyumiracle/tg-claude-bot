@@ -1,7 +1,16 @@
-# Security audit
+<div align="center">
 
-**Auditor:** Claude (Fable 5) — the model this bot bridges, reviewing its own bridge.
-**Date:** 2026-07-22
+# 🛡️ Security Audit
+
+**Audited by Claude (Fable 5) — the model this bot bridges, reviewing its own bridge.**
+
+![Date](https://img.shields.io/badge/date-2026--07--22-blue.svg)
+![Passes](https://img.shields.io/badge/review%20passes-3-blue.svg)
+![Findings fixed](https://img.shields.io/badge/findings%20fixed-10%2F10-brightgreen.svg)
+![Known unfixed](https://img.shields.io/badge/known%20unfixed-0-brightgreen.svg)
+
+</div>
+
 **Scope:** full line-by-line review of `bot.py`, `tg-claude-bot.service`, setup docs,
 and `.env` handling — three passes: two review-and-fix rounds, then a final-state
 verification round that (a) mechanically asserted every prior fix is present in the
@@ -12,7 +21,7 @@ shipped tree and (b) re-reviewed the code the fixes themselves introduced.
 > a reviewer that understands both sides of the bridge. Treat it as a strong
 > baseline, not a certification.
 
-## Threat model
+## 🎯 Threat model
 
 - **T1 — Unauthorized Telegram access:** strangers messaging the bot; forged
   callback presses; guests exceeding their scope.
@@ -23,7 +32,7 @@ shipped tree and (b) re-reviewed the code the fixes themselves introduced.
 - **T4 — Operational failure:** deploys or restarts losing state or silently
   breaking.
 
-## What holds (verified)
+## ✅ What holds (verified)
 
 | Control | Notes |
 |---|---|
@@ -37,27 +46,27 @@ shipped tree and (b) re-reviewed the code the fixes themselves introduced.
 | Error hygiene | Exception details (internal paths) go to the owner only; guests get a generic message. |
 | Ops | Graceful deploys wait for idle conversations; if no sudo rule exists the bot exits nonzero and systemd's `Restart=on-failure` completes the restart. Stateless design: a crash or restart loses no session data. |
 
-## Findings fixed during this audit
+## 🔧 Findings fixed during this audit
 
 | # | Severity | Finding | Fix |
 |---|---|---|---|
-| 1 | High (doc) | Service template invited placing `CLAUDE_CODE_OAUTH_TOKEN` in the world-readable systemd unit | Template made secret-free; token documented into `.env` (600) |
-| 2 | Medium | Guest cwd fell back to `$HOME`; pathless Grep could search it; absolute glob patterns could escape scoped dirs | `/tmp` fallback; pathless Glob/Grep gated on configured read dirs; absolute/`..` patterns excluded from auto-allow |
-| 3 | Medium | `/tmp` restart flag honored regardless of owner — any local user could trigger restarts; missing sudo rule made deploys silently no-op | Flag/notice ownership check; nonzero exit fallback for supervised restart |
-| 4 | Low | Turns drained from the queue inherited the lock-holder's escalation privilege | Least-privileged sender attribution for drained batches |
-| 5 | Low | Error replies leaked internal paths to guest DMs; `/status` leaked cwd + session id to guests | Owner-only details |
-| 6 | Low | Transient voice/image files in `/tmp` were world-readable | `umask 077` at startup |
-| 7 | Low | Guests couldn't answer `AskUserQuestion` buttons (owner-only check), stalling their turns | Question buttons pressable by the turn's initiator |
-| 8 | Info | Sender-prefix impersonation inside message bodies could confuse the model (never the permission layer) | Guest system prompt pins the outermost bridge prefix as the only authority |
-| 9 | Low | Button callbacks accepted an unvalidated index: a prompted user forging `callback_data` could crash the turn (`labels[idx]` out of range) | Option count stored per prompt; index parsed and bounds-checked before delivery |
-| 10 | Info | Round-2 glob gate over-matched: Grep *regex* patterns containing `..` lost auto-allow (false positive, availability only) | Gate scoped to Glob patterns; Grep regexes exempt |
+| 1 | 🔴 High (doc) | Service template invited placing `CLAUDE_CODE_OAUTH_TOKEN` in the world-readable systemd unit | Template made secret-free; token documented into `.env` (600) |
+| 2 | 🟠 Medium | Guest cwd fell back to `$HOME`; pathless Grep could search it; absolute glob patterns could escape scoped dirs | `/tmp` fallback; pathless Glob/Grep gated on configured read dirs; absolute/`..` patterns excluded from auto-allow |
+| 3 | 🟠 Medium | `/tmp` restart flag honored regardless of owner — any local user could trigger restarts; missing sudo rule made deploys silently no-op | Flag/notice ownership check; nonzero exit fallback for supervised restart |
+| 4 | 🟡 Low | Turns drained from the queue inherited the lock-holder's escalation privilege | Least-privileged sender attribution for drained batches |
+| 5 | 🟡 Low | Error replies leaked internal paths to guest DMs; `/status` leaked cwd + session id to guests | Owner-only details |
+| 6 | 🟡 Low | Transient voice/image files in `/tmp` were world-readable | `umask 077` at startup |
+| 7 | 🟡 Low | Guests couldn't answer `AskUserQuestion` buttons (owner-only check), stalling their turns | Question buttons pressable by the turn's initiator |
+| 8 | ⚪ Info | Sender-prefix impersonation inside message bodies could confuse the model (never the permission layer) | Guest system prompt pins the outermost bridge prefix as the only authority |
+| 9 | 🟡 Low | Button callbacks accepted an unvalidated index: a prompted user forging `callback_data` could crash the turn (`labels[idx]` out of range) | Option count stored per prompt; index parsed and bounds-checked before delivery |
+| 10 | ⚪ Info | Round-2 glob gate over-matched: Grep *regex* patterns containing `..` lost auto-allow (false positive, availability only) | Gate scoped to Glob patterns; Grep regexes exempt |
 
 **Final-state verification:** after the last fix, all 10 findings were re-checked
 against the shipped tree with mechanical assertions (13 checks, all passing), and
 the fix-introduced code paths were re-reviewed. No known unfixed issues remain
-within the threat model below.
+within the threat model above.
 
-## Accepted risks (by design, documented)
+## ⚖️ Accepted risks (by design, documented)
 
 - **Owner profile auto-allows every tool** except plan/question dialogs. The
   owner is operating their own machine with full shell anyway; the bridge adds
@@ -73,7 +82,7 @@ within the threat model below.
 - **Passthrough `/commands` are available to guests** in their own scoped
   sessions; tool use inside them remains permission-gated.
 
-## Out of scope
+## 🚫 Out of scope
 
 The Claude Code CLI, the Agent SDK, python-telegram-bot, and Telegram's own
 transport security are trusted dependencies. Voice models come from the
