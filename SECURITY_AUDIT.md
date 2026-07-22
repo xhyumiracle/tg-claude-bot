@@ -6,8 +6,7 @@
 
 ![Date](https://img.shields.io/badge/date-2026--07--22-blue.svg)
 ![Passes](https://img.shields.io/badge/review%20passes-3-blue.svg)
-![Findings fixed](https://img.shields.io/badge/findings%20fixed-10%2F10-brightgreen.svg)
-![Known unfixed](https://img.shields.io/badge/known%20unfixed-0-brightgreen.svg)
+![Findings](https://img.shields.io/badge/findings-10%20fixed%20·%200%20open-blue.svg)
 
 </div>
 
