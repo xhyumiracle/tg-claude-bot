@@ -1663,6 +1663,61 @@ async def _save_media(update: Update, ctx, media, filename: str) -> Optional[Pat
         return None
 
 
+# ---------- album aggregation ----------
+# Telegram delivers a multi-file "album" as separate updates sharing a
+# media_group_id; collapse them back into ONE turn with all attachments.
+
+ALBUM_SETTLE_S = 1.5
+ALBUM_INLINE_BUDGET = 9_000_000
+_albums: Dict[tuple, dict] = {}
+
+
+async def _album_add(update, ctx, block=None, size=0, line=None) -> None:
+    msg = update.effective_message
+    key = (*conv_key_of(update), msg.media_group_id)
+    e = _albums.get(key)
+    if e is None:
+        e = _albums[key] = {"blocks": [], "lines": [], "bytes": 0,
+                            "caption": "", "update": update, "ctx": ctx,
+                            "task": None}
+    if block is not None:
+        e["blocks"].append(block)
+        e["bytes"] += size
+    if line is not None:
+        e["lines"].append(line)
+    if msg.caption:
+        e["caption"] = msg.caption
+    if e["task"] is not None:
+        e["task"].cancel()
+    e["task"] = asyncio.create_task(_album_flush(key))
+
+
+async def _album_flush(key) -> None:
+    try:
+        await asyncio.sleep(ALBUM_SETTLE_S)
+    except asyncio.CancelledError:
+        return
+    e = _albums.pop(key, None)
+    if e is None:
+        return
+    update, ctx = e["update"], e["ctx"]
+    user = update.effective_user
+    name = user.full_name if user else "unknown"
+    uid = user.id if user else 0
+    parts = []
+    if e["blocks"]:
+        n = len(e["blocks"])
+        parts.append("sent the image above" if n == 1
+                     else f"sent the {n} images above")
+    if e["lines"]:
+        parts.append("sent files, saved at: " + "; ".join(e["lines"]))
+    text = (f"[{name} ({uid})] ({'; '.join(parts)}): "
+            f"{reply_context(update.effective_message)}{e['caption']}")
+    log.info("album %s flushed: %d blocks, %d files",
+             key, len(e["blocks"]), len(e["lines"]))
+    await run_turn(update, ctx, text, blocks=e["blocks"] or None)
+
+
 async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not chat_allowed(update):
         return
@@ -1691,26 +1746,36 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     finally:
         tmp.unlink(missing_ok=True)
-    if len(data) <= 4_500_000:
+    album = msg.media_group_id
+    album_used = (_albums.get((*conv_key_of(update), album), {}).get("bytes", 0)
+                  if album else 0)
+    if len(data) <= 4_500_000 and album_used + len(data) <= ALBUM_INLINE_BUDGET:
         # native path: image travels inside the message, lives in the transcript
         import base64
-        blocks = [{"type": "image", "source": {
+        block = {"type": "image", "source": {
             "type": "base64", "media_type": mime,
             "data": base64.b64encode(data).decode(),
-        }}]
-        log.info("photo %s user=%s -> inline (%d bytes)",
-                 conv_key_of(update), uid, len(data))
+        }}
+        log.info("photo %s user=%s -> inline (%d bytes, album=%s)",
+                 conv_key_of(update), uid, len(data), album)
+        if album:
+            await _album_add(update, ctx, block=block, size=len(data))
+            return
         await run_turn(
             update, ctx,
             f"[{name} ({uid})] (sent the image above): "
             f"{reply_context(msg)}{msg.caption or ''}",
-            blocks=blocks,
+            blocks=[block],
         )
         return
-    # oversized: fall back to disk + Read tool
+    # oversized or over inline budget: fall back to disk + Read tool
     path = media_dir_for(get_conv(update)) / f"{uuid.uuid4().hex[:12]}.{ext}"
     path.write_bytes(data)
-    log.info("photo %s user=%s -> %s (oversize)", conv_key_of(update), uid, path)
+    log.info("photo %s user=%s -> %s (disk)", conv_key_of(update), uid, path)
+    if album:
+        await _album_add(update, ctx,
+                         line=f"{path} (image; view with the Read tool)")
+        return
     await run_turn(
         update, ctx,
         f"[{name} ({uid})] (sent an image, saved at {path}; "
@@ -1737,6 +1802,9 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     name = user.full_name if user else "unknown"
     uid = user.id if user else 0
     log.info("document %s user=%s -> %s", conv_key_of(update), uid, path)
+    if msg.media_group_id:
+        await _album_add(update, ctx, line=str(path))
+        return
     await run_turn(
         update, ctx,
         f"[{name} ({uid})] (sent a file, saved at {path}): "
