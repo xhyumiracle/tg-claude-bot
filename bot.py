@@ -703,7 +703,7 @@ async def run_turn(
     uid = (sender_id if sender_id is not None
            else update.effective_user.id if update.effective_user else 0)
     if conv.lock.locked():
-        conv.queue.append((text, blocks, uid))
+        conv.queue.append((text, blocks, uid, update.effective_message))
         log.info("conv %s busy, queued (%d waiting)", conv.key, len(conv.queue))
         try:
             # native ack: a 👀 reaction instead of a noisy "queued" bubble
@@ -719,6 +719,11 @@ async def run_turn(
         return
     async with conv.lock:
         conv.last_user_id = uid
+        if sender_id is None:  # direct turn: mark the message being worked on
+            try:
+                await update.effective_message.set_reaction("👨‍💻")
+            except Exception:
+                pass
         try:
             await ctx.bot.send_chat_action(
                 chat_id=conv.key[0],
@@ -835,17 +840,32 @@ async def run_turn(
                     "Something went wrong; please try again."
                 )
 
+    if sender_id is None:
+        try:
+            await update.effective_message.set_reaction(None)
+        except Exception:
+            pass
     # drain messages queued while this turn was running
     if conv.queue:
         queued = conv.queue[:]
         conv.queue.clear()
-        texts = [t for t, _, _ in queued]
-        blks = [b for _, bs, _ in queued if bs for b in bs]
+        texts = [t for t, _, _, _ in queued]
+        blks = [b for _, bs, _, _ in queued if bs for b in bs]
         # least-privileged attribution: any non-owner sender wins
-        uids = {u for _, _, u in queued}
+        uids = {u for _, _, u, _ in queued}
         drain_uid = next((u for u in uids if u != OWNER_ID), OWNER_ID)
+        for _, _, _, m in queued:
+            try:
+                await m.set_reaction("👨‍💻")
+            except Exception:
+                pass
         await run_turn(update, ctx, "\n".join(texts), blks or None,
                        sender_id=drain_uid)
+        for _, _, _, m in queued:
+            try:
+                await m.set_reaction(None)
+            except Exception:
+                pass
 
 
 # ---------- handlers ----------
