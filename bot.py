@@ -437,8 +437,10 @@ async def handle_ask_user_question(conv: Conversation, tool_input: dict):
                 lines.append(f"• {o.get('label')}: {o['description']}")
         if q_.get("multiSelect"):
             lines.append("(multi-select question; pick the primary option)")
-        # generic escape hatches, mirroring the official TUI
-        extras = ["💬 Chat about this instead", "✏️ I'll type my own answer"]
+        # synthetic options, verbatim from the native TUI (__other__/__chat__)
+        extras = ["Other"]
+        if not q_.get("multiSelect"):
+            extras.append("Chat about this")
         idx = await ask_buttons(conv, "\n".join(lines), labels + extras,
                                 allowed_user=conv.last_user_id)
         if idx is None:
@@ -446,15 +448,15 @@ async def handle_ask_user_question(conv: Conversation, tool_input: dict):
                 message="User did not answer the question in time."
             )
         if idx >= len(labels):
-            if idx == len(labels):
+            if extras[idx - len(labels)] == "Other":
                 return PermissionResultDeny(
-                    message="The user wants to discuss this question in chat "
-                            "before choosing; continue the conversation "
-                            "instead of re-asking the same options."
+                    message="The user chose Other and will type their own "
+                            "answer as the next message; wait for it in "
+                            "plain chat."
                 )
             return PermissionResultDeny(
-                message="The user will type their own answer as the next "
-                        "message; wait for it in plain chat."
+                message="The user chose to chat about this instead of "
+                        "picking an option; continue the conversation."
             )
         answers[q_.get("question", "")] = labels[idx]
     return PermissionResultAllow(
