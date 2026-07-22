@@ -852,40 +852,62 @@ async def cmd_reset(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text("Fresh session on next message.")
 
 
-PICKER_PAGE = 8
+# ---------- generic paged menus ----------
+# A menu is a builder returning (title, item_rows, footer_rows). Rendering
+# paginates item_rows automatically once they exceed one page — every menu,
+# present or future, gets paging for free. Selection callbacks stay per-menu.
+
+MENU_PAGE = 8
+_menu_builders: Dict[str, object] = {}
 
 
-def _pager_row(prefix: str, page: int, pages: int) -> list:
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("◀ Prev", callback_data=f"{prefix}{page - 1}"))
-    if page < pages - 1:
-        nav.append(InlineKeyboardButton("Next ▶", callback_data=f"{prefix}{page + 1}"))
-    return nav
+def menu(key: str):
+    def deco(fn):
+        _menu_builders[key] = fn
+        return fn
+    return deco
 
 
-def _session_page(page: int) -> Tuple[str, InlineKeyboardMarkup]:
-    sessions = scan_sessions()
-    pages = max(1, -(-len(sessions) // PICKER_PAGE))
+async def show_menu(update: Update, key: str, page: int = 0, edit_query=None) -> None:
+    title, items, footer = await _menu_builders[key](update)
+    pages = max(1, -(-len(items) // MENU_PAGE))
     page = max(0, min(page, pages - 1))
-    rows = []
+    rows = list(items[page * MENU_PAGE:(page + 1) * MENU_PAGE])
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(
+                "◀ Prev", callback_data=f"pg:{key}:{page - 1}"))
+        nav.append(InlineKeyboardButton(
+            f"{page + 1}/{pages}", callback_data=f"pg:{key}:{page}"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton(
+                "Next ▶", callback_data=f"pg:{key}:{page + 1}"))
+        rows.append(nav)
+        title = f"{title} ({page + 1}/{pages})"
+    rows.extend(footer)
+    rows.append([InlineKeyboardButton("✖ Cancel", callback_data="cx")])
+    kb = InlineKeyboardMarkup(rows)
+    if edit_query is not None:
+        await edit_query.edit_message_text(f"{title}:", reply_markup=kb)
+    else:
+        await update.effective_message.reply_text(f"{title}:", reply_markup=kb)
+
+
+@menu("ss")
+async def _menu_sessions(update: Update):
+    items = []
     now = time.time()
-    for s in sessions[page * PICKER_PAGE:(page + 1) * PICKER_PAGE]:
+    for s in scan_sessions():
         proj = Path(s["cwd"]).name if s["cwd"] else "?"
         age_s = now - s["mtime"]
         age = (f"{int(age_s // 86400)}d" if age_s >= 86400
                else f"{int(age_s // 3600)}h" if age_s >= 3600
                else f"{max(1, int(age_s // 60))}m")
-        rows.append([InlineKeyboardButton(
+        items.append([InlineKeyboardButton(
             f"{age} · [{proj}] {s['label']}"[:60], callback_data=f"rs:{s['sid']}"
         )])
-    nav = _pager_row("rp:", page, pages)
-    if nav:
-        rows.append(nav)
-    rows.append([InlineKeyboardButton("✖ Cancel", callback_data="cx")])
-    title = ("Pick a session for this chat/topic"
-             + (f" ({page + 1}/{pages})" if pages > 1 else "") + ":")
-    return title, InlineKeyboardMarkup(rows)
+    return "Pick a session for this chat/topic", items, []
 
 
 async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -898,8 +920,7 @@ async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not scan_sessions(limit=1):
         await update.effective_message.reply_text("No sessions found.")
         return
-    title, kb = _session_page(0)
-    await update.effective_message.reply_text(title, reply_markup=kb)
+    await show_menu(update, "ss")
 
 
 async def bind_session(update: Update, sid: str) -> None:
@@ -1077,25 +1098,27 @@ async def cmd_whisper(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     args = ctx.args or []
     if not args:
-        choices = [
-            ("large-v3-turbo", "quality"),
-            ("medium", "balanced"),
-            ("small", "fast"),
-            ("base", "fastest"),
-        ]
-        rows = [[InlineKeyboardButton(
-            f"{'✓ ' if name == WHISPER_MODEL else ''}{name} ({hint})",
-            callback_data=f"wm:{name}",
-        )] for name, hint in choices]
-        rows.append([InlineKeyboardButton("✖ Cancel", callback_data="cx")])
-        await update.effective_message.reply_text(
-            f"Voice model: {WHISPER_MODEL}"
-            f" ({'loaded' if _whisper_model is not None else 'not loaded'})\n"
-            "Pick one, or set any model with /whisper <model>:",
-            reply_markup=InlineKeyboardMarkup(rows),
-        )
+        await show_menu(update, "wm")
         return
     await set_whisper_model(update.effective_message.reply_text, args[0])
+
+
+@menu("wm")
+async def _menu_whisper(update: Update):
+    choices = [
+        ("large-v3-turbo", "quality"),
+        ("medium", "balanced"),
+        ("small", "fast"),
+        ("base", "fastest"),
+    ]
+    items = [[InlineKeyboardButton(
+        f"{'✓ ' if name == WHISPER_MODEL else ''}{name} ({hint})",
+        callback_data=f"wm:{name}",
+    )] for name, hint in choices]
+    title = (f"Voice model: {WHISPER_MODEL}"
+             f" ({'loaded' if _whisper_model is not None else 'not loaded'})\n"
+             "Pick one, or set any model with /whisper <model>")
+    return title, items, []
 
 
 async def set_whisper_model(reply, model: str) -> None:
@@ -1188,39 +1211,32 @@ async def apply_effort(reply, conv: Conversation, e: str) -> None:
     )
 
 
-async def _model_page(conv: Conversation, page: int) -> Tuple[str, InlineKeyboardMarkup]:
+@menu("md")
+async def _menu_models(update: Update):
+    conv = get_conv(update)
     if conv.current_model is None:
         conv.current_model = _session_model(conv.session_id)
     active = _norm_model(conv.model or conv.current_model)
-    rows = []
-    pages = 1
+    items = []
     try:
-        models = await fetch_models()
-        pages = max(1, -(-len(models) // PICKER_PAGE))
-        page = max(0, min(page, pages - 1))
-        for m in models[page * PICKER_PAGE:(page + 1) * PICKER_PAGE]:
+        for m in await fetch_models():
             mid = m.get("id", "")
             mark = "✓ " if _norm_model(mid) == active else ""
-            rows.append([InlineKeyboardButton(
+            items.append([InlineKeyboardButton(
                 f"{mark}{m.get('display_name', mid)} · "
                 f"{_ctx_label(m.get('max_input_tokens'))} ctx",
                 callback_data=f"md:{mid}"[:64],
             )])
     except Exception as e:
         log.warning("fetch_models failed: %s", e)
-        for m in MODEL_CHOICES:
-            rows.append([InlineKeyboardButton(m, callback_data=f"md:{m}")])
-    nav = _pager_row("mp:", page, pages)
-    if nav:
-        rows.append(nav)
-    rows.append([InlineKeyboardButton(
-        "default (clear override)", callback_data="md:default")])
-    rows.append([InlineKeyboardButton("✖ Cancel", callback_data="cx")])
+        items = [[InlineKeyboardButton(m, callback_data=f"md:{m}")]
+                 for m in MODEL_CHOICES]
+    footer = [[InlineKeyboardButton(
+        "default (clear override)", callback_data="md:default")]]
     title = (f"Session model: {conv.current_model or 'unknown'}\n"
              f"Override: {conv.model or 'none'}\n"
-             "Pick one, or /model <alias|id> (fable, opus, sonnet, or a full id)"
-             + (f" ({page + 1}/{pages})" if pages > 1 else "") + ":")
-    return title, InlineKeyboardMarkup(rows)
+             "Pick one, or /model <alias|id> (fable, opus, sonnet, or a full id)")
+    return title, items, footer
 
 
 async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1231,8 +1247,7 @@ async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if args:
         await apply_model(update.effective_message.reply_text, conv, args[0])
         return
-    title, kb = await _model_page(conv, 0)
-    await update.effective_message.reply_text(title, reply_markup=kb)
+    await show_menu(update, "md")
 
 
 async def cmd_effort(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1243,14 +1258,16 @@ async def cmd_effort(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if args:
         await apply_effort(update.effective_message.reply_text, conv, args[0])
         return
-    rows = [[InlineKeyboardButton(
+    await show_menu(update, "ef")
+
+
+@menu("ef")
+async def _menu_effort(update: Update):
+    conv = get_conv(update)
+    items = [[InlineKeyboardButton(
         f"{'✓ ' if e == conv.effort else ''}{e}", callback_data=f"ef:{e}",
     )] for e in EFFORT_CHOICES]
-    rows.append([InlineKeyboardButton("✖ Cancel", callback_data="cx")])
-    await update.effective_message.reply_text(
-        f"Effort: {conv.effort or '(default)'}",
-        reply_markup=InlineKeyboardMarkup(rows),
-    )
+    return f"Effort: {conv.effort or '(default)'}\nPick one", items, []
 
 
 async def cmd_stop(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1333,20 +1350,18 @@ async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     elif data.startswith("rs:"):
         await q.answer()
         await bind_session(update, data[3:])
-    elif data.startswith("rp:") or data.startswith("mp:"):
+    elif data.startswith("pg:"):
         await q.answer()
         try:
-            page = int(data[3:])
+            _, key, page_s = data.split(":", 2)
+            page = int(page_s)
         except ValueError:
             return
-        if data.startswith("rp:"):
-            title, kb = _session_page(page)
-        else:
-            title, kb = await _model_page(get_conv(update), page)
-        try:
-            await q.edit_message_text(title, reply_markup=kb)
-        except Exception:
-            pass
+        if key in _menu_builders:
+            try:
+                await show_menu(update, key, page, edit_query=q)
+            except Exception:
+                pass
     elif data.startswith("wm:"):
         await q.answer()
         async def _edit(text: str) -> None:
