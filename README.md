@@ -46,11 +46,13 @@ break.
 
 | | **tg-claude-bot** | tmux-scraping bridges | direct-API bots |
 |---|---|---|---|
-| Backend | Claude Agent SDK (structured events) | terminal ANSI scraping | raw Anthropic API |
-| Your real CLI sessions | ✅ resume any, with AI titles | ⚠️ attach to live panes only | ❌ separate world |
+| Backend | Claude Agent SDK — structured events | live TUI + ANSI scraping | raw Anthropic API |
+| Sessions | ✅ resume *any* session in the CLI store, AI titles | ⚠️ only the live pane you attach to | ❌ its own separate history |
 | Tools, skills, MCP | ✅ everything the CLI has | ✅ | ❌ reimplemented, if at all |
-| Permission prompts | ✅ inline buttons | ❌ blind keypresses | n/a |
-| Survives restarts | ✅ stateless, CLI owns state | ❌ tied to tmux lifetime | needs a database |
+| Interactive prompts | ✅ native inline buttons — permissions, plan approval, clarifying questions | ⚠️ relayed TUI screen + simulated keypresses | n/a |
+| Voice messages | ✅ local whisper, bilingual | ❌ | cloud STT, if any |
+| Forum topics = sessions | ✅ one session per topic | ❌ | ❌ |
+| Survives bot restarts | ✅ stateless — nothing to lose | ⚠️ bridge dies with tmux | ⚠️ needs a database |
 | Moving parts | one Python file | tmux + parser + bot | bot + DB + API glue |
 
 The trade-off is deliberate: no attaching to a *live* interactive terminal
