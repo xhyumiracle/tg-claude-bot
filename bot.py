@@ -172,9 +172,12 @@ app_ref: Optional[Application] = None
 
 
 async def ask_buttons(
-    conv: "Conversation", text: str, options: list, timeout: float = 3600
+    conv: "Conversation", text: str, options: list, timeout: float = 3600,
+    allowed_user: int = 0,
 ) -> Optional[int]:
-    """Post inline buttons in the conversation; return chosen index or None."""
+    """Post inline buttons in the conversation; return chosen index or None.
+
+    Pressable by the owner, plus `allowed_user` if given."""
     if app_ref is None:
         return None
     token = uuid.uuid4().hex[:10]
@@ -194,7 +197,7 @@ async def ask_buttons(
     except Exception:
         log.exception("ask_buttons send failed")
         return None
-    pending_btns[token] = (fut, msg)
+    pending_btns[token] = (fut, msg, allowed_user)
     try:
         return await asyncio.wait_for(fut, timeout=timeout)
     except asyncio.TimeoutError:
@@ -317,9 +320,10 @@ def get_conv(update: Update) -> Conversation:
                 key=key, profile="owner", cwd=cwd, session_id=sid
             )
         else:
+            # fallback cwd deliberately NOT $HOME: pathless Glob/Grep search the cwd
             conversations[key] = Conversation(
                 key=key, profile="guest",
-                cwd=str(GUEST_READ_DIRS[0]) if GUEST_READ_DIRS else str(HOME)
+                cwd=str(GUEST_READ_DIRS[0]) if GUEST_READ_DIRS else "/tmp"
             )
     return conversations[key]
 
@@ -431,7 +435,8 @@ async def handle_ask_user_question(conv: Conversation, tool_input: dict):
                 lines.append(f"• {o.get('label')}: {o['description']}")
         if q_.get("multiSelect"):
             lines.append("(multi-select question; pick the primary option)")
-        idx = await ask_buttons(conv, "\n".join(lines), labels)
+        idx = await ask_buttons(conv, "\n".join(lines), labels,
+                                allowed_user=conv.last_user_id)
         if idx is None:
             return PermissionResultDeny(
                 message="User did not answer the question in time."
@@ -463,10 +468,16 @@ def make_permission_cb(conv: Conversation):
             return PermissionResultAllow(updated_input=tool_input)
         path = extract_path(tool_input)
         if tool_name in READ_TOOLS:
-            if any(is_under(path, d) for d in (*GUEST_READ_DIRS, *GUEST_WRITE_DIRS)):
-                return PermissionResultAllow(updated_input=tool_input)
-            if tool_name in ("Glob", "Grep") and not path:
-                return PermissionResultAllow(updated_input=tool_input)
+            # an absolute or traversing glob pattern can escape the scoped dirs
+            pat = str(tool_input.get("pattern") or "")
+            pat_ok = not (pat.startswith(("/", "~")) or ".." in pat)
+            if pat_ok:
+                if any(is_under(path, d)
+                       for d in (*GUEST_READ_DIRS, *GUEST_WRITE_DIRS)):
+                    return PermissionResultAllow(updated_input=tool_input)
+                if (tool_name in ("Glob", "Grep") and not path
+                        and GUEST_READ_DIRS):
+                    return PermissionResultAllow(updated_input=tool_input)
         if tool_name in WRITE_TOOLS and any(is_under(path, d) for d in GUEST_WRITE_DIRS):
             return PermissionResultAllow(updated_input=tool_input)
         # out of scope: escalate to Miracle with buttons if he asked, else deny
@@ -784,8 +795,12 @@ async def run_turn(
                 pass
             log.exception("claude error for %s", conv.key)
             await drop_client(conv)
-            if update.effective_chat.type == "private":
+            if is_owner(update):
                 await update.effective_message.reply_text(f"Error: {e}")
+            elif update.effective_chat.type == "private":
+                await update.effective_message.reply_text(
+                    "Something went wrong; please try again."
+                )
 
     # drain messages queued while this turn was running
     if conv.queue:
@@ -1227,10 +1242,29 @@ async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     if q is None:
         return
-    if q.from_user is None or q.from_user.id != OWNER_ID:
+    uid = q.from_user.id if q.from_user else 0
+    data = q.data or ""
+    if data.startswith("bt:"):
+        _, token, idx = data.split(":", 2)
+        entry = pending_btns.get(token)
+        if entry is None:
+            await q.answer("Expired.")
+            return
+        fut, _msg, allowed_user = entry
+        if uid != OWNER_ID and uid != allowed_user:
+            await q.answer("This prompt isn't for you.")
+            return
+        if not fut.done():
+            fut.set_result(int(idx))
+        await q.answer("OK")
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+    if uid != OWNER_ID:
         await q.answer("Owner only.")
         return
-    data = q.data or ""
     if data == "cx":
         await q.answer("Cancelled")
         try:
@@ -1264,20 +1298,6 @@ async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             await apply_model(_edit2, conv, data[3:])
         else:
             await apply_effort(_edit2, conv, data[3:])
-    elif data.startswith("bt:"):
-        _, token, idx = data.split(":", 2)
-        entry = pending_btns.get(token)
-        if entry is None:
-            await q.answer("Expired.")
-            return
-        fut, _msg = entry
-        if not fut.done():
-            fut.set_result(int(idx))
-        await q.answer("OK")
-        try:
-            await q.edit_message_reply_markup(reply_markup=None)
-        except Exception:
-            pass
     else:
         await q.answer()
 
@@ -1335,11 +1355,28 @@ async def notify_owner(app: Application, text: str) -> None:
         log.warning("owner notify failed: %r", text)
 
 
+_foreign_flag_warned = False
+
+
+def _own_file(p: Path) -> bool:
+    """The flag files live in world-writable /tmp; honor only our own."""
+    try:
+        return p.stat().st_uid == os.getuid()
+    except OSError:
+        return False
+
+
 async def restart_watcher(app: Application) -> None:
     """Graceful deploy: restart only when no conversation is mid-turn."""
+    global _foreign_flag_warned
     while True:
         await asyncio.sleep(5)
         if not RESTART_FLAG.exists():
+            continue
+        if not _own_file(RESTART_FLAG):
+            if not _foreign_flag_warned:
+                _foreign_flag_warned = True
+                log.warning("restart flag not owned by us; ignoring")
             continue
         if any(c.lock.locked() for c in conversations.values()):
             continue
@@ -1358,9 +1395,14 @@ async def restart_watcher(app: Application) -> None:
             )
         except Exception:
             log.warning("restart notice failed")
-        await asyncio.create_subprocess_shell(
+        proc = await asyncio.create_subprocess_shell(
             "sudo -n systemctl restart tg-claude-bot"
         )
+        rc = await proc.wait()
+        if rc != 0:
+            # no sudo rule configured: exit and let the supervisor restart us
+            log.warning("systemctl restart failed (rc=%s); exiting instead", rc)
+            os._exit(1)
         return
 
 
@@ -1405,7 +1447,7 @@ async def post_init(app: Application) -> None:
     app.create_task(refresh_effort_choices(app))
     # transform the pre-restart notice in place; only send a new message on cold boot
     edited = False
-    if RESTART_NOTICE.exists():
+    if RESTART_NOTICE.exists() and _own_file(RESTART_NOTICE):
         try:
             ref = json.loads(RESTART_NOTICE.read_text())
             await app.bot.edit_message_text(

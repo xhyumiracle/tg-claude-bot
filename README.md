@@ -110,7 +110,7 @@ bot admin.
 ```bash
 git clone https://github.com/xhyumiracle/tg-claude-bot && cd tg-claude-bot
 uv sync                 # add --extra voice for local voice transcription
-cp .env.example .env    # fill in TG_BOT_TOKEN and OWNER_USER_ID at minimum
+cp .env.example .env && chmod 600 .env   # fill in TG_BOT_TOKEN and OWNER_USER_ID
 ```
 
 **5. Run it**
@@ -142,6 +142,8 @@ All in `.env` (see [.env.example](.env.example)):
 ## Security model
 
 - Allowlisted chats only; everything else is ignored.
+- All secrets live in `.env` (chmod 600) — never in the systemd unit, which is
+  world-readable.
 - Owner: full permissions. Guests: scoped read/write and a custom prompt;
   out-of-scope tool calls escalate to the owner as Allow/Deny buttons.
 - Session management commands are owner-gated everywhere.
