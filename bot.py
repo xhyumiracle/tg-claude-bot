@@ -14,6 +14,7 @@ from claude_agent_sdk.types import (
     AssistantMessage,
     PermissionResultAllow,
     PermissionResultDeny,
+    ResultMessage,
     TextBlock,
     ToolPermissionContext,
     ToolUseBlock,
@@ -790,6 +791,13 @@ async def run_turn(
                             if buf:
                                 await flush_segment()
                             await status.update(update, "💭 Thinking…")
+                elif isinstance(m, ResultMessage):
+                    # errors come back as results, not exceptions — never
+                    # swallow them or the user sees their message vanish
+                    if m.is_error:
+                        err = (m.result or "; ".join(
+                            str(e) for e in (m.errors or [])) or "unknown error")
+                        buf.append(f"⚠️ Turn failed: {str(err)[:500]}")
                 elif isinstance(m, UserMessage):
                     # relay CLI local-command output (/context, /cost, ...)
                     texts = []
