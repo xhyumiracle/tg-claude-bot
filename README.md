@@ -4,9 +4,9 @@
 
 **Your local Claude Code, in your pocket.**
 
-A single-file Telegram bridge to the Claude Code CLI: pick up your Claude
-Code sessions from your phone, vibe-code by voice, keep every tool and
-skill, answer prompts with buttons.
+A single-file Telegram bridge to the Claude Code CLI: pick up your sessions
+from your phone, vibe-code by voice, keep every tool and skill, answer
+prompts with buttons.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](pyproject.toml)
