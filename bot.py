@@ -706,12 +706,16 @@ async def run_turn(
         conv.queue.append((text, blocks, uid))
         log.info("conv %s busy, queued (%d waiting)", conv.key, len(conv.queue))
         try:
-            await update.effective_message.reply_text(
-                "⏳ Queued; will process after the current turn.",
-                disable_notification=True,
-            )
+            # native ack: a 👀 reaction instead of a noisy "queued" bubble
+            await update.effective_message.set_reaction("👀")
         except Exception:
-            pass
+            try:
+                await update.effective_message.reply_text(
+                    "⏳ Queued; will process after the current turn.",
+                    disable_notification=True,
+                )
+            except Exception:
+                pass
         return
     async with conv.lock:
         conv.last_user_id = uid
