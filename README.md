@@ -78,8 +78,22 @@ cp .env.example .env && chmod 600 .env   # fill in TG_BOT_TOKEN and OWNER_USER_I
 uv run python bot.py
 ```
 
-DM your bot `/status` — you're live. For always-on, adapt and install
-[tg-claude-bot.service](tg-claude-bot.service).
+DM your bot `/status` — you're live.
+
+### Run as a service (recommended)
+
+The whole point is being reachable when you're away from the machine, so once
+the foreground run works, put it under systemd:
+
+```bash
+# edit the YOUR_USER paths in tg-claude-bot.service first
+sudo cp tg-claude-bot.service /etc/systemd/system/
+sudo systemctl enable --now tg-claude-bot
+journalctl -u tg-claude-bot -f          # watch the logs
+```
+
+To deploy an update gracefully: `touch /tmp/tgbot-restart-requested` — the bot
+restarts as soon as every conversation is idle, so no reply is ever cut off.
 
 ### Configuration
 
