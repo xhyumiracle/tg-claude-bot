@@ -88,17 +88,16 @@ losing: kill it, redeploy it, nothing is forgotten.
 
 ## Quick start
 
-You already run Claude Code — it's the prerequisite — so the fastest path is
-letting it install its own bridge. Paste this into Claude Code **on the machine
-that should host the bot**:
+You already run Claude Code — it's the prerequisite — so let it install its
+own bridge. Send this to Claude Code **on the machine that should host the
+bot**:
 
-> Set up https://github.com/xhyumiracle/tg-claude-bot for me: clone it, install
-> dependencies with uv (ask me whether I want voice-message support), walk me
-> through creating a bot with @BotFather and finding my numeric Telegram user
-> id, fill in `.env`, then run it (or install the systemd unit) and stay with
-> me until `/status` answers on my phone.
+```
+setup https://github.com/xhyumiracle/tg-claude-bot
+```
 
-It will drive the whole checklist below and you only tap @BotFather.
+This README is the whole runbook: the agent follows the manual steps below and
+only needs you for the @BotFather token and your user id.
 
 ### Manual setup
 
