@@ -1,0 +1,1587 @@
+import asyncio
+import json
+import logging
+import os
+import re
+import time
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+
+from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+from claude_agent_sdk.types import (
+    AssistantMessage,
+    PermissionResultAllow,
+    PermissionResultDeny,
+    TextBlock,
+    ToolPermissionContext,
+    ToolUseBlock,
+    UserMessage,
+)
+try:
+    from claude_agent_sdk.types import ThinkingBlock
+except ImportError:
+    class ThinkingBlock:  # sentinel, never matches
+        pass
+from dotenv import load_dotenv
+from telegram import (
+    BotCommand,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
+from telegram.constants import ChatAction, ParseMode
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+load_dotenv()
+
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    level=logging.INFO,
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+log = logging.getLogger("tg-claude-bot")
+
+TG_TOKEN = os.environ["TG_BOT_TOKEN"]
+OWNER_ID = int(os.environ["OWNER_USER_ID"])
+GUEST_USER_IDS = {
+    int(x) for x in os.environ.get("GUEST_USER_IDS", "").replace(",", " ").split()
+}
+TARGET_GROUP_ID = int(os.environ.get("TARGET_GROUP_ID", "0"))
+DEFAULT_RESUME = os.environ.get("RESUME_SESSION_ID", "")
+
+HOME = Path.home()
+OWNER_DEFAULT_CWD = os.environ.get("OWNER_DEFAULT_CWD", str(HOME))
+
+
+def _env_dirs(key: str) -> list:
+    return [Path(p).expanduser().resolve()
+            for p in os.environ.get(key, "").split(":") if p.strip()]
+
+
+GUEST_READ_DIRS = _env_dirs("GUEST_READ_DIRS")
+GUEST_WRITE_DIRS = _env_dirs("GUEST_WRITE_DIRS")
+PROJECTS_ROOT = HOME / ".claude" / "projects"
+
+READ_TOOLS = {"Read", "Glob", "Grep", "NotebookRead"}
+WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
+WEB_TOOLS = {"WebFetch", "WebSearch"}
+
+_DEFAULT_GUEST_PROMPT = f"""You are Claude, assisting in a Telegram chat with restricted access.
+
+- You may Read/Glob/Grep under: {', '.join(str(d) for d in GUEST_READ_DIRS) or '(none configured)'}
+- You may Write/Edit ONLY under: {', '.join(str(d) for d in GUEST_WRITE_DIRS) or '(none configured)'}
+- No shell/bash access. If asked to run code, explain and reason about it instead.
+
+Group-chat behavior:
+- Each incoming message is prefixed with `[<name> (<id>)]:` so you can tell who spoke.
+- If a message does not call for a response from you, reply with exactly `<pass>` and nothing else; the bot will stay silent.
+- Keep replies concise and Telegram-friendly (short code fences, no giant tables).
+"""
+
+_prompt_file = os.environ.get("GUEST_SYSTEM_PROMPT_FILE", "")
+GUEST_PROMPT = (
+    Path(_prompt_file).expanduser().read_text()
+    if _prompt_file and Path(_prompt_file).expanduser().exists()
+    else _DEFAULT_GUEST_PROMPT
+)
+
+OWNER_APPEND = """
+You are reached over Telegram, in a chat with the owner of this machine.
+When a session is resumed, its full history is your context.
+Telegram etiquette: keep replies concise, prefer plain text or minimal Markdown, no giant
+tables or long code fences. For large outputs (files, PDFs), write them to disk and reply
+with the path, or send them via the bot API if asked.
+"""
+
+# Owner-only bot-side shell commands (data-driven; extend by adding entries).
+SHELL_CMDS = {
+    "ccusage": "npx -y ccusage@latest blocks --active",
+}
+
+RESTART_FLAG = Path("/tmp/tgbot-restart-requested")
+RESTART_NOTICE = Path("/tmp/tgbot-restart-notice.json")
+
+_LOCAL_OUT_RE = re.compile(
+    r"<local-command-stdout>(.*?)</local-command-stdout>", re.S
+)
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "large-v3-turbo")
+_whisper_model = None
+
+
+def _get_whisper():
+    global _whisper_model
+    if _whisper_model is None:
+        from faster_whisper import WhisperModel
+        _whisper_model = WhisperModel(
+            WHISPER_MODEL, device="cpu", compute_type="int8"
+        )
+    return _whisper_model
+
+
+async def transcribe(path: str) -> str:
+    def _run() -> str:
+        segments, _info = _get_whisper().transcribe(
+            path,
+            vad_filter=True,
+            initial_prompt="以下是简体中文普通话，可能夹杂英文。",
+        )
+        return "".join(s.text for s in segments).strip()
+    return await asyncio.to_thread(_run)
+
+
+ConvKey = Tuple[int, int]
+
+
+@dataclass
+class Conversation:
+    key: ConvKey
+    profile: str  # "owner" | "guest"
+    cwd: str
+    session_id: Optional[str] = None
+    client: Optional[ClaudeSDKClient] = None
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    last_user_id: int = 0
+    queue: list = field(default_factory=list)
+    model: Optional[str] = None
+    effort: Optional[str] = None
+    current_model: Optional[str] = None
+    ctx_warned: int = 0
+
+
+conversations: Dict[ConvKey, Conversation] = {}
+pending_btns: Dict[str, tuple] = {}
+app_ref: Optional[Application] = None
+
+
+async def ask_buttons(
+    conv: "Conversation", text: str, options: list, timeout: float = 3600
+) -> Optional[int]:
+    """Post inline buttons in the conversation; return chosen index or None."""
+    if app_ref is None:
+        return None
+    token = uuid.uuid4().hex[:10]
+    fut: asyncio.Future = asyncio.get_running_loop().create_future()
+    rows = [
+        [InlineKeyboardButton(str(label)[:60], callback_data=f"bt:{token}:{i}")]
+        for i, label in enumerate(options)
+    ]
+    chat_id, thread = conv.key
+    try:
+        msg = await app_ref.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=thread or None,
+            text=text[:3900],
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+    except Exception:
+        log.exception("ask_buttons send failed")
+        return None
+    pending_btns[token] = (fut, msg)
+    try:
+        return await asyncio.wait_for(fut, timeout=timeout)
+    except asyncio.TimeoutError:
+        try:
+            await msg.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return None
+    finally:
+        pending_btns.pop(token, None)
+
+
+# ---------- session discovery ----------
+
+_CWD_RE = re.compile(r'"cwd"\s*:\s*"([^"]+)"')
+
+
+def _session_meta(path: Path) -> Tuple[Optional[str], str]:
+    """Return (cwd, label): prefer a CLI summary record, else first user message."""
+    cwd, label, first_msg = None, "", ""
+    try:
+        with path.open("rb") as f:
+            head = f.read(65536).decode("utf-8", errors="ignore")
+            try:
+                f.seek(-16384, os.SEEK_END)
+            except OSError:
+                f.seek(0)
+            tail = f.read().decode("utf-8", errors="ignore")
+    except OSError:
+        return None, ""
+    m = _CWD_RE.search(head)
+    if m:
+        cwd = m.group(1)
+    summary = ""
+    for chunk in (head, tail):
+        for line in chunk.splitlines():
+            if '"type":"ai-title"' in line:
+                try:
+                    label = json.loads(line).get("aiTitle", "") or label
+                except Exception:
+                    pass
+            elif '"type":"summary"' in line:
+                try:
+                    summary = json.loads(line).get("summary", "") or summary
+                except Exception:
+                    pass
+    label = label or summary
+    if not label:
+        for line in head.splitlines():
+            if '"type":"user"' not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            content = rec.get("message", {}).get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    b.get("text", "") for b in content if isinstance(b, dict)
+                )
+            content = " ".join(str(content).split())
+            if content and not content.startswith(("<", "/", "Caveat:")):
+                first_msg = content
+                break
+        label = first_msg
+    return cwd, label[:60]
+
+
+def scan_sessions(limit: int = 8):
+    files = sorted(
+        PROJECTS_ROOT.glob("*/*.jsonl"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    out, seen = [], set()
+    for f in files:
+        sid = f.stem
+        if sid in seen or len(sid) < 32:
+            continue
+        seen.add(sid)
+        cwd, label = _session_meta(f)
+        out.append({"sid": sid, "cwd": cwd, "label": label or "(no text)",
+                    "mtime": f.stat().st_mtime})
+        if len(out) >= limit:
+            break
+    return out
+
+
+def find_session(sid: str) -> Optional[dict]:
+    for f in PROJECTS_ROOT.glob(f"*/{sid}.jsonl"):
+        cwd, label = _session_meta(f)
+        return {"sid": sid, "cwd": cwd, "label": label}
+    return None
+
+
+# ---------- conversations ----------
+
+def conv_key_of(update: Update) -> ConvKey:
+    thread = 0
+    msg = update.effective_message
+    if msg is not None and msg.message_thread_id:
+        thread = msg.message_thread_id
+    return (update.effective_chat.id, thread)
+
+
+def get_conv(update: Update) -> Conversation:
+    key = conv_key_of(update)
+    if key not in conversations:
+        chat = update.effective_chat
+        if chat.type == "private" and chat.id == OWNER_ID:
+            sid = DEFAULT_RESUME or None
+            cwd = OWNER_DEFAULT_CWD
+            if sid:
+                meta = find_session(sid)
+                if meta and meta["cwd"]:
+                    cwd = meta["cwd"]
+                else:
+                    sid = None
+            conversations[key] = Conversation(
+                key=key, profile="owner", cwd=cwd, session_id=sid
+            )
+        else:
+            conversations[key] = Conversation(
+                key=key, profile="guest",
+                cwd=str(GUEST_READ_DIRS[0]) if GUEST_READ_DIRS else str(HOME)
+            )
+    return conversations[key]
+
+
+async def drop_client(conv: Conversation) -> None:
+    if conv.client is not None:
+        try:
+            await conv.client.disconnect()
+        except Exception:
+            log.exception("disconnect error for %s", conv.key)
+        conv.client = None
+
+
+def build_options(conv: Conversation) -> ClaudeAgentOptions:
+    if conv.profile == "owner":
+        return ClaudeAgentOptions(
+            system_prompt={
+                "type": "preset",
+                "preset": "claude_code",
+                "append": OWNER_APPEND,
+            },
+            cwd=conv.cwd,
+            resume=conv.session_id,
+            permission_mode="default",
+            can_use_tool=make_owner_cb(conv),
+            model=conv.model,
+            effort=conv.effort,
+            setting_sources=["user", "project"],
+        )
+    return ClaudeAgentOptions(
+        system_prompt=GUEST_PROMPT,
+        cwd=conv.cwd,
+        add_dirs=[str(d) for d in GUEST_WRITE_DIRS],
+        allowed_tools=sorted(READ_TOOLS | WRITE_TOOLS | WEB_TOOLS),
+        can_use_tool=make_permission_cb(conv),
+        permission_mode="default",
+        resume=conv.session_id,
+        setting_sources=["user", "project"],
+    )
+
+
+async def ensure_client(conv: Conversation) -> ClaudeSDKClient:
+    if conv.client is None:
+        client = ClaudeSDKClient(options=build_options(conv))
+        await client.connect()
+        conv.client = client
+        log.info("connected %s profile=%s resume=%s cwd=%s",
+                 conv.key, conv.profile, conv.session_id, conv.cwd)
+    return conv.client
+
+
+# ---------- generic permission bridge (inline buttons) ----------
+
+def is_under(path_str: str, root: Path) -> bool:
+    if not path_str:
+        return False
+    try:
+        p = Path(os.path.expanduser(path_str)).resolve()
+        p.relative_to(root)
+        return True
+    except Exception:
+        return False
+
+
+def extract_path(tool_input: dict) -> str:
+    for k in ("file_path", "notebook_path", "path"):
+        v = tool_input.get(k)
+        if isinstance(v, str) and v:
+            return v
+    return ""
+
+
+async def ask_owner_permission(conv: Conversation, tool_name: str, detail: str) -> bool:
+    idx = await ask_buttons(
+        conv,
+        f"Permission request: {tool_name}\n{detail[:300]}",
+        ["✅ Allow once", "❌ Deny"],
+        timeout=180,
+    )
+    return idx == 0
+
+
+async def handle_exit_plan(conv: Conversation, tool_input: dict):
+    plan = str(tool_input.get("plan", "")).strip() or "(empty plan)"
+    idx = await ask_buttons(
+        conv,
+        f"📋 Plan ready:\n\n{plan}",
+        ["✅ Approve plan", "❌ Keep planning"],
+    )
+    if idx == 0:
+        return PermissionResultAllow(updated_input=tool_input)
+    return PermissionResultDeny(
+        message="User wants to keep planning (or did not respond); "
+                "refine the plan or ask what to change."
+    )
+
+
+async def handle_ask_user_question(conv: Conversation, tool_input: dict):
+    answers = {}
+    for q_ in tool_input.get("questions", []):
+        opts = q_.get("options", [])
+        labels = [
+            (o.get("label", "") if isinstance(o, dict) else str(o)) or "?"
+            for o in opts
+        ]
+        lines = [f"❓ {q_.get('header', '')}: {q_.get('question', '')}"]
+        for o in opts:
+            if isinstance(o, dict) and o.get("description"):
+                lines.append(f"• {o.get('label')}: {o['description']}")
+        if q_.get("multiSelect"):
+            lines.append("(multi-select question; pick the primary option)")
+        idx = await ask_buttons(conv, "\n".join(lines), labels)
+        if idx is None:
+            return PermissionResultDeny(
+                message="User did not answer the question in time."
+            )
+        answers[q_.get("question", "")] = labels[idx]
+    return PermissionResultAllow(
+        updated_input={
+            "questions": tool_input.get("questions", []),
+            "answers": answers,
+        }
+    )
+
+
+def make_owner_cb(conv: Conversation):
+    async def can_use_tool(tool_name: str, tool_input: dict, ctx: ToolPermissionContext):
+        if tool_name == "ExitPlanMode":
+            return await handle_exit_plan(conv, tool_input)
+        if tool_name == "AskUserQuestion":
+            return await handle_ask_user_question(conv, tool_input)
+        return PermissionResultAllow(updated_input=tool_input)
+    return can_use_tool
+
+
+def make_permission_cb(conv: Conversation):
+    async def can_use_tool(tool_name: str, tool_input: dict, ctx: ToolPermissionContext):
+        if tool_name == "AskUserQuestion":
+            return await handle_ask_user_question(conv, tool_input)
+        if tool_name in WEB_TOOLS:
+            return PermissionResultAllow(updated_input=tool_input)
+        path = extract_path(tool_input)
+        if tool_name in READ_TOOLS:
+            if any(is_under(path, d) for d in (*GUEST_READ_DIRS, *GUEST_WRITE_DIRS)):
+                return PermissionResultAllow(updated_input=tool_input)
+            if tool_name in ("Glob", "Grep") and not path:
+                return PermissionResultAllow(updated_input=tool_input)
+        if tool_name in WRITE_TOOLS and any(is_under(path, d) for d in GUEST_WRITE_DIRS):
+            return PermissionResultAllow(updated_input=tool_input)
+        # out of scope: escalate to Miracle with buttons if he asked, else deny
+        if conv.last_user_id == OWNER_ID:
+            ok = await ask_owner_permission(conv, tool_name, path or str(tool_input)[:200])
+            if ok:
+                return PermissionResultAllow(updated_input=tool_input)
+        return PermissionResultDeny(
+            message=f"{tool_name} denied by scope policy (path={path!r})."
+        )
+    return can_use_tool
+
+
+# ---------- access control ----------
+
+def chat_allowed(update: Update) -> bool:
+    chat = update.effective_chat
+    if chat is None:
+        return False
+    if chat.type == "private":
+        user = update.effective_user
+        return user is not None and (user.id == OWNER_ID or user.id in GUEST_USER_IDS)
+    return chat.id == TARGET_GROUP_ID
+
+
+def is_owner(update: Update) -> bool:
+    u = update.effective_user
+    return u is not None and u.id == OWNER_ID
+
+
+# ---------- messaging ----------
+
+def reply_context(msg) -> str:
+    r = msg.reply_to_message
+    if r is None:
+        return ""
+    quoted = (r.text or r.caption or "").strip()
+    if not quoted:
+        return ""
+    if r.from_user and r.from_user.is_bot:
+        src = "your earlier message"
+    elif r.from_user:
+        src = f"{r.from_user.full_name}'s message"
+    else:
+        src = "a message"
+    quoted = " ".join(quoted.split())[:400]
+    return f'(replying to {src}: "{quoted}") '
+
+
+def format_incoming(update: Update) -> str:
+    user = update.effective_user
+    name = user.full_name if user else "unknown"
+    uid = user.id if user else 0
+    msg = update.effective_message
+    return f"[{name} ({uid})]: {reply_context(msg)}{msg.text}"
+
+
+async def send_long(update: Update, text: str) -> None:
+    limit = 4000
+    chunks = [text[i: i + limit] for i in range(0, len(text), limit)] or [text]
+    for chunk in chunks:
+        try:
+            await update.effective_message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await update.effective_message.reply_text(chunk)
+
+
+class LiveStatus:
+    """One status message per turn, updated in place; becomes the final reply."""
+
+    def __init__(self) -> None:
+        self.msg = None
+        self.last = 0.0
+        self.text = ""
+
+    async def update(self, update_obj: Update, text: str) -> None:
+        now = time.time()
+        if self.msg is None:
+            try:
+                self.msg = await update_obj.effective_message.reply_text(
+                    text, disable_notification=True
+                )
+                self.last, self.text = now, text
+            except Exception:
+                pass
+            return
+        if now - self.last < 2.5 or text == self.text:
+            return
+        try:
+            await self.msg.edit_text(text)
+            self.last, self.text = now, text
+        except Exception:
+            pass
+
+    async def finalize(self, update_obj: Update, reply: str) -> None:
+        if self.msg is None:
+            if reply:
+                await send_long(update_obj, reply)
+            return
+        if not reply:
+            try:
+                await self.msg.delete()
+            except Exception:
+                pass
+            return
+        if len(reply) <= 4000:
+            try:
+                await self.msg.edit_text(reply, parse_mode=ParseMode.MARKDOWN)
+                return
+            except Exception:
+                try:
+                    await self.msg.edit_text(reply)
+                    return
+                except Exception:
+                    pass
+        try:
+            await self.msg.delete()
+        except Exception:
+            pass
+        await send_long(update_obj, reply)
+
+
+def _tool_brief(block: ToolUseBlock) -> str:
+    inp = block.input or {}
+    for k in ("command", "description", "file_path", "pattern", "prompt", "url"):
+        v = inp.get(k)
+        if isinstance(v, str) and v:
+            return f"{block.name}: {' '.join(v.split())[:60]}"
+    return block.name
+
+
+async def _context_limit(conv: Conversation) -> int:
+    active = _norm_model(conv.model or conv.current_model)
+    try:
+        for m in await fetch_models():
+            if _norm_model(m.get("id")) == active:
+                return m.get("max_input_tokens") or 200_000
+    except Exception:
+        pass
+    return 200_000
+
+
+async def check_context_usage(update: Update, conv: Conversation, usage: dict) -> None:
+    total = ((usage.get("input_tokens") or 0)
+             + (usage.get("cache_read_input_tokens") or 0)
+             + (usage.get("cache_creation_input_tokens") or 0))
+    if not total:
+        return
+    limit = await _context_limit(conv)
+    pct = total * 100 / limit
+    if pct < 75:
+        conv.ctx_warned = 0
+        return
+    level = 90 if pct >= 90 else (80 if pct >= 80 else 0)
+    if not level or conv.ctx_warned >= level:
+        return
+    conv.ctx_warned = level
+    icon = "🔴" if level == 90 else "🟠"
+    try:
+        await update.effective_message.reply_text(
+            f"{icon} Context {pct:.0f}% used "
+            f"({total // 1000}k / {limit // 1000}k). /compact to trim.",
+            disable_notification=True,
+        )
+    except Exception:
+        pass
+
+
+async def run_turn(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str,
+    blocks: Optional[list] = None,
+) -> None:
+    conv = get_conv(update)
+    if conv.lock.locked():
+        conv.queue.append((text, blocks))
+        log.info("conv %s busy, queued (%d waiting)", conv.key, len(conv.queue))
+        try:
+            await update.effective_message.reply_text(
+                "⏳ Queued; will process after the current turn.",
+                disable_notification=True,
+            )
+        except Exception:
+            pass
+        return
+    async with conv.lock:
+        conv.last_user_id = update.effective_user.id if update.effective_user else 0
+        try:
+            await ctx.bot.send_chat_action(
+                chat_id=conv.key[0],
+                message_thread_id=conv.key[1] or None,
+                action=ChatAction.TYPING,
+            )
+        except Exception:
+            pass
+        try:
+            client = await ensure_client(conv)
+            if blocks:
+                content = list(blocks) + [{"type": "text", "text": text}]
+
+                async def _gen():
+                    yield {
+                        "type": "user",
+                        "message": {"role": "user", "content": content},
+                        "parent_tool_use_id": None,
+                    }
+                await client.query(_gen())
+            else:
+                await client.query(text)
+            status = LiveStatus()
+            buf: list[str] = []
+            n_tools = 0
+
+            async def flush_segment() -> None:
+                nonlocal status
+                seg = "\n".join(p for p in buf if p).strip()
+                buf.clear()
+                if seg.startswith("<pass>"):
+                    seg = ""
+                await status.finalize(update, seg)
+                status = LiveStatus()
+
+            turn_usage: dict = {}
+            async for m in client.receive_response():
+                sid = getattr(m, "session_id", None)
+                if sid and sid != conv.session_id:
+                    conv.session_id = sid
+                u = getattr(m, "usage", None)
+                if isinstance(u, dict) and u.get("input_tokens") is not None:
+                    turn_usage = u
+                if (getattr(m, "subtype", "") == "init"
+                        and isinstance(getattr(m, "data", None), dict)):
+                    conv.current_model = m.data.get("model") or conv.current_model
+                if isinstance(m, AssistantMessage):
+                    for block in m.content:
+                        if isinstance(block, TextBlock):
+                            buf.append(block.text)
+                        elif isinstance(block, ToolUseBlock):
+                            n_tools += 1
+                            if buf:
+                                await flush_segment()
+                            await status.update(
+                                update,
+                                f"⏳ Working… ({n_tools})\n🔧 {_tool_brief(block)}",
+                            )
+                        elif isinstance(block, ThinkingBlock):
+                            if buf:
+                                await flush_segment()
+                            await status.update(update, "💭 Thinking…")
+                elif isinstance(m, UserMessage):
+                    # relay CLI local-command output (/context, /cost, ...)
+                    texts = []
+                    content = getattr(m, "content", None)
+                    if isinstance(content, str):
+                        texts.append(content)
+                    elif isinstance(content, list):
+                        for b in content:
+                            if isinstance(b, TextBlock):
+                                texts.append(b.text)
+                            elif isinstance(b, str):
+                                texts.append(b)
+                    for t in texts:
+                        for out in _LOCAL_OUT_RE.findall(t):
+                            if out.strip():
+                                buf.append(out.strip())
+            await flush_segment()
+            await check_context_usage(update, conv, turn_usage)
+        except Exception as e:
+            log.exception("claude error for %s", conv.key)
+            await drop_client(conv)
+            if update.effective_chat.type == "private":
+                await update.effective_message.reply_text(f"Error: {e}")
+
+    # drain messages queued while this turn was running
+    if conv.queue:
+        queued = conv.queue[:]
+        conv.queue.clear()
+        texts = [t for t, _ in queued]
+        blks = [b for _, bs in queued if bs for b in bs]
+        await run_turn(update, ctx, "\n".join(texts), blks or None)
+
+
+# ---------- handlers ----------
+
+async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    if not chat_allowed(update):
+        await update.effective_message.reply_text(
+            f"This bot doesn't operate here. chat_id={update.effective_chat.id}"
+        )
+        return
+    await update.effective_message.reply_text(
+        "Hi, Claude here.\n"
+        "/resume — pick a CLI session to continue (per chat/topic)\n"
+        "/new — fresh session\n"
+        "/status — current binding\n"
+        "Any other /command is passed to Claude (/compact, skills, ...)."
+    )
+
+
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await cmd_start(update, ctx)
+
+
+async def cmd_reset(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    if not chat_allowed(update) or not is_owner(update):
+        return
+    conv = get_conv(update)
+    async with conv.lock:
+        await drop_client(conv)
+        conv.session_id = None
+    await update.effective_message.reply_text("Fresh session on next message.")
+
+
+async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not chat_allowed(update) or not is_owner(update):
+        return
+    args = ctx.args or []
+    if args:
+        await bind_session(update, args[0])
+        return
+    sessions = scan_sessions()
+    if not sessions:
+        await update.effective_message.reply_text("No sessions found.")
+        return
+    import time as _t
+    rows = []
+    for s in sessions:
+        proj = Path(s["cwd"]).name if s["cwd"] else "?"
+        age_s = _t.time() - s["mtime"]
+        age = (f"{int(age_s // 86400)}d" if age_s >= 86400
+               else f"{int(age_s // 3600)}h" if age_s >= 3600
+               else f"{max(1, int(age_s // 60))}m")
+        rows.append([InlineKeyboardButton(
+            f"{age} · [{proj}] {s['label']}"[:60], callback_data=f"rs:{s['sid']}"
+        )])
+    rows.append([InlineKeyboardButton("✖ Cancel", callback_data="cx")])
+    await update.effective_message.reply_text(
+        "Pick a session for this chat/topic:",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def bind_session(update: Update, sid: str) -> None:
+    meta = find_session(sid)
+    if meta is None:
+        await update.effective_message.reply_text(f"Session {sid} not found.")
+        return
+    conv = get_conv(update)
+    async with conv.lock:
+        await drop_client(conv)
+        conv.session_id = sid
+        if meta["cwd"]:
+            conv.cwd = meta["cwd"]
+    await update.effective_message.reply_text(
+        f"Bound to {sid[:8]}… ({meta['label'] or 'no label'})\ncwd: {conv.cwd}"
+    )
+
+
+def _oauth_token() -> str:
+    creds = json.loads((HOME / ".claude" / ".credentials.json").read_text())
+    return creds["claudeAiOauth"]["accessToken"]
+
+
+_models_cache: dict = {"ts": 0.0, "data": []}
+
+
+async def fetch_models() -> list:
+    import httpx
+    if time.time() - _models_cache["ts"] < 3600 and _models_cache["data"]:
+        return _models_cache["data"]
+    async with httpx.AsyncClient(timeout=15) as cx:
+        r = await cx.get(
+            "https://api.anthropic.com/v1/models",
+            headers={
+                "Authorization": f"Bearer {_oauth_token()}",
+                "anthropic-beta": "oauth-2025-04-20",
+                "anthropic-version": "2023-06-01",
+            },
+        )
+    r.raise_for_status()
+    data = r.json().get("data", [])
+    _models_cache.update(ts=time.time(), data=data)
+    return data
+
+
+def _norm_model(mid: Optional[str]) -> str:
+    """claude-fable-5[1m] and claude-fable-5 are the same model."""
+    return re.sub(r"\[[^\]]*\]$", "", mid or "")
+
+
+def _session_model(sid: Optional[str]) -> Optional[str]:
+    """Read the model actually used by a session from its transcript tail."""
+    if not sid:
+        return None
+    for f in PROJECTS_ROOT.glob(f"*/{sid}.jsonl"):
+        try:
+            with f.open("rb") as fh:
+                try:
+                    fh.seek(-65536, os.SEEK_END)
+                except OSError:
+                    fh.seek(0)
+                tail = fh.read().decode("utf-8", errors="ignore")
+        except OSError:
+            return None
+        hits = re.findall(r'"model"\s*:\s*"([^"]+)"', tail)
+        hits = [h for h in hits if h.startswith("claude")]
+        return hits[-1] if hits else None
+    return None
+
+
+def _ctx_label(n) -> str:
+    if not n:
+        return "?"
+    return f"{n // 1_000_000}M" if n >= 1_000_000 else f"{n // 1000}k"
+
+
+async def fetch_usage() -> str:
+    import httpx
+    from datetime import datetime
+
+    token = _oauth_token()
+    async with httpx.AsyncClient(timeout=15) as cx:
+        r = await cx.get(
+            "https://api.anthropic.com/api/oauth/usage",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "anthropic-beta": "oauth-2025-04-20",
+            },
+        )
+    if r.status_code != 200:
+        return (f"Usage endpoint error {r.status_code}. "
+                "Token may need a refresh; run any turn in the terminal CLI.")
+    d = r.json()
+
+    def bar(p: float) -> str:
+        n = max(0, min(10, round((p or 0) / 10)))
+        return "█" * n + "░" * (10 - n)
+
+    def local(ts: str) -> str:
+        try:
+            return datetime.fromisoformat(ts).astimezone().strftime("%m-%d %H:%M")
+        except Exception:
+            return "?"
+
+    lines = ["📊 Subscription usage"]
+    labels = {"session": "Session (5hr)", "weekly_all": "Weekly (7 day)"}
+    for lim in d.get("limits") or []:
+        kind = lim.get("kind", "?")
+        label = labels.get(kind)
+        if label is None:
+            scope = ((lim.get("scope") or {}).get("model") or {})
+            name = scope.get("display_name") or kind
+            label = f"Weekly {name}" if lim.get("group") == "weekly" else name
+        pct = lim.get("percent") or 0
+        sev = "" if lim.get("severity") in (None, "normal") else " ⚠️"
+        lines.append(
+            f"{label}: {pct:.0f}% {bar(pct)} resets {local(lim.get('resets_at'))}{sev}"
+        )
+    if not (d.get("limits") or []):
+        fh = d.get("five_hour") or {}
+        sd = d.get("seven_day") or {}
+        lines.append(
+            f"Session (5hr): {fh.get('utilization') or 0:.0f}% "
+            f"{bar(fh.get('utilization'))} resets {local(fh.get('resets_at'))}"
+        )
+        lines.append(
+            f"Weekly (7 day): {sd.get('utilization') or 0:.0f}% "
+            f"{bar(sd.get('utilization'))} resets {local(sd.get('resets_at'))}"
+        )
+    ex = d.get("extra_usage") or {}
+    sp = d.get("spend") or {}
+    if ex.get("is_enabled") or sp.get("enabled"):
+        def money(m: dict) -> float:
+            return (m.get("amount_minor") or 0) / (10 ** (m.get("exponent") or 2))
+
+        used = money(sp.get("used") or {})
+        cap = money(sp.get("limit") or {})
+        if not cap:  # fallback to extra_usage (values in minor units too)
+            dp = ex.get("decimal_places") or 2
+            used = (ex.get("used_credits") or 0) / (10 ** dp)
+            cap = (ex.get("monthly_limit") or 0) / (10 ** dp)
+        pct = sp.get("percent") or ex.get("utilization") or 0
+        sev = "" if sp.get("severity") in (None, "normal") else " ⚠️"
+        from datetime import date
+        today = date.today()
+        nxt = date(today.year + (today.month == 12), today.month % 12 + 1, 1)
+        lines.append(
+            f"Usage credits: ${used:.2f} / ${cap:.2f}"
+            f" ({pct:.0f}%){sev} resets {nxt.strftime('%b %d')}"
+        )
+    return "\n".join(lines)
+
+
+async def cmd_usage(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    if not chat_allowed(update) or not is_owner(update):
+        return
+    try:
+        text = await fetch_usage()
+    except Exception as e:
+        text = f"Usage fetch failed: {e}"
+    await update.effective_message.reply_text(text)
+
+
+def _persist_env(key: str, value: str) -> None:
+    env_path = Path(__file__).parent / ".env"
+    lines = env_path.read_text().splitlines() if env_path.exists() else []
+    lines = [l for l in lines if not l.startswith(f"{key}=")]
+    lines.append(f"{key}={value}")
+    env_path.write_text("\n".join(lines) + "\n")
+
+
+async def cmd_whisper(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    global WHISPER_MODEL, _whisper_model
+    if not chat_allowed(update) or not is_owner(update):
+        return
+    args = ctx.args or []
+    if not args:
+        choices = [
+            ("large-v3-turbo", "quality"),
+            ("medium", "balanced"),
+            ("small", "fast"),
+            ("base", "fastest"),
+        ]
+        rows = [[InlineKeyboardButton(
+            f"{'✓ ' if name == WHISPER_MODEL else ''}{name} ({hint})",
+            callback_data=f"wm:{name}",
+        )] for name, hint in choices]
+        rows.append([InlineKeyboardButton("✖ Cancel", callback_data="cx")])
+        await update.effective_message.reply_text(
+            f"Voice model: {WHISPER_MODEL}"
+            f" ({'loaded' if _whisper_model is not None else 'not loaded'})\n"
+            "Pick one, or set any model with /whisper <model>:",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return
+    await set_whisper_model(update.effective_message.reply_text, args[0])
+
+
+async def set_whisper_model(reply, model: str) -> None:
+    global WHISPER_MODEL, _whisper_model
+    WHISPER_MODEL = model
+    _whisper_model = None
+    _persist_env("WHISPER_MODEL", model)
+    await reply(
+        f"Voice model set to {model} (persisted). "
+        "Loads (and downloads if needed) on next voice message."
+    )
+
+
+MODEL_CHOICES = ["default", "opus", "sonnet", "haiku"]
+
+
+# Static snapshot used until (and if) runtime discovery replaces it.
+EFFORT_FALLBACK = ["low", "medium", "high", "xhigh", "max", "ultracode"]
+
+
+def _discover_effort_choices() -> tuple:
+    """Behavioral discovery, wording-independent.
+
+    Decider: output of `claude --effort <v> --version` identical to the
+    bare `claude --version` baseline == value silently accepted. Any extra
+    output (however phrased) == rejected. Text parsing is only a candidate
+    *generator*; if the wording changes we lose a source, never correctness.
+    Returns (choices, scrape_worked).
+    """
+    import subprocess
+
+    def run(args: list) -> str:
+        r = subprocess.run(["claude", *args, "--version"],
+                          capture_output=True, text=True, timeout=20)
+        return (r.stdout + r.stderr).strip()
+
+    baseline = run([])
+    probe_txt = run(["--effort", "__probe__"])
+
+    candidates: list = []
+    scraped = re.findall(r"[a-z]{2,12}", probe_txt.replace(baseline, ""))
+    scrape_worked = bool(scraped)
+    for src in (scraped, EFFORT_FALLBACK):
+        for c in src:
+            if c not in candidates:
+                candidates.append(c)
+
+    accepted = [c for c in candidates if run(["--effort", c]) == baseline]
+    return (accepted or EFFORT_FALLBACK), scrape_worked
+
+
+EFFORT_CHOICES = list(EFFORT_FALLBACK)
+
+
+async def refresh_effort_choices(app: Application) -> None:
+    global EFFORT_CHOICES
+    try:
+        choices, scrape_worked = await asyncio.to_thread(_discover_effort_choices)
+        EFFORT_CHOICES = choices
+        log.info("effort choices discovered: %s (scrape=%s)", choices, scrape_worked)
+        if not scrape_worked:
+            await notify_owner(
+                app,
+                "⚠️ Effort discovery degraded: CLI warning format changed; "
+                "using probe-verified fallback candidates only.",
+            )
+    except Exception:
+        log.exception("effort discovery failed; keeping fallback")
+
+
+async def apply_model(reply, conv: Conversation, m: str) -> None:
+    conv.model = None if m == "default" else m
+    if conv.client is not None:
+        try:
+            await conv.client.set_model(conv.model)
+        except Exception as e:
+            await reply(f"set_model failed: {e}")
+            return
+        await reply(f"Model set to {m} (live).")
+    else:
+        await reply(f"Model set to {m}; applies on next message.")
+
+
+async def apply_effort(reply, conv: Conversation, e: str) -> None:
+    conv.effort = e
+    await drop_client(conv)
+    await reply(
+        f"Effort set to {e}; applies from the next message "
+        "(session resumes, context preserved)."
+    )
+
+
+async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not chat_allowed(update) or not is_owner(update):
+        return
+    conv = get_conv(update)
+    args = ctx.args or []
+    if args:
+        await apply_model(update.effective_message.reply_text, conv, args[0])
+        return
+    if conv.current_model is None:
+        conv.current_model = _session_model(conv.session_id)
+    active = _norm_model(conv.model or conv.current_model)
+    rows = []
+    try:
+        models = await fetch_models()
+        for m in models[:10]:
+            mid = m.get("id", "")
+            mark = "✓ " if _norm_model(mid) == active else ""
+            rows.append([InlineKeyboardButton(
+                f"{mark}{m.get('display_name', mid)} · "
+                f"{_ctx_label(m.get('max_input_tokens'))} ctx",
+                callback_data=f"md:{mid}"[:64],
+            )])
+    except Exception as e:
+        log.warning("fetch_models failed: %s", e)
+        for m in MODEL_CHOICES:
+            rows.append([InlineKeyboardButton(m, callback_data=f"md:{m}")])
+    rows.append([InlineKeyboardButton(
+        "default (clear override)", callback_data="md:default")])
+    rows.append([InlineKeyboardButton("✖ Cancel", callback_data="cx")])
+    await update.effective_message.reply_text(
+        f"Session model: {conv.current_model or 'unknown'}\n"
+        f"Override: {conv.model or 'none'}\n"
+        "Pick one, or /model <alias|id> (fable, opus, sonnet, or a full id):",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def cmd_effort(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not chat_allowed(update) or not is_owner(update):
+        return
+    conv = get_conv(update)
+    args = ctx.args or []
+    if args:
+        await apply_effort(update.effective_message.reply_text, conv, args[0])
+        return
+    rows = [[InlineKeyboardButton(
+        f"{'✓ ' if e == conv.effort else ''}{e}", callback_data=f"ef:{e}",
+    )] for e in EFFORT_CHOICES]
+    rows.append([InlineKeyboardButton("✖ Cancel", callback_data="cx")])
+    await update.effective_message.reply_text(
+        f"Effort: {conv.effort or '(default)'}",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def cmd_stop(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    if not chat_allowed(update) or not is_owner(update):
+        return
+    conv = get_conv(update)
+    if conv.client is None or not conv.lock.locked():
+        await update.effective_message.reply_text("Nothing running.")
+        return
+    try:
+        await conv.client.interrupt()
+        await update.effective_message.reply_text("⏹ Interrupt sent.")
+    except Exception as e:
+        await update.effective_message.reply_text(f"Interrupt failed: {e}")
+
+
+async def cmd_status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    if not chat_allowed(update):
+        return
+    conv = get_conv(update)
+    await update.effective_message.reply_text(
+        f"profile: {conv.profile}\n"
+        f"session: {conv.session_id or '(new on next message)'}\n"
+        f"cwd: {conv.cwd}\n"
+        f"connected: {conv.client is not None}"
+    )
+
+
+async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if q is None:
+        return
+    if q.from_user is None or q.from_user.id != OWNER_ID:
+        await q.answer("Owner only.")
+        return
+    data = q.data or ""
+    if data == "cx":
+        await q.answer("Cancelled")
+        try:
+            await q.message.delete()
+        except Exception:
+            try:
+                await q.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+    elif data.startswith("rs:"):
+        await q.answer()
+        await bind_session(update, data[3:])
+    elif data.startswith("wm:"):
+        await q.answer()
+        async def _edit(text: str) -> None:
+            try:
+                await q.edit_message_text(text)
+            except Exception:
+                pass
+        await set_whisper_model(_edit, data[3:])
+    elif data.startswith("md:") or data.startswith("ef:"):
+        await q.answer()
+        conv = get_conv(update)
+
+        async def _edit2(text: str) -> None:
+            try:
+                await q.edit_message_text(text)
+            except Exception:
+                pass
+        if data.startswith("md:"):
+            await apply_model(_edit2, conv, data[3:])
+        else:
+            await apply_effort(_edit2, conv, data[3:])
+    elif data.startswith("bt:"):
+        _, token, idx = data.split(":", 2)
+        entry = pending_btns.get(token)
+        if entry is None:
+            await q.answer("Expired.")
+            return
+        fut, _msg = entry
+        if not fut.done():
+            fut.set_result(int(idx))
+        await q.answer("OK")
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+    else:
+        await q.answer()
+
+
+async def on_unknown_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Any /command the bot doesn't own is passed through to the CLI session."""
+    if not chat_allowed(update):
+        return
+    msg = update.effective_message
+    if msg is None or not msg.text:
+        return
+    text = re.sub(r"^(/\w+)@\w+", r"\1", msg.text)  # strip @botname
+    cmd = text.split()[0][1:].lower()
+    if cmd in SHELL_CMDS:
+        if not is_owner(update):
+            return
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                SHELL_CMDS[cmd],
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
+            body = _ANSI_RE.sub("", out.decode(errors="ignore")).strip()[-3500:]
+        except Exception as e:
+            body = f"error: {e}"
+        try:
+            await msg.reply_text(f"```\n{body}\n```", parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await msg.reply_text(body)
+        return
+    log.info("passthrough %s from %s", text.split()[0], update.effective_user.id)
+    await run_turn(update, ctx, text)
+
+
+async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not chat_allowed(update):
+        return
+    msg = update.effective_message
+    if msg is None or not msg.text:
+        return
+    log.info("msg %s user=%s text=%r", conv_key_of(update),
+             update.effective_user.id if update.effective_user else None,
+             msg.text[:120])
+    await run_turn(update, ctx, format_incoming(update))
+
+
+async def notify_owner(app: Application, text: str) -> None:
+    try:
+        await app.bot.send_message(
+            chat_id=OWNER_ID, text=text, disable_notification=True
+        )
+    except Exception:
+        log.warning("owner notify failed: %r", text)
+
+
+async def restart_watcher(app: Application) -> None:
+    """Graceful deploy: restart only when no conversation is mid-turn."""
+    while True:
+        await asyncio.sleep(5)
+        if not RESTART_FLAG.exists():
+            continue
+        if any(c.lock.locked() for c in conversations.values()):
+            continue
+        try:
+            RESTART_FLAG.unlink()
+        except OSError:
+            pass
+        log.info("restart flag detected and idle; restarting service")
+        try:
+            m = await app.bot.send_message(
+                chat_id=OWNER_ID, text="♻️ Restarting…",
+                disable_notification=True,
+            )
+            RESTART_NOTICE.write_text(
+                json.dumps({"chat_id": m.chat_id, "message_id": m.message_id})
+            )
+        except Exception:
+            log.warning("restart notice failed")
+        await asyncio.create_subprocess_shell(
+            "sudo -n systemctl restart tg-claude-bot"
+        )
+        return
+
+
+async def post_init(app: Application) -> None:
+    """Register command menus so typing '/' shows hints (scoped per chat)."""
+    cmds = [
+        BotCommand("resume", "Resume a conversation"),
+        BotCommand("new", "Start a new session"),
+        BotCommand("status", "Show current session binding"),
+        BotCommand("stop", "Interrupt the current turn (ESC)"),
+        BotCommand("model", "Set the model for this conversation"),
+        BotCommand("effort", "Set effort level for this conversation"),
+        BotCommand("compact", "Clear history but keep a summary in context"),
+        BotCommand("context", "Show current context usage"),
+        BotCommand("cost", "Show session cost"),
+        BotCommand("usage", "Subscription usage (5h / weekly / credits)"),
+        BotCommand("ccusage", "Token stats from local logs (ccusage)"),
+        BotCommand("verify", "Verify a code change end-to-end"),
+        BotCommand("simplify", "Simplify the changed code"),
+        BotCommand("review", "Review a GitHub pull request"),
+        BotCommand("run", "Launch and drive this project's app"),
+        BotCommand("loop", "Run a prompt on a recurring interval"),
+        BotCommand("schedule", "Manage scheduled cloud agents"),
+        BotCommand("init", "Initialize CLAUDE.md for a codebase"),
+        BotCommand("whisper", "Show or set the voice transcription model"),
+        BotCommand("reset", "Same as /new"),
+        BotCommand("help", "Show help"),
+    ]
+    try:
+        await app.bot.set_my_commands(cmds, scope=BotCommandScopeDefault())
+        # clear any previously-set per-chat scopes so default applies everywhere
+        for scope in (BotCommandScopeChat(chat_id=OWNER_ID),
+                      BotCommandScopeChat(chat_id=TARGET_GROUP_ID)):
+            try:
+                await app.bot.delete_my_commands(scope=scope)
+            except Exception:
+                pass
+        log.info("command menu registered (unified scope)")
+    except Exception:
+        log.exception("failed to register command menu")
+    app.create_task(restart_watcher(app))
+    app.create_task(refresh_effort_choices(app))
+    # transform the pre-restart notice in place; only send a new message on cold boot
+    edited = False
+    if RESTART_NOTICE.exists():
+        try:
+            ref = json.loads(RESTART_NOTICE.read_text())
+            await app.bot.edit_message_text(
+                chat_id=ref["chat_id"], message_id=ref["message_id"],
+                text="✅ Online",
+            )
+            edited = True
+        except Exception:
+            pass
+        finally:
+            try:
+                RESTART_NOTICE.unlink()
+            except OSError:
+                pass
+    if not edited:
+        await notify_owner(app, "✅ Online")
+
+
+async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not chat_allowed(update):
+        return
+    msg = update.effective_message
+    media = msg.voice or msg.audio
+    if media is None:
+        return
+    if media.duration and media.duration > 600:
+        await msg.reply_text("Voice message too long (>10 min).")
+        return
+    placeholder = ("🎙 Preparing speech model… (first use may download it)"
+                   if _whisper_model is None else "🎤 Transcribing…")
+    try:
+        notice = await msg.reply_text(placeholder, disable_notification=True)
+    except Exception:
+        notice = None
+
+    async def show(text_: str) -> None:
+        if notice is not None:
+            try:
+                await notice.edit_text(text_)
+                return
+            except Exception:
+                pass
+        await msg.reply_text(text_, disable_notification=True)
+
+    tmp = Path(f"/tmp/tgvoice-{uuid.uuid4().hex}.oga")
+    try:
+        f = await ctx.bot.get_file(media.file_id)
+        await f.download_to_drive(custom_path=str(tmp))
+        text = await transcribe(str(tmp))
+    except Exception as e:
+        log.exception("voice transcription failed")
+        await show(f"Transcription failed: {e}")
+        return
+    finally:
+        tmp.unlink(missing_ok=True)
+    if not text:
+        await show("(听不清，转写为空)")
+        return
+    user = update.effective_user
+    name = user.full_name if user else "unknown"
+    uid = user.id if user else 0
+    log.info("voice %s user=%s -> %r", conv_key_of(update), uid, text[:120])
+    await show(f"🎤 {text}")
+    await run_turn(
+        update, ctx, f"[{name} ({uid})] (voice): {reply_context(msg)}{text}"
+    )
+
+
+MEDIA_TTL_DAYS = float(os.environ.get("TGBOT_MEDIA_TTL_DAYS", "14"))
+
+
+def media_dir_for(conv: Conversation) -> Path:
+    d = Path(conv.cwd) / ".tgbot" / "media"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        gi = d.parent / ".gitignore"
+        if not gi.exists():
+            gi.write_text("*\n")
+    except OSError:
+        d = Path("/tmp/tgbot-media")
+        d.mkdir(exist_ok=True)
+    # opportunistic TTL cleanup
+    cutoff = time.time() - MEDIA_TTL_DAYS * 86400
+    try:
+        for f in d.iterdir():
+            if f.is_file() and f.stat().st_mtime < cutoff:
+                f.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return d
+
+
+async def _save_media(update: Update, ctx, media, filename: str) -> Optional[Path]:
+    conv = get_conv(update)
+    path = media_dir_for(conv) / filename
+    try:
+        f = await ctx.bot.get_file(media.file_id)
+        await f.download_to_drive(custom_path=str(path))
+        return path
+    except Exception as e:
+        log.exception("media download failed")
+        await update.effective_message.reply_text(
+            f"Download failed: {e} (Bot API file limit is 20MB)"
+        )
+        return None
+
+
+async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not chat_allowed(update):
+        return
+    msg = update.effective_message
+    if msg.photo:
+        media = msg.photo[-1]  # largest size
+        ext = "jpg"
+    elif msg.document and (msg.document.mime_type or "").startswith("image/"):
+        media = msg.document
+        ext = (msg.document.mime_type or "image/png").split("/")[-1]
+    else:
+        return
+    mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+            "webp": "image/webp", "gif": "image/gif"}.get(ext.lower(), "image/jpeg")
+    user = update.effective_user
+    name = user.full_name if user else "unknown"
+    uid = user.id if user else 0
+    tmp = Path(f"/tmp/tgimg-{uuid.uuid4().hex}.{ext}")
+    try:
+        f = await ctx.bot.get_file(media.file_id)
+        await f.download_to_drive(custom_path=str(tmp))
+        data = tmp.read_bytes()
+    except Exception as e:
+        log.exception("image download failed")
+        await msg.reply_text(f"Image download failed: {e}")
+        return
+    finally:
+        tmp.unlink(missing_ok=True)
+    if len(data) <= 4_500_000:
+        # native path: image travels inside the message, lives in the transcript
+        import base64
+        blocks = [{"type": "image", "source": {
+            "type": "base64", "media_type": mime,
+            "data": base64.b64encode(data).decode(),
+        }}]
+        log.info("photo %s user=%s -> inline (%d bytes)",
+                 conv_key_of(update), uid, len(data))
+        await run_turn(
+            update, ctx,
+            f"[{name} ({uid})] (sent the image above): "
+            f"{reply_context(msg)}{msg.caption or ''}",
+            blocks=blocks,
+        )
+        return
+    # oversized: fall back to disk + Read tool
+    path = media_dir_for(get_conv(update)) / f"{uuid.uuid4().hex[:12]}.{ext}"
+    path.write_bytes(data)
+    log.info("photo %s user=%s -> %s (oversize)", conv_key_of(update), uid, path)
+    await run_turn(
+        update, ctx,
+        f"[{name} ({uid})] (sent an image, saved at {path}; "
+        f"use the Read tool to view it): {reply_context(msg)}{msg.caption or ''}",
+    )
+
+
+def _safe_name(name: str) -> str:
+    return re.sub(r"[^\w.\-]+", "_", name)[:80] or "file"
+
+
+async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not chat_allowed(update):
+        return
+    msg = update.effective_message
+    doc = msg.document
+    if doc is None:
+        return
+    fname = f"{uuid.uuid4().hex[:8]}-{_safe_name(doc.file_name or 'file')}"
+    path = await _save_media(update, ctx, doc, fname)
+    if path is None:
+        return
+    user = update.effective_user
+    name = user.full_name if user else "unknown"
+    uid = user.id if user else 0
+    log.info("document %s user=%s -> %s", conv_key_of(update), uid, path)
+    await run_turn(
+        update, ctx,
+        f"[{name} ({uid})] (sent a file, saved at {path}): "
+        f"{reply_context(msg)}{msg.caption or ''}",
+    )
+
+
+async def on_shutdown(app: Application) -> None:
+    log.info("shutting down, closing %d conversations", len(conversations))
+    for conv in list(conversations.values()):
+        await drop_client(conv)
+
+
+def main() -> None:
+    global app_ref
+    log.info("config: target_group=%s default_resume=%s",
+             TARGET_GROUP_ID, DEFAULT_RESUME or "(none)")
+    app = (
+        Application.builder()
+        .token(TG_TOKEN)
+        .concurrent_updates(True)
+        .post_init(post_init)
+        .post_shutdown(on_shutdown)
+        .build()
+    )
+    app_ref = app
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(CommandHandler("new", cmd_reset))
+    app.add_handler(CommandHandler("resume", cmd_resume))
+    app.add_handler(CommandHandler("sessions", cmd_resume))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("stop", cmd_stop))
+    app.add_handler(CommandHandler("esc", cmd_stop))
+    app.add_handler(CommandHandler("model", cmd_model))
+    app.add_handler(CommandHandler("effort", cmd_effort))
+    app.add_handler(CommandHandler("whisper", cmd_whisper))
+    app.add_handler(CommandHandler("usage", cmd_usage))
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.COMMAND, on_unknown_command))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, on_photo))
+    app.add_handler(MessageHandler(
+        filters.Document.ALL & ~filters.Document.IMAGE, on_document
+    ))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()

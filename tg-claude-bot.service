@@ -1,0 +1,21 @@
+[Unit]
+Description=Telegram bridge for Claude Code (claude-agent-sdk)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+WorkingDirectory=/home/YOUR_USER/tg-claude-bot
+Environment=PATH=/home/YOUR_USER/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Auth for the Claude CLI: either a long-lived token from `claude setup-token`,
+# or omit this line if the CLI is already logged in for this user.
+Environment=CLAUDE_CODE_OAUTH_TOKEN=REPLACE_ME
+ExecStart=/home/YOUR_USER/.local/bin/uv run python bot.py
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
