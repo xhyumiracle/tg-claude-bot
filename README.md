@@ -188,4 +188,6 @@ All state lives in the CLI's own files; kill the bot, nothing is forgotten.
 
 [MIT](LICENSE) · If this put Claude Code in your pocket, a ⭐ helps others find it.
 
+<sub>Friends: [LINUX DO](https://linux.do/)</sub>
+
 </div>
