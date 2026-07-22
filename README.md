@@ -4,8 +4,8 @@
 
 **Your local Claude Code, in your pocket.**
 
-A single-file Telegram bridge to the Claude Code CLI: resume any session,
-keep every tool and skill, answer prompts with buttons, talk by voice.
+A single-file Telegram bridge to the Claude Code CLI: vibe-code by voice,
+resume any session, keep every tool and skill, answer prompts with buttons.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](pyproject.toml)
