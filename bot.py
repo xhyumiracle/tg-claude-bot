@@ -1342,12 +1342,39 @@ async def cmd_status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             f"connected: {conv.client is not None}"
         )
         return
-    await update.effective_message.reply_text(
-        f"profile: {conv.profile}\n"
-        f"session: {conv.session_id or '(new on next message)'}\n"
-        f"cwd: {conv.cwd}\n"
-        f"connected: {conv.client is not None}"
-    )
+    state = ("⏳ working" if conv.lock.locked()
+             else "🟢 connected" if conv.client is not None
+             else "⚪ idle — connects on next message")
+    lines = [f"👤 {conv.profile} · {state}"]
+    if conv.session_id:
+        label = ""
+        for f in PROJECTS_ROOT.glob(f"*/{conv.session_id}.jsonl"):
+            _, label = _session_meta(f)
+            break
+        lines.append(f"📄 {label or '(untitled)'}")
+        lines.append(f"      {conv.session_id}")
+    else:
+        lines.append("📄 (new session on next message)")
+    lines.append(f"📁 {conv.cwd}")
+    model = _norm_model(conv.model or conv.current_model
+                        or _session_model(conv.session_id))
+    mline = f"🤖 {model or 'default model'}"
+    if conv.model:
+        mline += " (override)"
+    if conv.effort:
+        mline += f" · effort: {conv.effort}"
+    lines.append(mline)
+    total = await asyncio.to_thread(_session_context_tokens, conv.session_id)
+    if total:
+        limit = await _context_limit(conv)
+        pct = total * 100 / limit
+        icon = "🔴" if pct >= 90 else "🟠" if pct >= 80 else "🧠"
+        n = max(0, min(10, round(pct / 10)))
+        lines.append(f"{icon} Context {pct:.0f}% {'█' * n}{'░' * (10 - n)} "
+                     f"({total // 1000}k / {limit // 1000}k)")
+    if conv.queue:
+        lines.append(f"📥 {len(conv.queue)} message(s) queued")
+    await update.effective_message.reply_text("\n".join(lines))
 
 
 async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
