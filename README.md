@@ -23,10 +23,6 @@ tools, skills, and config — it *is* your local CLI. `/resume` picks up any
 session you left in the terminal. The bot is a thin stateless router; the CLI
 owns everything.
 
-<p align="center">
-  <img alt="A voice message becomes a transcript, live status, and Claude's clarifying question as buttons" src="assets/demo-question.jpg" width="340">
-</p>
-
 ## ✨ Highlights
 
 | | |
@@ -60,6 +56,12 @@ owns everything.
 Deliberate trade-off: no attaching to a *live* terminal (what tmux bridges
 like [ccbot](https://github.com/six-ddc/ccbot) do) — in exchange, structured
 events and statelessness.
+
+<p align="center">
+  <img alt="A voice message becomes a transcript, live status, and Claude's clarifying question as buttons" src="assets/demo-question.jpg" width="340">
+  <br>
+  <em>One turn, end to end: voice → local transcript → live status → clarifying question as buttons.</em>
+</p>
 
 ## ⌨️ Commands
 
