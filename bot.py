@@ -628,15 +628,28 @@ def _tool_brief(block: ToolUseBlock) -> str:
     return block.name
 
 
-async def _context_limit(conv: Conversation) -> int:
-    active = _norm_model(conv.model or conv.current_model)
+async def _context_limit(conv: Conversation, used: int = 0) -> int:
+    raw = (conv.model or conv.current_model
+           or _session_model(conv.session_id) or "")
+    active = _norm_model(raw)
     try:
-        for m in await fetch_models():
-            if _norm_model(m.get("id")) == active:
-                return m.get("max_input_tokens") or 200_000
+        models = await fetch_models()
     except Exception:
-        pass
-    return 200_000
+        return 1_000_000 if "[1m]" in raw else 200_000
+    for m in models:  # exact id (incl. context-window variant) wins
+        if m.get("id") == raw and m.get("max_input_tokens"):
+            return m["max_input_tokens"]
+    cands = sorted(m["max_input_tokens"] for m in models
+                   if _norm_model(m.get("id")) == active
+                   and m.get("max_input_tokens"))
+    if not cands:
+        return 200_000
+    # the id is ambiguous between window variants (jsonl strips the suffix);
+    # actual usage rules out windows it already exceeds
+    for c in cands:
+        if used < c:
+            return c
+    return cands[-1]
 
 
 def _session_context_tokens(sid: Optional[str]) -> int:
@@ -674,7 +687,7 @@ async def check_context_usage(update: Update, conv: Conversation) -> None:
     total = await asyncio.to_thread(_session_context_tokens, conv.session_id)
     if not total:
         return
-    limit = await _context_limit(conv)
+    limit = await _context_limit(conv, total)
     pct = total * 100 / limit
     if pct < 75:
         conv.ctx_warned = 0
@@ -1366,7 +1379,7 @@ async def cmd_status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     lines.append(mline)
     total = await asyncio.to_thread(_session_context_tokens, conv.session_id)
     if total:
-        limit = await _context_limit(conv)
+        limit = await _context_limit(conv, total)
         pct = total * 100 / limit
         icon = "🔴" if pct >= 90 else "🟠" if pct >= 80 else "🧠"
         n = max(0, min(10, round(pct / 10)))
