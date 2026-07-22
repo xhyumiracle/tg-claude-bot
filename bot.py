@@ -268,7 +268,7 @@ def _session_meta(path: Path) -> Tuple[Optional[str], str]:
     return cwd, label[:60]
 
 
-def scan_sessions(limit: int = 8):
+def scan_sessions(limit: int = 60):
     files = sorted(
         PROJECTS_ROOT.glob("*/*.jsonl"),
         key=lambda p: p.stat().st_mtime,
@@ -852,6 +852,42 @@ async def cmd_reset(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text("Fresh session on next message.")
 
 
+PICKER_PAGE = 8
+
+
+def _pager_row(prefix: str, page: int, pages: int) -> list:
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀ Prev", callback_data=f"{prefix}{page - 1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("Next ▶", callback_data=f"{prefix}{page + 1}"))
+    return nav
+
+
+def _session_page(page: int) -> Tuple[str, InlineKeyboardMarkup]:
+    sessions = scan_sessions()
+    pages = max(1, -(-len(sessions) // PICKER_PAGE))
+    page = max(0, min(page, pages - 1))
+    rows = []
+    now = time.time()
+    for s in sessions[page * PICKER_PAGE:(page + 1) * PICKER_PAGE]:
+        proj = Path(s["cwd"]).name if s["cwd"] else "?"
+        age_s = now - s["mtime"]
+        age = (f"{int(age_s // 86400)}d" if age_s >= 86400
+               else f"{int(age_s // 3600)}h" if age_s >= 3600
+               else f"{max(1, int(age_s // 60))}m")
+        rows.append([InlineKeyboardButton(
+            f"{age} · [{proj}] {s['label']}"[:60], callback_data=f"rs:{s['sid']}"
+        )])
+    nav = _pager_row("rp:", page, pages)
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("✖ Cancel", callback_data="cx")])
+    title = ("Pick a session for this chat/topic"
+             + (f" ({page + 1}/{pages})" if pages > 1 else "") + ":")
+    return title, InlineKeyboardMarkup(rows)
+
+
 async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not chat_allowed(update) or not is_owner(update):
         return
@@ -859,26 +895,11 @@ async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if args:
         await bind_session(update, args[0])
         return
-    sessions = scan_sessions()
-    if not sessions:
+    if not scan_sessions(limit=1):
         await update.effective_message.reply_text("No sessions found.")
         return
-    import time as _t
-    rows = []
-    for s in sessions:
-        proj = Path(s["cwd"]).name if s["cwd"] else "?"
-        age_s = _t.time() - s["mtime"]
-        age = (f"{int(age_s // 86400)}d" if age_s >= 86400
-               else f"{int(age_s // 3600)}h" if age_s >= 3600
-               else f"{max(1, int(age_s // 60))}m")
-        rows.append([InlineKeyboardButton(
-            f"{age} · [{proj}] {s['label']}"[:60], callback_data=f"rs:{s['sid']}"
-        )])
-    rows.append([InlineKeyboardButton("✖ Cancel", callback_data="cx")])
-    await update.effective_message.reply_text(
-        "Pick a session for this chat/topic:",
-        reply_markup=InlineKeyboardMarkup(rows),
-    )
+    title, kb = _session_page(0)
+    await update.effective_message.reply_text(title, reply_markup=kb)
 
 
 async def bind_session(update: Update, sid: str) -> None:
@@ -1167,21 +1188,17 @@ async def apply_effort(reply, conv: Conversation, e: str) -> None:
     )
 
 
-async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not chat_allowed(update) or not is_owner(update):
-        return
-    conv = get_conv(update)
-    args = ctx.args or []
-    if args:
-        await apply_model(update.effective_message.reply_text, conv, args[0])
-        return
+async def _model_page(conv: Conversation, page: int) -> Tuple[str, InlineKeyboardMarkup]:
     if conv.current_model is None:
         conv.current_model = _session_model(conv.session_id)
     active = _norm_model(conv.model or conv.current_model)
     rows = []
+    pages = 1
     try:
         models = await fetch_models()
-        for m in models[:10]:
+        pages = max(1, -(-len(models) // PICKER_PAGE))
+        page = max(0, min(page, pages - 1))
+        for m in models[page * PICKER_PAGE:(page + 1) * PICKER_PAGE]:
             mid = m.get("id", "")
             mark = "✓ " if _norm_model(mid) == active else ""
             rows.append([InlineKeyboardButton(
@@ -1193,15 +1210,29 @@ async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         log.warning("fetch_models failed: %s", e)
         for m in MODEL_CHOICES:
             rows.append([InlineKeyboardButton(m, callback_data=f"md:{m}")])
+    nav = _pager_row("mp:", page, pages)
+    if nav:
+        rows.append(nav)
     rows.append([InlineKeyboardButton(
         "default (clear override)", callback_data="md:default")])
     rows.append([InlineKeyboardButton("✖ Cancel", callback_data="cx")])
-    await update.effective_message.reply_text(
-        f"Session model: {conv.current_model or 'unknown'}\n"
-        f"Override: {conv.model or 'none'}\n"
-        "Pick one, or /model <alias|id> (fable, opus, sonnet, or a full id):",
-        reply_markup=InlineKeyboardMarkup(rows),
-    )
+    title = (f"Session model: {conv.current_model or 'unknown'}\n"
+             f"Override: {conv.model or 'none'}\n"
+             "Pick one, or /model <alias|id> (fable, opus, sonnet, or a full id)"
+             + (f" ({page + 1}/{pages})" if pages > 1 else "") + ":")
+    return title, InlineKeyboardMarkup(rows)
+
+
+async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not chat_allowed(update) or not is_owner(update):
+        return
+    conv = get_conv(update)
+    args = ctx.args or []
+    if args:
+        await apply_model(update.effective_message.reply_text, conv, args[0])
+        return
+    title, kb = await _model_page(conv, 0)
+    await update.effective_message.reply_text(title, reply_markup=kb)
 
 
 async def cmd_effort(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1302,6 +1333,20 @@ async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     elif data.startswith("rs:"):
         await q.answer()
         await bind_session(update, data[3:])
+    elif data.startswith("rp:") or data.startswith("mp:"):
+        await q.answer()
+        try:
+            page = int(data[3:])
+        except ValueError:
+            return
+        if data.startswith("rp:"):
+            title, kb = _session_page(page)
+        else:
+            title, kb = await _model_page(get_conv(update), page)
+        try:
+            await q.edit_message_text(title, reply_markup=kb)
+        except Exception:
+            pass
     elif data.startswith("wm:"):
         await q.answer()
         async def _edit(text: str) -> None:
