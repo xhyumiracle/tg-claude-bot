@@ -18,10 +18,13 @@ buttons, talk to it with voice messages.
 
 ---
 
-Start a session in your terminal, walk away, and continue it from Telegram —
-same session, same context, same tools. The bot is a thin stateless router over
-the Claude Agent SDK; the CLI keeps owning sessions, tools, skills, and
-persistence. There is very little here that can break.
+Message the bot and you get a fresh Claude Code session — same tools, skills,
+and config as your terminal, because it *is* your local CLI, just like typing
+`claude` in a shell. And when you want the session you left on your desktop,
+`/resume` picks it up from your phone: same context, same everything. The bot
+is a thin stateless router over the Claude Agent SDK; the CLI keeps owning
+sessions, tools, skills, and persistence. There is very little here that can
+break.
 
 ## Highlights
 
