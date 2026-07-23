@@ -2630,29 +2630,33 @@ def main() -> None:
         .build()
     )
     app_ref = app
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("clear", cmd_reset))
-    app.add_handler(CommandHandler("new", cmd_reset))
-    app.add_handler(CommandHandler("reset", cmd_reset))
-    app.add_handler(CommandHandler("resume", cmd_resume))
-    app.add_handler(CommandHandler("sessions", cmd_resume))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("stop", cmd_stop))
-    app.add_handler(CommandHandler("esc", cmd_stop))
-    app.add_handler(CommandHandler("model", cmd_model))
-    app.add_handler(CommandHandler("effort", cmd_effort))
-    app.add_handler(CommandHandler("mode", cmd_mode))
-    app.add_handler(CommandHandler("whisper", cmd_whisper))
-    app.add_handler(CommandHandler("usage", cmd_usage))
+    app.add_handler(CommandHandler("start", cmd_start, filters=~filters.FORWARDED))
+    app.add_handler(CommandHandler("help", cmd_help, filters=~filters.FORWARDED))
+    app.add_handler(CommandHandler("clear", cmd_reset, filters=~filters.FORWARDED))
+    app.add_handler(CommandHandler("new", cmd_reset, filters=~filters.FORWARDED))
+    app.add_handler(CommandHandler("reset", cmd_reset, filters=~filters.FORWARDED))
+    app.add_handler(CommandHandler("resume", cmd_resume, filters=~filters.FORWARDED))
+    app.add_handler(CommandHandler("sessions", cmd_resume, filters=~filters.FORWARDED))
+    app.add_handler(CommandHandler("status", cmd_status, filters=~filters.FORWARDED))
+    app.add_handler(CommandHandler("stop", cmd_stop, filters=~filters.FORWARDED))
+    app.add_handler(CommandHandler("esc", cmd_stop, filters=~filters.FORWARDED))
+    app.add_handler(CommandHandler("model", cmd_model, filters=~filters.FORWARDED))
+    app.add_handler(CommandHandler("effort", cmd_effort, filters=~filters.FORWARDED))
+    app.add_handler(CommandHandler("mode", cmd_mode, filters=~filters.FORWARDED))
+    app.add_handler(CommandHandler("whisper", cmd_whisper, filters=~filters.FORWARDED))
+    app.add_handler(CommandHandler("usage", cmd_usage, filters=~filters.FORWARDED))
     app.add_handler(CallbackQueryHandler(on_callback))
-    app.add_handler(MessageHandler(filters.COMMAND, on_unknown_command))
+    # forwarded messages are quoted material, never instructions: commands in
+    # them route to the text/aggregation path like any other forwarded text
+    app.add_handler(MessageHandler(
+        filters.COMMAND & ~filters.FORWARDED, on_unknown_command))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, on_photo))
     app.add_handler(MessageHandler(
         filters.Document.ALL & ~filters.Document.IMAGE, on_document
     ))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    app.add_handler(MessageHandler(
+        filters.TEXT & (~filters.COMMAND | filters.FORWARDED), on_message))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
