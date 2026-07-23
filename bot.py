@@ -246,7 +246,11 @@ for _old, _new in (
 ):
     try:
         if _old.exists() and not _new.exists():
-            _old.rename(_new)
+            try:
+                _old.rename(_new)
+            except OSError:  # cross-device: copy, never silently reset state
+                shutil.copy2(_old, _new)
+                _old.unlink()
     except OSError:
         pass
 _state: dict = {}
@@ -283,23 +287,40 @@ def stored_binding(key: ConvKey) -> Optional[dict]:
     return _state.get("bindings", {}).get(f"{key[0]}:{key[1]}")
 
 
-def _inflight_add(conv: "Conversation", msg) -> None:
-    """A message's turn (or queue wait) is in progress: remember its id so an
-    unclean restart can clear its reaction and offer to continue."""
-    lst = _state.setdefault("inflight", {}).setdefault(
-        f"{conv.key[0]}:{conv.key[1]}", [])
-    if msg.message_id not in lst:
-        lst.append(msg.message_id)
-        _state_save()
+def _inflight_ent(key: str) -> dict:
+    ent = _state.setdefault("inflight", {}).setdefault(key, {"m": [], "q": {}})
+    if isinstance(ent, list):  # transitional schema (list of ids)
+        ent = {"m": ent, "q": {}}
+        _state["inflight"][key] = ent
+    return ent
+
+
+def _inflight_add(conv: "Conversation", msg, queued_text: str = None) -> None:
+    """A message's turn (or queue wait) is starting: persist BEFORE acting so
+    a crash at any point leaves at most an idempotent cleanup, never a zombie.
+    Queued text is stored too — it exists nowhere else (not yet in the CLI
+    transcript, and the Bot API cannot re-fetch messages by id)."""
+    ent = _inflight_ent(f"{conv.key[0]}:{conv.key[1]}")
+    if msg.message_id not in ent["m"]:
+        ent["m"].append(msg.message_id)
+    if queued_text is not None:
+        ent["q"][str(msg.message_id)] = queued_text[:1000]
+    _state_save()
 
 
 def _inflight_del(conv: "Conversation", msg) -> None:
     key = f"{conv.key[0]}:{conv.key[1]}"
-    lst = _state.get("inflight", {}).get(key, [])
-    if msg.message_id in lst:
-        lst.remove(msg.message_id)
-        if not lst:
-            _state["inflight"].pop(key, None)
+    if key not in _state.get("inflight", {}):
+        return
+    ent = _inflight_ent(key)
+    changed = msg.message_id in ent["m"]
+    if changed:
+        ent["m"].remove(msg.message_id)
+    changed |= ent["q"].pop(str(msg.message_id), None) is not None
+    if not ent["m"]:
+        _state["inflight"].pop(key, None)
+        changed = True
+    if changed:
         _state_save()
 
 
@@ -985,10 +1006,12 @@ async def run_turn(
     if conv.lock.locked():
         conv.queue.append((text, blocks, uid, update.effective_message))
         log.info("conv %s busy, queued (%d waiting)", conv.key, len(conv.queue))
+        # persist first, act second: a crash here costs one idempotent cleanup
+        _inflight_add(conv, update.effective_message,
+                      queued_text=(text or "").strip() or "[media]")
         try:
             # native ack: a 👀 reaction instead of a noisy "queued" bubble
             await update.effective_message.set_reaction("👀")
-            _inflight_add(conv, update.effective_message)
         except Exception:
             try:
                 await update.effective_message.reply_text(
@@ -1001,9 +1024,9 @@ async def run_turn(
     async with conv.lock:
         conv.last_user_id = uid
         if sender_id is None:  # direct turn: mark the message being worked on
+            _inflight_add(conv, update.effective_message)
             try:
                 await update.effective_message.set_reaction("👨‍💻")
-                _inflight_add(conv, update.effective_message)
             except Exception:
                 pass
         try:
@@ -1933,22 +1956,32 @@ async def _reconcile_state(app: Application) -> None:
                 chat_id=chat_id, message_id=msg_id, reaction=None)
         except Exception:
             pass
-    for key, msg_ids in inflight.items():
+    for key, ent in inflight.items():
+        if isinstance(ent, list):  # transitional schema
+            ent = {"m": ent, "q": {}}
         chat_s, _, thread_s = key.partition(":")
         chat_id, thread = int(chat_s), int(thread_s or 0)
-        for mid in msg_ids:
+        for mid in ent["m"]:
             try:
                 await app.bot.set_message_reaction(
                     chat_id=chat_id, message_id=mid, reaction=None)
             except Exception:
                 pass
+        # Two kinds of interruption, honestly distinguished: the running
+        # turn is safe in the CLI transcript; queued messages never reached
+        # it and exist only here — show them so nothing silently vanishes.
+        lost = [t for t in ent["q"].values()]
+        text = ("⚡ Restarted mid-turn. The interrupted turn is safe in the "
+                "session transcript — send \"continue\" to pick it back up.")
+        if lost:
+            shown = "\n".join(f"• {t[:150]}" for t in lost[:10])
+            text += (f"\n\n{len(lost)} queued message(s) never reached the "
+                     f"session and were dropped:\n{shown}\n"
+                     "Resend whichever still matter.")
         try:
             await app.bot.send_message(
                 chat_id=chat_id, message_thread_id=thread or None,
-                text=("⚡ Restarted mid-turn. Nothing is lost — the session "
-                      "transcript has everything up to the interruption. "
-                      "Send \"continue\" to pick the work back up."),
-                disable_notification=True,
+                text=text, disable_notification=True,
             )
         except Exception:
             pass
