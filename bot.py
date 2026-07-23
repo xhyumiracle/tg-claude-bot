@@ -2032,10 +2032,12 @@ async def _fwd_flush(key: tuple) -> None:
     if len(items) == 1:
         m, fc, text = items[0]
         body = f"[{name} ({uid})]: {fc}{reply_context(m)}{text}"
-    else:
+    elif any(fc for _, fc, _ in items):  # forwarded batch: numbered, sourced
         lines = [f"{i + 1}) {fc}{t}" for i, (_, fc, t) in enumerate(items)]
         body = (f"[{name} ({uid})] (forwarded {len(items)} messages):\n"
                 + "\n".join(lines))
+    else:  # client-split long message: reassemble seamlessly
+        body = f"[{name} ({uid})]: " + "\n".join(t for _, _, t in items)
     log.info("fwd batch %s flushed: %d message(s)", key, len(items))
     try:
         await run_turn(update, ctx, body)
@@ -2055,7 +2057,11 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     log.info("msg %s user=%s text=%r", conv_key_of(update),
              update.effective_user.id if update.effective_user else None,
              msg.text[:120])
-    if getattr(msg, "forward_origin", None):
+    # mechanically-batched arrivals (one gesture → many updates) settle into
+    # one turn: forwards, and long texts the client split at the 4096 limit.
+    # Typed bursts deliberately do NOT settle — their gaps are seconds long,
+    # and a window big enough to catch them would tax every message's latency.
+    if getattr(msg, "forward_origin", None) or len(msg.text) >= 4000:
         await _fwd_add(update, ctx)
         return
     # a typed follow-up must not overtake a still-settling forward batch:
