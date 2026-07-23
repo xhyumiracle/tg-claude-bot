@@ -31,14 +31,14 @@ owns everything.
 | 🔁 **Resume any real session** | Inline picker over your actual session store (`~/.claude/projects`), with the CLI's own AI titles; cross-project, cwd auto-detected. |
 | 🧵 **Per-topic sessions** | Every forum topic is an independent session — one conversation per `(chat, topic)`. |
 | ⏩ **Zero command remapping** | Unknown `/commands` go verbatim to the CLI: `/compact`, skills, anything headless. `/context`-style output is relayed. |
-| 🔘 **Buttons instead of a TUI** | Permissions, plan approval, clarifying questions — all inline buttons via one generic `can_use_tool` bridge. |
-| 💬 **Chat-native ergonomics** | Reply to any message to quote it into context. Mid-turn messages queue with a 👀 reaction and switch to 👨‍💻 while processing — never dropped, never noisy. |
+| 🔘 **Buttons instead of a TUI** | Permissions — including the CLI's native *don't-ask-again* option — plan approval, clarifying questions: all inline buttons. Answered prompts clean up after themselves. |
+| 💬 **Chat-native ergonomics** | Reply to any message to quote it into context. Mid-turn messages queue with a 👀 reaction and switch to 👨‍💻 while processing — never dropped, never noisy. Multi-forwards and 4096-split long texts arrive as one coherent message. |
 | 🎤 **Voice messages** | Local faster-whisper, bilingual zh/en, editable 🎤 transcript. No audio leaves your machine. |
 | 🖼 **Native media** | Images ride inside the message as base64 blocks, lifecycle owned by the CLI transcript; other files get a TTL-cleaned media dir. |
 | 📟 **Live status** | One `⏳ Working…` message edited in place, morphing into the reply; elapsed ticker for long commands. |
-| 🎛 **CLI parity** | `/model`, `/effort`, `/usage`, `/esc` — options sourced from official APIs and the CLI itself, no hardcoded lists. |
+| 🎛 **CLI parity** | `/model`, `/effort`, `/mode` (the shift+tab cycle), `/usage`, `/esc` — options sourced from official APIs and the CLI itself, no hardcoded lists. |
 | 🟠 **Context warnings** | 🟠 at 80% / 🔴 at 90% of the real context window, same source as `/context`. |
-| ♻️ **Graceful deploys** | Restarts wait until every conversation is idle; in-flight replies are never lost. |
+| ♻️ **Restart-proof** | Topics stay bound to their sessions across restarts — even hard crashes: interrupted turns auto-resume from the transcript, queued messages are replayed. |
 | 🔒 **Owner/guest profiles** | Allowlisted chats only; owner full access, guests scoped with Allow/Deny escalation to the owner. |
 
 ## 🚀 Quick start
@@ -124,7 +124,7 @@ All in `.env` (see [.env.example](.env.example)):
 | Interactive prompts | ✅ native inline buttons — permissions, plan approval, clarifying questions | ⚠️ relayed TUI screen + simulated keypresses | n/a |
 | Voice messages | ✅ local whisper, bilingual | ❌ | cloud STT, if any |
 | Forum topics = sessions | ✅ one session per topic | ❌ | ❌ |
-| Survives bot restarts | ✅ stateless — nothing to lose | ⚠️ bridge dies with tmux | ⚠️ needs a database |
+| Survives bot restarts | ✅ sessions rebind, interrupted turns auto-resume | ⚠️ bridge dies with tmux | ⚠️ needs a database |
 | Moving parts | one Python file | tmux + parser + bot | bot + DB + API glue |
 
 Deliberate trade-off: no attaching to a *live* terminal (what tmux bridges
@@ -162,7 +162,10 @@ Telegram ── python-telegram-bot ── bot.py (stateless router)
                                      └─ Claude Code CLI ── ~/.claude/projects/*.jsonl
 ```
 
-All state lives in the CLI's own files; kill the bot, nothing is forgotten.
+Conversation state lives in the CLI's own files; the bot keeps only a tiny
+pointer file (`~/.tgclaude/`) — which topic resumes which session, plus what
+was mid-flight. Kill the bot — or the power — and topics rebind, interrupted
+turns continue automatically.
 
 ## 🔒 Security model
 
@@ -171,7 +174,9 @@ All state lives in the CLI's own files; kill the bot, nothing is forgotten.
   world-readable.
 - Owner: full permissions. Guests: scoped read/write and a custom prompt;
   out-of-scope tool calls escalate to the owner as Allow/Deny buttons.
-- Session management commands are owner-gated everywhere.
+- Session management commands are owner-gated everywhere; so is `/mode` —
+  permission modes change the guardrails themselves, and `bypass permissions`
+  disables the guest sandbox for that conversation.
 - Voice notes are transcribed locally and deleted; images follow the CLI's
   transcript retention.
 - Full threat model, verified controls, and accepted risks:
