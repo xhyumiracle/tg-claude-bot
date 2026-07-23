@@ -326,6 +326,7 @@ def _strip_html(s: str) -> str:
 async def ask_buttons(
     conv: "Conversation", text: str, options: list, timeout: float = 3600,
     allowed_user: int = 0, parse_mode: Optional[str] = None,
+    ephemeral: bool = False,
 ) -> Optional[int]:
     """Post inline buttons in the conversation; return chosen index or None.
 
@@ -358,7 +359,8 @@ async def ask_buttons(
                 return None
             log.warning("ask_buttons rich send failed; retrying plain",
                         exc_info=True)
-    pending_btns[token] = (fut, msg, allowed_user, [str(o) for o in options])
+    pending_btns[token] = (fut, msg, allowed_user,
+                           [str(o) for o in options], ephemeral)
     try:
         return await asyncio.wait_for(fut, timeout=timeout)
     except asyncio.TimeoutError:
@@ -668,7 +670,8 @@ async def ask_owner_permission(conv: Conversation, tool_name: str,
         if rules:
             text += f"\n♻️ <code>{_h.escape(rules)}</code>"
         labels.insert(1, "♻️ Always allow (don't ask again)")
-    idx = await ask_buttons(conv, text, labels, timeout=180, parse_mode="HTML")
+    idx = await ask_buttons(conv, text, labels, timeout=180,
+                            parse_mode="HTML", ephemeral=True)
     if idx is None:
         return "deny"
     label = labels[idx]
@@ -1748,7 +1751,7 @@ async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         if entry is None:
             await q.answer("Expired.")
             return
-        fut, msg, allowed_user, labels = entry
+        fut, msg, allowed_user, labels, ephemeral = entry
         if uid != OWNER_ID and uid != allowed_user:
             await q.answer("This prompt isn't for you.")
             return
@@ -1758,11 +1761,15 @@ async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         if not fut.done():
             fut.set_result(idx)
         await q.answer("OK")
-        # collapse to one line — the prompt scrolls into history like the
-        # CLI's, instead of stacking up and burying the live reply
+        # Ephemeral prompts (permissions) vanish once answered — CLI parity.
+        # Content-bearing ones (plans, questions) collapse to one line so
+        # neither stacks up and buries the live reply.
         try:
-            first = ((msg.text if msg else "") or "").split("\n", 1)[0]
-            await q.edit_message_text(f"{first}\n→ {labels[idx]}")
+            if ephemeral:
+                await q.message.delete()
+            else:
+                first = ((msg.text if msg else "") or "").split("\n", 1)[0]
+                await q.edit_message_text(f"{first}\n→ {labels[idx]}")
         except Exception:
             try:
                 await q.edit_message_reply_markup(reply_markup=None)
