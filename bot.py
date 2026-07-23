@@ -678,8 +678,8 @@ async def ask_owner_permission(conv: Conversation, tool_name: str,
         labels.insert(1, "♻️ Always allow (don't ask again)")
     idx = await ask_buttons(conv, text, labels, timeout=180,
                             parse_mode="HTML", ephemeral=True)
-    if idx is None:
-        return "deny"
+    if idx is None:  # unanswered ≠ refused; let the model tell the user
+        return "timeout"
     label = labels[idx]
     if label.startswith("✅"):
         return "once"
@@ -806,6 +806,13 @@ def make_permission_cb(conv: Conversation):
                 return PermissionResultAllow(
                     updated_input=tool_input,
                     updated_permissions=suggestions or None,
+                )
+            if choice == "timeout":
+                return PermissionResultDeny(
+                    message=f"{tool_name}: the permission prompt went "
+                            "unanswered for 180s — a timeout, not a refusal. "
+                            "If the call is still needed, tell the user to "
+                            "watch for the next prompt and retry."
                 )
         return PermissionResultDeny(
             message=f"{tool_name} denied by scope policy (path={path!r})."
