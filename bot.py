@@ -254,10 +254,18 @@ class Conversation:
     # via bash_proc.
     interrupt_asap: bool = False
     bash_proc: Optional[object] = None
-    # temporal-causality reply anchor: each reply segment quotes the newest
-    # user message the model had seen when that segment started (turn starter
-    # at first; moves to each steered message as it lands)
+    # consume-once reply anchor: set to the turn's originating message at
+    # turn start; the FIRST reply segment that sends takes it (quotes that
+    # message) and clears it, so every later segment in the same turn sends
+    # unquoted. A turn can't tell which segment answers which steered
+    # message, so it quotes only the origin and stops guessing; the next
+    # turn re-establishes a fresh anchor.
     reply_anchor: Optional[object] = None
+
+    def take_anchor(self):
+        a = self.reply_anchor
+        self.reply_anchor = None
+        return a
 
 
 conversations: Dict[ConvKey, Conversation] = {}
@@ -979,44 +987,61 @@ def format_incoming(update: Update) -> str:
 
 
 async def send_long(update: Update, text: str, anchor=None) -> None:
+    """anchor is a Message to quote, or None to send unquoted (do_quote=
+    False) into the same chat/thread."""
     limit = 4000
-    target = anchor or update.effective_message
     chunks = [text[i: i + limit] for i in range(0, len(text), limit)] or [text]
     for chunk in chunks:
-        try:
-            await target.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
-        except Exception:
-            await target.reply_text(chunk)
+        if anchor is not None:
+            try:
+                await anchor.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
+            except Exception:
+                await anchor.reply_text(chunk)
+        else:
+            try:
+                await update.effective_message.reply_text(
+                    chunk, parse_mode=ParseMode.MARKDOWN, do_quote=False)
+            except Exception:
+                await update.effective_message.reply_text(
+                    chunk, do_quote=False)
 
 
 class LiveStatus:
-    """One status message per segment, updated in place; becomes the reply.
-    anchor_fn (optional) resolves the message to quote at send time — the
-    temporal-causality anchor: the newest user message the model had seen
-    when this segment's status message was first created."""
+    """One status message per segment, edited in place; becomes the reply.
+    The turn's reply anchor is consume-once (anchor_fn): the FIRST segment
+    that actually sends resolves it — quoting the turn's originating message
+    — and clears it, so every later segment resolves None and sends
+    unquoted. A single turn can't tell which segment answers which of
+    several steered messages, so it quotes only the origin and stops
+    guessing; the next turn re-establishes a fresh quote target."""
+
+    _UNSET = object()
 
     def __init__(self, anchor_fn=None) -> None:
         self.msg = None
         self.last = 0.0
         self.text = ""
         self.anchor_fn = anchor_fn
-        self.anchor_msg = None  # snapshot at status-message creation
+        self.anchor = self._UNSET  # resolved once: a Message, or None
 
-    def _target(self, update_obj: Update):
-        if self.anchor_msg is not None:
-            return self.anchor_msg
-        anchor = self.anchor_fn() if self.anchor_fn else None
-        return anchor or update_obj.effective_message
+    def _resolve(self):
+        if self.anchor is self._UNSET:
+            self.anchor = self.anchor_fn() if self.anchor_fn else None
+        return self.anchor
+
+    async def _send(self, update_obj: Update, text: str, **kw):
+        anchor = self._resolve()
+        if anchor is not None:
+            return await anchor.reply_text(text, **kw)
+        return await update_obj.effective_message.reply_text(
+            text, do_quote=False, **kw)
 
     async def update(self, update_obj: Update, text: str) -> None:
         now = time.time()
         if self.msg is None:
             try:
-                target = self._target(update_obj)
-                self.msg = await target.reply_text(
-                    text, disable_notification=True
-                )
-                self.anchor_msg = target
+                self.msg = await self._send(
+                    update_obj, text, disable_notification=True)
                 self.last, self.text = now, text
             except Exception:
                 pass
@@ -1032,8 +1057,7 @@ class LiveStatus:
     async def finalize(self, update_obj: Update, reply: str) -> None:
         if self.msg is None:
             if reply:
-                await send_long(update_obj, reply,
-                                anchor=self._target(update_obj))
+                await send_long(update_obj, reply, anchor=self._resolve())
             return
         if not reply:
             try:
@@ -1055,7 +1079,7 @@ class LiveStatus:
             await self.msg.delete()
         except Exception:
             pass
-        await send_long(update_obj, reply, anchor=self._target(update_obj))
+        await send_long(update_obj, reply, anchor=self._resolve())
 
 
 def _tool_brief(block: ToolUseBlock) -> str:
@@ -1173,8 +1197,9 @@ async def _consume_orphan_turn(update: Update, conv: "Conversation",
         _take(m)
     out = "\n".join(p for p in buf if p).strip()
     if out and not out.startswith("<pass>"):
-        # the orphan turn answers the raced steered message — quote it
-        await send_long(update, _tg_markdown(out), anchor=conv.reply_anchor)
+        # a separate (raced) turn's output — send unquoted, consistent with
+        # "stop guessing which message a segment answers"
+        await send_long(update, _tg_markdown(out), anchor=None)
 
 
 async def run_turn(
@@ -1247,7 +1272,8 @@ async def _run_turn_inner(
             try:
                 await conv.client.query(text)
                 conv.steered.append(update.effective_message)
-                conv.reply_anchor = anchor or update.effective_message
+                # steers do NOT move the reply anchor: the turn keeps
+                # quoting its origin, later segments send unquoted
                 conv.last_steer = time.time()
                 log.info("conv %s steered into live turn", conv.key)
                 try:
@@ -1314,7 +1340,7 @@ async def _run_turn_inner(
                     await client.interrupt()
                 except Exception:
                     pass
-            status = LiveStatus(anchor_fn=lambda: conv.reply_anchor)
+            status = LiveStatus(anchor_fn=conv.take_anchor)
             if status_text:
                 await status.update(update, status_text)
             turn_start = time.time()
@@ -1343,7 +1369,7 @@ async def _run_turn_inner(
                 if seg.startswith("<pass>"):
                     seg = ""
                 await status.finalize(update, _tg_markdown(seg))
-                status = LiveStatus(anchor_fn=lambda: conv.reply_anchor)
+                status = LiveStatus(anchor_fn=conv.take_anchor)
 
             async for m in client.receive_response():
                 sid = getattr(m, "session_id", None)
