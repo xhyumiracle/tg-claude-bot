@@ -12,3 +12,6 @@ wheels/
 # Secrets & local-only config
 .env
 *.local.md
+
+# Runtime artifacts
+.tgbot-restart-requested

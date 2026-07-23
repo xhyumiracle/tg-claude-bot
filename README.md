@@ -36,7 +36,7 @@ owns everything.
 | 🎤 **Voice messages** | Local faster-whisper, bilingual zh/en, editable 🎤 transcript. No audio leaves your machine. |
 | 🖼 **Native media** | Images ride inside the message as base64 blocks, lifecycle owned by the CLI transcript; other files get a TTL-cleaned media dir. |
 | 📟 **Live status** | One `⏳ Working…` message edited in place, morphing into the reply; elapsed ticker for long commands. |
-| 🎛 **CLI parity** | `/model`, `/effort`, `/usage`, `/stop` — options sourced from official APIs and the CLI itself, no hardcoded lists. |
+| 🎛 **CLI parity** | `/model`, `/effort`, `/usage`, `/esc` — options sourced from official APIs and the CLI itself, no hardcoded lists. |
 | 🟠 **Context warnings** | 🟠 at 80% / 🔴 at 90% of the real context window, same source as `/context`. |
 | ♻️ **Graceful deploys** | Restarts wait until every conversation is idle; in-flight replies are never lost. |
 | 🔒 **Owner/guest profiles** | Allowlisted chats only; owner full access, guests scoped with Allow/Deny escalation to the owner. |
@@ -140,13 +140,13 @@ events and statelessness.
 | Command | What it does |
 |---|---|
 | `/resume` | Inline session picker (titles, project, age); `/resume <id>` binds directly |
-| `/new` | Start a fresh session in this chat/topic |
+| `/clear` (`/new`) | Start a fresh session in this chat/topic |
 | `/status` | Current binding: session, project, model, effort |
 | `/model` | Live model picker — real names and context windows from `/v1/models` |
 | `/effort` | Reasoning-effort picker — levels discovered from the CLI itself |
 | `/usage` | Subscription limits (5h / weekly / per-model / credits) |
 | `/whisper` | Pick the voice-transcription model |
-| `/stop` (`/esc`) | Interrupt the current turn — the CLI's ESC |
+| `/esc` (`/stop`) | Interrupt the current turn — the CLI's ESC |
 | anything else | Forwarded verbatim to the CLI: `/compact`, `/context`, `/cost`, your skills… |
 
 `/` autocompletes in Telegram — the menu is registered via `setMyCommands`.

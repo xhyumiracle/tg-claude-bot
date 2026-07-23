@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -113,6 +114,10 @@ SHELL_CMDS = {
 }
 
 RESTART_FLAG = Path("/tmp/tgbot-restart-requested")
+# Self-rescue flag inside the repo: reachable via an agent's Write tool even
+# when Bash/permission escalation is broken (learned the hard way when a
+# permission-bridge bug locked the agent out of `touch /tmp/...`).
+RESTART_FLAG_LOCAL = Path(__file__).resolve().parent / ".tgbot-restart-requested"
 RESTART_NOTICE = Path("/tmp/tgbot-restart-notice.json")
 
 _LOCAL_OUT_RE = re.compile(
@@ -214,6 +219,57 @@ class Conversation:
 conversations: Dict[ConvKey, Conversation] = {}
 pending_btns: Dict[str, tuple] = {}
 app_ref: Optional[Application] = None
+
+
+# ---------- durable routing state ----------
+# First principles: graceful drain can never cover a crash or power loss, so
+# the only reliable invariant is "state is on disk at all times; restart =
+# reconcile from disk". The CLI owns all *conversation* state (transcripts);
+# the bot owns *routing* state — which TG topic points at which session, and
+# which TG messages are wearing an in-progress reaction. Both live here.
+STATE_FILE = HOME / ".claude" / "tgbot_state.json"
+_state: dict = {}
+
+
+def _state_load() -> None:
+    global _state
+    try:
+        _state = json.loads(STATE_FILE.read_text())
+    except Exception:
+        _state = {}
+
+
+def _state_save() -> None:
+    try:
+        tmp = STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(_state))
+        tmp.replace(STATE_FILE)  # atomic; readers never see a torn write
+    except Exception:
+        log.exception("state save failed")
+
+
+def persist_binding(conv: "Conversation") -> None:
+    _state.setdefault("bindings", {})[f"{conv.key[0]}:{conv.key[1]}"] = {
+        "session_id": conv.session_id, "cwd": conv.cwd,
+        "model": conv.model, "effort": conv.effort,
+    }
+    _state_save()
+
+
+def stored_binding(key: ConvKey) -> Optional[dict]:
+    return _state.get("bindings", {}).get(f"{key[0]}:{key[1]}")
+
+
+def track_reaction(msg, on: bool) -> None:
+    """Record which TG messages currently wear a 👀/👨‍💻 reaction so a
+    restart can clear them instead of leaving zombie in-progress status."""
+    lst = _state.setdefault("reactions", [])
+    entry = [msg.chat_id, msg.message_id]
+    if on and entry not in lst:
+        lst.append(entry)
+    elif not on and entry in lst:
+        lst.remove(entry)
+    _state_save()
 
 
 async def ask_buttons(
@@ -361,15 +417,26 @@ def get_conv(update: Update) -> Conversation:
                     cwd = meta["cwd"]
                 else:
                     sid = None
-            conversations[key] = Conversation(
+            conv = Conversation(
                 key=key, profile="owner", cwd=cwd, session_id=sid
             )
         else:
             # fallback cwd deliberately NOT $HOME: pathless Glob/Grep search the cwd
-            conversations[key] = Conversation(
+            conv = Conversation(
                 key=key, profile="guest",
                 cwd=str(GUEST_READ_DIRS[0]) if GUEST_READ_DIRS else "/tmp"
             )
+        # Restart continuity: a topic keeps pointing at the session it was on.
+        # The stored binding wins over static defaults — it is more recent.
+        stored = stored_binding(key)
+        if stored:
+            ssid = stored.get("session_id")
+            if ssid and find_session(ssid):
+                conv.session_id = ssid
+                conv.cwd = stored.get("cwd") or conv.cwd
+            conv.model = stored.get("model") or conv.model
+            conv.effort = stored.get("effort") or conv.effort
+        conversations[key] = conv
     return conversations[key]
 
 
@@ -382,9 +449,16 @@ async def drop_client(conv: Conversation) -> None:
         conv.client = None
 
 
+# Prefer the system CLI over the SDK's bundled one: sessions created in the
+# terminal may contain records (e.g. model-fallback blocks) that an older
+# bundled CLI replays verbatim to the API, breaking /resume with a 400.
+SYSTEM_CLI = shutil.which("claude")
+
+
 def build_options(conv: Conversation) -> ClaudeAgentOptions:
     if conv.profile == "owner":
         return ClaudeAgentOptions(
+            cli_path=SYSTEM_CLI,
             system_prompt={
                 "type": "preset",
                 "preset": "claude_code",
@@ -399,6 +473,7 @@ def build_options(conv: Conversation) -> ClaudeAgentOptions:
             setting_sources=["user", "project"],
         )
     return ClaudeAgentOptions(
+        cli_path=SYSTEM_CLI,
         system_prompt=GUEST_PROMPT,
         cwd=conv.cwd,
         add_dirs=[str(d) for d in GUEST_WRITE_DIRS],
@@ -441,14 +516,69 @@ def extract_path(tool_input: dict) -> str:
     return ""
 
 
-async def ask_owner_permission(conv: Conversation, tool_name: str, detail: str) -> bool:
-    idx = await ask_buttons(
-        conv,
-        f"Permission request: {tool_name}\n{detail[:300]}",
-        ["✅ Allow once", "❌ Deny"],
-        timeout=180,
-    )
-    return idx == 0
+def _parse_permission_suggestions(suggestions) -> list:
+    """The SDK hands the CLI's permission_suggestions over as raw wire dicts
+    (camelCase) despite its own type annotation, while updated_permissions
+    must be PermissionUpdate objects (the SDK calls .to_dict() on them).
+    Normalize everything to PermissionUpdate here."""
+    from claude_agent_sdk.types import PermissionRuleValue, PermissionUpdate
+    parsed = []
+    for s in suggestions or []:
+        if isinstance(s, PermissionUpdate):
+            parsed.append(s)
+            continue
+        if not isinstance(s, dict):
+            continue
+        rules = [
+            PermissionRuleValue(
+                tool_name=r.get("toolName") or r.get("tool_name") or "",
+                rule_content=r.get("ruleContent") or r.get("rule_content"),
+            )
+            for r in (s.get("rules") or []) if isinstance(r, dict)
+        ]
+        parsed.append(PermissionUpdate(
+            type=s.get("type", "addRules"),
+            rules=rules or None,
+            behavior=s.get("behavior"),
+            mode=s.get("mode"),
+            directories=s.get("directories"),
+            destination=s.get("destination"),
+        ))
+    return parsed
+
+
+def _fmt_permission_rules(updates) -> str:
+    parts = []
+    for u in updates:
+        for r in (u.rules or []):
+            parts.append(r.tool_name + (f"({r.rule_content})" if r.rule_content else ""))
+        if u.type in ("addDirectories", "removeDirectories") and u.directories:
+            parts.append(f"{u.type}: {', '.join(u.directories)}")
+    return ", ".join(parts)
+
+
+async def ask_owner_permission(conv: Conversation, tool_name: str, detail: str,
+                               suggestions: list) -> str:
+    """Returns 'once', 'always', or 'deny' — mirroring the CLI's native
+    Yes / Yes-don't-ask-again / No prompt. 'always' is only offered when the
+    CLI supplied permission-rule suggestions (same source as the native
+    don't-ask-again option)."""
+    text = f"Permission request: {tool_name}\n{detail[:300]}"
+    labels = ["✅ Allow once", "❌ Deny"]
+    if suggestions:
+        rules = _fmt_permission_rules(suggestions)
+        if rules:
+            text += f"\n\nDon't-ask-again rule: {rules}"
+        labels.insert(1, "♻️ Always allow (don't ask again)")
+    idx = await ask_buttons(conv, text, labels, timeout=180)
+    if idx is None:
+        return "deny"
+    label = labels[idx]
+    if label.startswith("✅"):
+        return "once"
+    if label.startswith("♻️"):
+        return "always"
+    return "deny"
 
 
 async def handle_exit_plan(conv: Conversation, tool_input: dict):
@@ -512,16 +642,33 @@ async def handle_ask_user_question(conv: Conversation, tool_input: dict):
 
 def make_owner_cb(conv: Conversation):
     async def can_use_tool(tool_name: str, tool_input: dict, ctx: ToolPermissionContext):
-        if tool_name == "ExitPlanMode":
-            return await handle_exit_plan(conv, tool_input)
-        if tool_name == "AskUserQuestion":
-            return await handle_ask_user_question(conv, tool_input)
-        return PermissionResultAllow(updated_input=tool_input)
+        try:
+            if tool_name == "ExitPlanMode":
+                return await handle_exit_plan(conv, tool_input)
+            if tool_name == "AskUserQuestion":
+                return await handle_ask_user_question(conv, tool_input)
+            return PermissionResultAllow(updated_input=tool_input)
+        except Exception:
+            log.exception("owner permission bridge failed for %s", tool_name)
+            return PermissionResultDeny(
+                message=f"{tool_name}: permission bridge hit an internal "
+                        "error; denied safely. Check the bot logs."
+            )
     return can_use_tool
 
 
 def make_permission_cb(conv: Conversation):
     async def can_use_tool(tool_name: str, tool_input: dict, ctx: ToolPermissionContext):
+        try:
+            return await _can_use_tool(tool_name, tool_input, ctx)
+        except Exception:
+            log.exception("permission bridge failed for %s", tool_name)
+            return PermissionResultDeny(
+                message=f"{tool_name}: permission bridge hit an internal "
+                        "error; denied safely. The owner has the traceback."
+            )
+
+    async def _can_use_tool(tool_name: str, tool_input: dict, ctx: ToolPermissionContext):
         if tool_name == "AskUserQuestion":
             return await handle_ask_user_question(conv, tool_input)
         if tool_name in WEB_TOOLS:
@@ -543,9 +690,16 @@ def make_permission_cb(conv: Conversation):
             return PermissionResultAllow(updated_input=tool_input)
         # out of scope: escalate to Miracle with buttons if he asked, else deny
         if conv.last_user_id == OWNER_ID:
-            ok = await ask_owner_permission(conv, tool_name, path or str(tool_input)[:200])
-            if ok:
+            suggestions = _parse_permission_suggestions(ctx.suggestions)
+            choice = await ask_owner_permission(
+                conv, tool_name, path or str(tool_input)[:200], suggestions)
+            if choice == "once":
                 return PermissionResultAllow(updated_input=tool_input)
+            if choice == "always":
+                return PermissionResultAllow(
+                    updated_input=tool_input,
+                    updated_permissions=suggestions or None,
+                )
         return PermissionResultDeny(
             message=f"{tool_name} denied by scope policy (path={path!r})."
         )
@@ -763,6 +917,7 @@ async def run_turn(
         try:
             # native ack: a 👀 reaction instead of a noisy "queued" bubble
             await update.effective_message.set_reaction("👀")
+            track_reaction(update.effective_message, True)
         except Exception:
             try:
                 await update.effective_message.reply_text(
@@ -777,6 +932,7 @@ async def run_turn(
         if sender_id is None:  # direct turn: mark the message being worked on
             try:
                 await update.effective_message.set_reaction("👨‍💻")
+                track_reaction(update.effective_message, True)
             except Exception:
                 pass
         try:
@@ -836,6 +992,7 @@ async def run_turn(
                 sid = getattr(m, "session_id", None)
                 if sid and sid != conv.session_id:
                     conv.session_id = sid
+                    persist_binding(conv)
                 if (getattr(m, "subtype", "") == "init"
                         and isinstance(getattr(m, "data", None), dict)):
                     conv.current_model = m.data.get("model") or conv.current_model
@@ -900,6 +1057,7 @@ async def run_turn(
             await update.effective_message.set_reaction(None)
         except Exception:
             pass
+        track_reaction(update.effective_message, False)
     # drain messages queued while this turn was running
     if conv.queue:
         queued = conv.queue[:]
@@ -921,6 +1079,7 @@ async def run_turn(
                 await m.set_reaction(None)
             except Exception:
                 pass
+            track_reaction(m, False)
 
 
 # ---------- handlers ----------
@@ -934,7 +1093,7 @@ async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         "Hi, Claude here.\n"
         "/resume — pick a CLI session to continue (per chat/topic)\n"
-        "/new — fresh session\n"
+        "/clear — fresh session\n"
         "/status — current binding\n"
         "Any other /command is passed to Claude (/compact, skills, ...)."
     )
@@ -951,6 +1110,7 @@ async def cmd_reset(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     async with conv.lock:
         await drop_client(conv)
         conv.session_id = None
+        persist_binding(conv)
     await update.effective_message.reply_text("Fresh session on next message.")
 
 
@@ -1036,35 +1196,60 @@ async def bind_session(update: Update, sid: str) -> None:
         conv.session_id = sid
         if meta["cwd"]:
             conv.cwd = meta["cwd"]
+        persist_binding(conv)
     await update.effective_message.reply_text(
         f"Bound to {sid[:8]}… ({meta['label'] or 'no label'})\ncwd: {conv.cwd}"
     )
 
 
 def _oauth_token() -> str:
+    # Prefer the long-lived setup token (CLAUDE_CODE_OAUTH_TOKEN) over the
+    # rotating short-lived access token in .credentials.json.
+    if env_tok := os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        return env_tok
     creds = json.loads((HOME / ".claude" / ".credentials.json").read_text())
     return creds["claudeAiOauth"]["accessToken"]
 
 
 _models_cache: dict = {"ts": 0.0, "data": []}
+_MODELS_DISK_CACHE = HOME / ".claude" / "tgbot_models_cache.json"
+
+
+def _models_disk_load() -> list:
+    try:
+        return json.loads(_MODELS_DISK_CACHE.read_text()).get("data", [])
+    except Exception:
+        return []
 
 
 async def fetch_models() -> list:
     import httpx
     if time.time() - _models_cache["ts"] < 3600 and _models_cache["data"]:
         return _models_cache["data"]
-    async with httpx.AsyncClient(timeout=15) as cx:
-        r = await cx.get(
-            "https://api.anthropic.com/v1/models",
-            headers={
-                "Authorization": f"Bearer {_oauth_token()}",
-                "anthropic-beta": "oauth-2025-04-20",
-                "anthropic-version": "2023-06-01",
-            },
-        )
-    r.raise_for_status()
-    data = r.json().get("data", [])
+    try:
+        async with httpx.AsyncClient(timeout=15) as cx:
+            r = await cx.get(
+                "https://api.anthropic.com/v1/models",
+                headers={
+                    "Authorization": f"Bearer {_oauth_token()}",
+                    "anthropic-beta": "oauth-2025-04-20",
+                    "anthropic-version": "2023-06-01",
+                },
+            )
+        r.raise_for_status()
+        data = r.json().get("data", [])
+    except Exception:
+        # Token may be expired; fall back to disk cache without clobbering memory ts
+        disk = _models_disk_load()
+        if disk:
+            _models_cache.setdefault("data", disk)  # populate memory only if empty
+            return disk
+        raise
     _models_cache.update(ts=time.time(), data=data)
+    try:
+        _MODELS_DISK_CACHE.write_text(json.dumps({"data": data}))
+    except Exception:
+        pass
     return data
 
 
@@ -1234,7 +1419,15 @@ async def set_whisper_model(reply, model: str) -> None:
     )
 
 
-MODEL_CHOICES = ["default", "opus", "sonnet", "haiku"]
+MODEL_CHOICES = [
+    {"id": "default",                        "display_name": "default (session model)",             "max_input_tokens": None},
+    {"id": "claude-opus-4-7-20251101",       "display_name": "Claude Opus 4.7",                    "max_input_tokens": 200_000},
+    {"id": "claude-opus-4-7-20251101[1m]",   "display_name": "Claude Opus 4.7 (1M ctx)",           "max_input_tokens": 1_048_576},
+    {"id": "claude-sonnet-4-6-20251015",     "display_name": "Claude Sonnet 4.6",                  "max_input_tokens": 200_000},
+    {"id": "claude-haiku-4-5-20251001",      "display_name": "Claude Haiku 4.5",                   "max_input_tokens": 200_000},
+    {"id": "claude-fable-5",                 "display_name": "Claude Fable 5 (200K)",               "max_input_tokens": 200_000},
+    {"id": "claude-fable-5[1m]",             "display_name": "Claude Fable 5 (1M)",                "max_input_tokens": 1_048_576},
+]
 
 
 # Static snapshot used until (and if) runtime discovery replaces it.
@@ -1331,8 +1524,14 @@ async def _menu_models(update: Update):
             )])
     except Exception as e:
         log.warning("fetch_models failed: %s", e)
-        items = [[InlineKeyboardButton(m, callback_data=f"md:{m}")]
-                 for m in MODEL_CHOICES]
+        for m in MODEL_CHOICES:
+            mid = m["id"]
+            mark = "✓ " if _norm_model(mid) == active else ""
+            items.append([InlineKeyboardButton(
+                f"{mark}{m['display_name']} · "
+                f"{_ctx_label(m['max_input_tokens'])} ctx",
+                callback_data=f"md:{mid}"[:64],
+            )])
     footer = [[InlineKeyboardButton(
         "default (clear override)", callback_data="md:default")]]
     title = (f"Session model: {conv.current_model or 'unknown'}\n"
@@ -1581,23 +1780,40 @@ def _own_file(p: Path) -> bool:
 
 
 async def restart_watcher(app: Application) -> None:
-    """Graceful deploy: restart only when no conversation is mid-turn."""
+    """Graceful deploy: restart only when no conversation is mid-turn.
+    Drain is an optimization — the durable-state reconcile at startup is the
+    guarantee — so waiting here is best-effort, never load-bearing."""
     global _foreign_flag_warned
+    wait_notified = False
     while True:
         await asyncio.sleep(5)
-        if not RESTART_FLAG.exists():
+        flags = [f for f in (RESTART_FLAG, RESTART_FLAG_LOCAL) if f.exists()]
+        owned = [f for f in flags if _own_file(f)]
+        if flags and not owned and not _foreign_flag_warned:
+            _foreign_flag_warned = True
+            log.warning("restart flag not owned by us; ignoring")
+        if not owned:
+            wait_notified = False
             continue
-        if not _own_file(RESTART_FLAG):
-            if not _foreign_flag_warned:
-                _foreign_flag_warned = True
-                log.warning("restart flag not owned by us; ignoring")
+        busy = [c for c in conversations.values() if c.lock.locked()]
+        if busy:
+            if not wait_notified:
+                wait_notified = True
+                try:
+                    await app.bot.send_message(
+                        chat_id=OWNER_ID,
+                        text=(f"⏳ Restart queued — waiting for {len(busy)} "
+                              "busy conversation(s) to finish."),
+                        disable_notification=True,
+                    )
+                except Exception:
+                    pass
             continue
-        if any(c.lock.locked() for c in conversations.values()):
-            continue
-        try:
-            RESTART_FLAG.unlink()
-        except OSError:
-            pass
+        for f in owned:
+            try:
+                f.unlink()
+            except OSError:
+                pass
         log.info("restart flag detected and idle; restarting service")
         try:
             m = await app.bot.send_message(
@@ -1620,14 +1836,43 @@ async def restart_watcher(app: Application) -> None:
         return
 
 
+async def _reconcile_state(app: Application) -> None:
+    """Restart = reconcile from disk: clear in-progress reactions left by the
+    previous process and tell the owner what was interrupted, instead of
+    leaving zombie status the user has to puzzle over."""
+    _state_load()
+    stale = list(_state.get("reactions", []))
+    if not stale:
+        return
+    for chat_id, msg_id in stale:
+        try:
+            await app.bot.set_message_reaction(
+                chat_id=chat_id, message_id=msg_id, reaction=None)
+        except Exception:
+            pass
+    _state["reactions"] = []
+    _state_save()
+    try:
+        await app.bot.send_message(
+            chat_id=OWNER_ID,
+            text=(f"♻️ Restarted. {len(stale)} message(s) were still marked "
+                  "in-progress; their turns were interrupted — resend them "
+                  "if the work didn't complete. Session bindings are "
+                  "preserved."),
+            disable_notification=True,
+        )
+    except Exception:
+        pass
+
+
 async def post_init(app: Application) -> None:
     """Register command menus so typing '/' shows hints (scoped per chat)."""
+    await _reconcile_state(app)
     cmds = [
         BotCommand("resume", "Resume a conversation"),
-        BotCommand("new", "Start a new session"),
+        BotCommand("clear", "Reset the conversation (fresh session)"),
         BotCommand("status", "Show current session binding"),
-        BotCommand("stop", "Interrupt the current turn (ESC)"),
-        BotCommand("esc", "Same as /stop"),
+        BotCommand("esc", "Interrupt the current turn (the CLI's ESC)"),
         BotCommand("model", "Set the model for this conversation"),
         BotCommand("effort", "Set effort level for this conversation"),
         BotCommand("compact", "Clear history but keep a summary in context"),
@@ -1643,7 +1888,9 @@ async def post_init(app: Application) -> None:
         BotCommand("schedule", "Manage scheduled cloud agents"),
         BotCommand("init", "Initialize CLAUDE.md for a codebase"),
         BotCommand("whisper", "Show or set the voice transcription model"),
-        BotCommand("reset", "Same as /new"),
+        BotCommand("new", "Same as /clear"),
+        BotCommand("reset", "Same as /clear"),
+        BotCommand("stop", "Same as /esc"),
         BotCommand("help", "Show help"),
     ]
     try:
@@ -1941,8 +2188,9 @@ def main() -> None:
     app_ref = app
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(CommandHandler("clear", cmd_reset))
     app.add_handler(CommandHandler("new", cmd_reset))
+    app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("sessions", cmd_resume))
     app.add_handler(CommandHandler("status", cmd_status))
