@@ -327,6 +327,56 @@ def _strip_html(s: str) -> str:
     return _h.unescape(re.sub(r"</?[a-zA-Z][^>]*>", "", s))
 
 
+pending_multi: Dict[str, tuple] = {}
+
+
+def _multi_kb(token: str, options: list, selected: set) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(
+        ("☑️ " if i in selected else "▫️ ") + str(o)[:56],
+        callback_data=f"mt:{token}:{i}")]
+        for i, o in enumerate(options)]
+    rows.append([InlineKeyboardButton("✅ Done",
+                                      callback_data=f"mt:{token}:done")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def ask_buttons_multi(
+    conv: "Conversation", text: str, options: list, timeout: float = 3600,
+    allowed_user: int = 0,
+) -> Optional[list]:
+    """Native multiSelect: toggle options, ✅ Done resolves with the indices."""
+    if app_ref is None:
+        return None
+    token = uuid.uuid4().hex[:10]
+    fut: asyncio.Future = asyncio.get_running_loop().create_future()
+    selected: set = set()
+    chat_id, thread = conv.key
+    try:
+        msg = await app_ref.bot.send_message(
+            chat_id=chat_id, message_thread_id=thread or None,
+            text=text[:3900],
+            reply_markup=_multi_kb(token, options, selected))
+    except Exception:
+        log.exception("ask_buttons_multi send failed")
+        return None
+    pending_multi[token] = (fut, msg, allowed_user, options, selected)
+    _state.setdefault("prompts", {})[token] = [msg.chat_id, msg.message_id]
+    _state_save()
+    try:
+        return await asyncio.wait_for(fut, timeout=timeout)
+    except asyncio.TimeoutError:
+        try:
+            first = (msg.text or "").split("\n", 1)[0]
+            await msg.edit_text(f"{first}\n⌛️ expired")
+        except Exception:
+            pass
+        return None
+    finally:
+        pending_multi.pop(token, None)
+        if _state.get("prompts", {}).pop(token, None) is not None:
+            _state_save()
+
+
 async def ask_buttons(
     conv: "Conversation", text: str, options: list, timeout: float = 3600,
     allowed_user: int = 0, parse_mode: Optional[str] = None,
@@ -720,12 +770,27 @@ async def handle_ask_user_question(conv: Conversation, tool_input: dict):
         for o in opts:
             if isinstance(o, dict) and o.get("description"):
                 lines.append(f"• {o.get('label')}: {o['description']}")
-        if q_.get("multiSelect"):
-            lines.append("(multi-select question; pick the primary option)")
         # synthetic options, verbatim from the native TUI (__other__/__chat__)
         extras = ["Other"]
-        if not q_.get("multiSelect"):
-            extras.append("Chat about this")
+        if q_.get("multiSelect"):
+            lines.append("(select all that apply, then ✅ Done)")
+            sel = await ask_buttons_multi(conv, "\n".join(lines),
+                                          labels + extras,
+                                          allowed_user=conv.last_user_id)
+            if sel is None:
+                return PermissionResultDeny(
+                    message="User did not answer the question in time."
+                )
+            if len(labels) in sel:  # "Other" toggled on
+                return PermissionResultDeny(
+                    message="The user chose Other and will type their own "
+                            "answer as the next message; wait for it in "
+                            "plain chat."
+                )
+            answers[q_.get("question", "")] = ", ".join(
+                labels[i] for i in sel if i < len(labels))
+            continue
+        extras.append("Chat about this")
         idx = await ask_buttons(conv, "\n".join(lines), labels + extras,
                                 allowed_user=conv.last_user_id)
         if idx is None:
@@ -1747,6 +1812,62 @@ async def cmd_permissions(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     await show_menu(update, "pr")
 
 
+async def run_bash_mode(update: Update, cmd: str) -> None:
+    """CLI parity for `!command`: run directly in the conversation's cwd, no
+    model in the loop. Caller gates to owner-typed (never forwards/guests)."""
+    import html as _h
+    conv = get_conv(update)
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            cmd, cwd=conv.cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await update.effective_message.reply_text("⌛️ killed after 120s")
+            return
+    except Exception as e:
+        await update.effective_message.reply_text(f"spawn failed: {e}")
+        return
+    text = out.decode(errors="replace").strip()
+    if not text:
+        text = f"(no output, exit {proc.returncode})"
+    elif proc.returncode:
+        text += f"\n(exit {proc.returncode})"
+    for i in range(0, len(text), 3500):
+        chunk = text[i:i + 3500]
+        try:
+            await update.effective_message.reply_text(
+                f"<pre>{_h.escape(chunk)}</pre>", parse_mode="HTML")
+        except Exception:
+            try:
+                await update.effective_message.reply_text(chunk)
+            except Exception:
+                pass
+
+
+async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """CLI parity for /export: hand over the session's own transcript file."""
+    if not chat_allowed(update) or not is_owner(update):
+        return
+    conv = get_conv(update)
+    if not conv.session_id:
+        await update.effective_message.reply_text("No session bound yet.")
+        return
+    for f in PROJECTS_ROOT.glob(f"*/{conv.session_id}.jsonl"):
+        try:
+            await update.effective_message.reply_document(
+                document=f.open("rb"), filename=f"{conv.session_id}.jsonl",
+                caption=f"Session transcript · {_shorten_home(conv.cwd)}")
+        except Exception as e:
+            await update.effective_message.reply_text(f"Export failed: {e}")
+        return
+    await update.effective_message.reply_text("Session file not found.")
+
+
 # The CLI's shift+tab cycle, labels verbatim from the binary's own
 # indicator table (symbol + label + the bypass dialog's term).
 PERM_MODES = [
@@ -1937,6 +2058,52 @@ async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
                 await q.edit_message_reply_markup(reply_markup=None)
             except Exception:
                 pass
+        return
+    if data.startswith("mt:"):
+        try:
+            _, token, action = data.split(":", 2)
+        except ValueError:
+            await q.answer()
+            return
+        entry = pending_multi.get(token)
+        if entry is None:
+            await q.answer("Expired.")
+            try:
+                await q.edit_message_text("⌛️ expired")
+            except Exception:
+                pass
+            return
+        fut, msg, allowed_user, options, selected = entry
+        if uid != OWNER_ID and uid != allowed_user:
+            await q.answer("This prompt isn't for you.")
+            return
+        if action == "done":
+            if not fut.done():
+                fut.set_result(sorted(selected))
+            await q.answer("OK")
+            try:
+                first = ((msg.text if msg else "") or "").split("\n", 1)[0]
+                chosen = ", ".join(str(options[i])
+                                   for i in sorted(selected)) or "(none)"
+                await q.edit_message_text(f"{first}\n→ {chosen}")
+            except Exception:
+                pass
+            return
+        try:
+            i = int(action)
+        except ValueError:
+            await q.answer()
+            return
+        if not 0 <= i < len(options):
+            await q.answer()
+            return
+        selected.symmetric_difference_update({i})
+        await q.answer()
+        try:
+            await q.edit_message_reply_markup(
+                _multi_kb(token, options, selected))
+        except Exception:
+            pass
         return
     if uid != OWNER_ID:
         await q.answer("Owner only.")
@@ -2152,6 +2319,12 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     log.info("msg %s user=%s text=%r", conv_key_of(update),
              update.effective_user.id if update.effective_user else None,
              msg.text[:120])
+    # `!` bash mode (CLI parity): owner-TYPED only — forwards are quotes
+    if (msg.text.startswith("!") and len(msg.text) > 1
+            and not getattr(msg, "forward_origin", None)
+            and is_owner(update)):
+        await run_bash_mode(update, msg.text[1:].strip())
+        return
     # every text goes through the settle buffer; the window matches the
     # arrival's signature. Forwards/splits trickle (1.2s); typed text only
     # waits for same-instant companions (0.25s — invisible next to turn
@@ -2391,6 +2564,7 @@ async def post_init(app: Application) -> None:
         BotCommand("effort", "Set effort level for this conversation"),
         BotCommand("mode", "Permission mode (default/acceptEdits/plan/bypass)"),
         BotCommand("permissions", "View / remove the CLI's allow rules"),
+        BotCommand("export", "Send this session's transcript file"),
         BotCommand("compact", "Clear history but keep a summary in context"),
         BotCommand("context", "Show current context usage"),
         BotCommand("cost", "Show session cost"),
@@ -2730,6 +2904,8 @@ def main() -> None:
     app.add_handler(CommandHandler("effort", cmd_effort, filters=~filters.FORWARDED))
     app.add_handler(CommandHandler("mode", cmd_mode, filters=~filters.FORWARDED))
     app.add_handler(CommandHandler("permissions", cmd_permissions,
+                                   filters=~filters.FORWARDED))
+    app.add_handler(CommandHandler("export", cmd_export,
                                    filters=~filters.FORWARDED))
     app.add_handler(CommandHandler("whisper", cmd_whisper, filters=~filters.FORWARDED))
     app.add_handler(CommandHandler("usage", cmd_usage, filters=~filters.FORWARDED))

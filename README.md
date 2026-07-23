@@ -148,6 +148,8 @@ events and statelessness.
 | `/effort` | Reasoning-effort picker — levels discovered from the CLI itself |
 | `/mode` | Native permission modes: default · acceptEdits · plan · bypassPermissions |
 | `/permissions` | View and revoke the allow rules accumulated by *don't-ask-again* |
+| `/export` | Send this session's transcript file |
+| `!command` | Bash mode — run a shell command directly in the session's cwd (owner-typed only) |
 | `/usage` | Subscription limits (5h / weekly / per-model / credits) |
 | `/whisper` | Pick the voice-transcription model |
 | `/esc` (`/stop`) | Interrupt the current turn — the CLI's ESC |
@@ -175,6 +177,8 @@ turns continue automatically.
   world-readable.
 - Owner: full permissions. Guests: scoped read/write and a custom prompt;
   out-of-scope tool calls escalate to the owner as Allow/Deny buttons.
+- `!` bash mode is the one deliberate shell surface: owner-typed messages
+  only — forwarded text never executes, guests never reach it.
 - Session management commands are owner-gated everywhere; so is `/mode` —
   permission modes change the guardrails themselves, and `bypass permissions`
   disables the guest sandbox for that conversation.
