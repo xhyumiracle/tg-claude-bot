@@ -247,6 +247,12 @@ class Conversation:
     # `claude setup-token` awaits its auth code. Ephemeral by design — a
     # restart mid-login just means running /login again.
     login: Optional[dict] = None
+    # /esc coverage for the gaps where no client exists yet (issue #1):
+    # a turn still starting (CLI+MCP boot can take seconds) honors
+    # interrupt_asap right after query; a running `!cmd` shell is killable
+    # via bash_proc.
+    interrupt_asap: bool = False
+    bash_proc: Optional[object] = None
 
 
 conversations: Dict[ConvKey, Conversation] = {}
@@ -1164,6 +1170,7 @@ async def run_turn(
         await _run_turn_inner(update, ctx, text, blocks, status_text, sender_id)
     finally:
         conv.turn_active = False
+        conv.interrupt_asap = False  # never let a stale /esc kill a later turn
         # steered messages belong to this turn exactly like the direct one:
         # sync state deletes first (un-skippable), best-effort reactions after
         steered = conv.steered[:]
@@ -1267,6 +1274,12 @@ async def _run_turn_inner(
             else:
                 await client.query(text)
             conv.turn_active = True  # steering may now inject into this turn
+            if conv.interrupt_asap:  # /esc arrived while the CLI was booting
+                conv.interrupt_asap = False
+                try:
+                    await client.interrupt()
+                except Exception:
+                    pass
             status = LiveStatus()
             if status_text:
                 await status.update(update, status_text)
@@ -2094,12 +2107,15 @@ async def run_bash_mode(update: Update, cmd: str) -> None:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
+        conv.bash_proc = proc  # /esc kills it (issue #1)
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
         except asyncio.TimeoutError:
             proc.kill()
             await update.effective_message.reply_text("⌛️ killed after 120s")
             return
+        finally:
+            conv.bash_proc = None
     except Exception as e:
         await update.effective_message.reply_text(f"spawn failed: {e}")
         return
@@ -2231,6 +2247,21 @@ async def cmd_stop(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     if conv.login:
         await _login_cancel(conv)
         await update.effective_message.reply_text("⏹ /login cancelled.")
+        return
+    if conv.bash_proc is not None:  # `!cmd` holds no lock and no client
+        try:
+            conv.bash_proc.kill()
+        except ProcessLookupError:
+            pass
+        await update.effective_message.reply_text("⏹ Shell command killed.")
+        return
+    if conv.lock.locked() and conv.client is None:
+        # turn accepted but the CLI is still booting (spawn + MCP servers
+        # can take seconds) — issue #1's "Nothing running." while it
+        # clearly was. Interrupt the moment the query is on the wire.
+        conv.interrupt_asap = True
+        await update.effective_message.reply_text(
+            "⏹ Turn is still starting — interrupt queued.")
         return
     if conv.client is None or not conv.lock.locked():
         await update.effective_message.reply_text("Nothing running.")
@@ -2510,9 +2541,9 @@ async def on_unknown_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 # modes are benign: over-merge ≈ what queue batching does anyway; over-split
 # yields smaller but self-contained batches.
 FWD_SETTLE_S = 1.2   # forwards/splits trickle in over a second or two
-TEXT_SETTLE_S = 0.25  # typed text: only same-instant companions (e.g. the
-                      # comment Telegram sends alongside a forward gesture);
-                      # imperceptible next to multi-second turn startup
+TEXT_SETTLE_S = 0.0   # typed text fires instantly: steering (live-verified)
+                      # absorbs any same-gesture companion into the running
+                      # turn, so the merge window is obsolete
 _fwd_batches: Dict[tuple, dict] = {}
 
 
@@ -2537,9 +2568,12 @@ async def _fwd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     e["update"], e["ctx"] = update, ctx
     if e["task"]:
         e["task"].cancel()
+    # batchy is sticky per batch: a typed comment landing on an open forward
+    # batch must not shrink its window while forwards are still trickling
     batchy = bool(getattr(msg, "forward_origin", None)) or len(msg.text) >= 4000
+    e["batchy"] = e.get("batchy", False) or batchy
     e["task"] = asyncio.create_task(
-        _fwd_settle(key, FWD_SETTLE_S if batchy else TEXT_SETTLE_S))
+        _fwd_settle(key, FWD_SETTLE_S if e["batchy"] else TEXT_SETTLE_S))
 
 
 async def _fwd_settle(key: tuple, delay: float) -> None:
