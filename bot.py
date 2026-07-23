@@ -49,6 +49,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    Defaults,
     MessageHandler,
     filters,
 )
@@ -1428,7 +1429,7 @@ async def _run_turn_inner(
             except Exception:
                 pass
         await run_turn(update, ctx, "\n".join(texts), blks or None,
-                       sender_id=drain_uid)
+                       sender_id=drain_uid, anchor=queued[0][3])
         for _, _, _, m in queued:
             try:
                 await m.set_reaction(None)
@@ -3234,6 +3235,9 @@ def main() -> None:
         Application.builder()
         .token(TG_TOKEN)
         .concurrent_updates(True)
+        # a deleted reply-anchor must never cost the reply itself:
+        # fall back to sending unquoted instead of raising
+        .defaults(Defaults(allow_sending_without_reply=True))
         .post_init(post_init)
         .post_shutdown(on_shutdown)
         .build()
