@@ -313,6 +313,11 @@ def _inflight_del(conv: "Conversation", msg) -> None:
         _state_save()
 
 
+def _strip_html(s: str) -> str:
+    import html as _h
+    return _h.unescape(re.sub(r"</?[a-zA-Z][^>]*>", "", s))
+
+
 async def ask_buttons(
     conv: "Conversation", text: str, options: list, timeout: float = 3600,
     allowed_user: int = 0, parse_mode: Optional[str] = None,
@@ -331,11 +336,13 @@ async def ask_buttons(
     chat_id, thread = conv.key
     msg = None
     for pm in ((parse_mode, None) if parse_mode else (None,)):
+        # the plain fallback must be readable, never raw markup soup
+        body = text if pm else (_strip_html(text) if parse_mode else text)
         try:
             msg = await app_ref.bot.send_message(
                 chat_id=chat_id,
                 message_thread_id=thread or None,
-                text=text[:3900],
+                text=body[:3900],
                 reply_markup=InlineKeyboardMarkup(rows),
                 parse_mode=pm,
             )
@@ -344,12 +351,15 @@ async def ask_buttons(
             if pm is None:  # plain-text attempt also failed: give up
                 log.exception("ask_buttons send failed")
                 return None
-    pending_btns[token] = (fut, msg, allowed_user, len(options))
+            log.warning("ask_buttons rich send failed; retrying plain",
+                        exc_info=True)
+    pending_btns[token] = (fut, msg, allowed_user, [str(o) for o in options])
     try:
         return await asyncio.wait_for(fut, timeout=timeout)
     except asyncio.TimeoutError:
-        try:
-            await msg.edit_reply_markup(reply_markup=None)
+        try:  # collapse, mirroring the CLI prompt scrolling into history
+            first = ((msg.text if msg else "") or "").split("\n", 1)[0]
+            await msg.edit_text(f"{first}\n⌛️ expired")
         except Exception:
             pass
         return None
@@ -611,7 +621,9 @@ def _fmt_permission_rules(updates) -> str:
         if u.type in ("addDirectories", "removeDirectories") and u.directories:
             dirs = ", ".join(_shorten_home(d) for d in u.directories)
             parts.append(f"{u.type}: {dirs}")
-    return ", ".join(parts)
+    if len(parts) > 3:
+        parts = parts[:3] + [f"+{len(parts) - 3} more"]
+    return " · ".join(parts)
 
 
 def _fmt_tool_request(tool_name: str, tool_input: dict, path) -> str:
@@ -649,7 +661,7 @@ async def ask_owner_permission(conv: Conversation, tool_name: str,
     if suggestions:
         rules = _fmt_permission_rules(suggestions)
         if rules:
-            text += f"\n♻️ <i>Don't ask again = {_h.escape(rules)}</i>"
+            text += f"\n♻️ <code>{_h.escape(rules)}</code>"
         labels.insert(1, "♻️ Always allow (don't ask again)")
     idx = await ask_buttons(conv, text, labels, timeout=180, parse_mode="HTML")
     if idx is None:
@@ -1731,20 +1743,26 @@ async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         if entry is None:
             await q.answer("Expired.")
             return
-        fut, _msg, allowed_user, n_opts = entry
+        fut, msg, allowed_user, labels = entry
         if uid != OWNER_ID and uid != allowed_user:
             await q.answer("This prompt isn't for you.")
             return
-        if not 0 <= idx < n_opts:
+        if not 0 <= idx < len(labels):
             await q.answer()
             return
         if not fut.done():
             fut.set_result(idx)
         await q.answer("OK")
+        # collapse to one line — the prompt scrolls into history like the
+        # CLI's, instead of stacking up and burying the live reply
         try:
-            await q.edit_message_reply_markup(reply_markup=None)
+            first = ((msg.text if msg else "") or "").split("\n", 1)[0]
+            await q.edit_message_text(f"{first}\n→ {labels[idx]}")
         except Exception:
-            pass
+            try:
+                await q.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
         return
     if uid != OWNER_ID:
         await q.answer("Owner only.")
