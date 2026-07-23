@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import time
+import hashlib
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1693,6 +1694,59 @@ async def _menu_models(update: Update):
     return title, items, footer
 
 
+# ---------- /permissions: view + revoke the CLI's allow rules ----------
+# Always-allow presses accumulate rules into the CLI's own settings files;
+# this is the native undo. We edit the same files the CLI reads.
+
+def _perm_rule_sources(conv: Conversation) -> list:
+    root = Path(conv.cwd)
+    return [
+        ("user", HOME / ".claude" / "settings.json"),
+        ("user-local", HOME / ".claude" / "settings.local.json"),
+        ("project", root / ".claude" / "settings.json"),
+        ("project-local", root / ".claude" / "settings.local.json"),
+    ]
+
+
+def _rule_sig(rule: str) -> str:
+    return hashlib.md5(rule.encode()).hexdigest()[:6]
+
+
+_perm_snapshot: list = []  # [(path, rule)] as last rendered
+
+
+@menu("pr")
+async def _menu_permissions(update: Update):
+    conv = get_conv(update)
+    _perm_snapshot.clear()
+    items = []
+    for scope, path in _perm_rule_sources(conv):
+        try:
+            allow = (json.loads(path.read_text())
+                     .get("permissions", {}).get("allow", []))
+        except Exception:
+            continue
+        for rule in allow:
+            if not isinstance(rule, str):
+                continue
+            idx = len(_perm_snapshot)
+            _perm_snapshot.append((path, rule))
+            items.append([InlineKeyboardButton(
+                f"🗑 {rule} · {scope}"[:60],
+                callback_data=f"pr:{idx}:{_rule_sig(rule)}",
+            )])
+    title = ("Allow rules the CLI reads for this conversation — tap to "
+             f"remove.\ncwd: {_shorten_home(conv.cwd)}"
+             + ("" if items else "\n(no allow rules found)"))
+    return title, items, []
+
+
+async def cmd_permissions(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not chat_allowed(update) or not is_owner(update):
+        return
+    await show_menu(update, "pr")
+
+
 # The CLI's shift+tab cycle, labels verbatim from the binary's own
 # indicator table (symbol + label + the bypass dialog's term).
 PERM_MODES = [
@@ -1942,6 +1996,32 @@ async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             except Exception:
                 pass
         await apply_perm_mode(_edit3, conv, data[3:])
+    elif data.startswith("pr:"):
+        try:
+            _, idx_s, sig = data.split(":", 2)
+            path, rule = _perm_snapshot[int(idx_s)]
+        except (ValueError, IndexError):
+            await q.answer("Expired — reopen /permissions.")
+            return
+        if _rule_sig(rule) != sig:  # menu re-rendered since; indices shifted
+            await q.answer("Expired — reopen /permissions.")
+            return
+        try:
+            d = json.loads(path.read_text())
+            allow = d.get("permissions", {}).get("allow", [])
+            if rule in allow:
+                allow.remove(rule)
+                tmp = path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(d, indent=2) + "\n")
+                tmp.replace(path)
+            await q.answer(f"Removed: {rule}"[:190])
+        except Exception:
+            log.exception("rule removal failed")
+            await q.answer("Removal failed — see logs.")
+            return
+        # a live CLI process has the old rules loaded; reconnect lazily
+        await drop_client(get_conv(update))
+        await show_menu(update, "pr", edit_query=q)
     else:
         await q.answer()
 
@@ -2310,6 +2390,7 @@ async def post_init(app: Application) -> None:
         BotCommand("model", "Set the model for this conversation"),
         BotCommand("effort", "Set effort level for this conversation"),
         BotCommand("mode", "Permission mode (default/acceptEdits/plan/bypass)"),
+        BotCommand("permissions", "View / remove the CLI's allow rules"),
         BotCommand("compact", "Clear history but keep a summary in context"),
         BotCommand("context", "Show current context usage"),
         BotCommand("cost", "Show session cost"),
@@ -2648,6 +2729,8 @@ def main() -> None:
     app.add_handler(CommandHandler("model", cmd_model, filters=~filters.FORWARDED))
     app.add_handler(CommandHandler("effort", cmd_effort, filters=~filters.FORWARDED))
     app.add_handler(CommandHandler("mode", cmd_mode, filters=~filters.FORWARDED))
+    app.add_handler(CommandHandler("permissions", cmd_permissions,
+                                   filters=~filters.FORWARDED))
     app.add_handler(CommandHandler("whisper", cmd_whisper, filters=~filters.FORWARDED))
     app.add_handler(CommandHandler("usage", cmd_usage, filters=~filters.FORWARDED))
     app.add_handler(CallbackQueryHandler(on_callback))
