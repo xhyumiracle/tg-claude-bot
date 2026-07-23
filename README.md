@@ -92,8 +92,10 @@ sudo systemctl enable --now tg-claude-bot
 journalctl -u tg-claude-bot -f          # watch the logs
 ```
 
-To deploy an update gracefully: `touch /tmp/tgbot-restart-requested` — the bot
+To deploy an update gracefully: `touch ~/.tgbot/restart-requested` — the bot
 restarts as soon as every conversation is idle, so no reply is ever cut off.
+Even on a hard crash nothing is lost: topics rebind to their sessions, and
+interrupted turns resume with `continue` (the CLI transcript has everything).
 
 ### Configuration
 

@@ -113,12 +113,18 @@ SHELL_CMDS = {
     "ccusage": "npx -y ccusage@latest blocks --active",
 }
 
-RESTART_FLAG = Path("/tmp/tgbot-restart-requested")
+# All bot-owned durable state lives in ONE machine-global private dir.
+# Principle: keep it minimal — whatever the CLI already stores (transcripts,
+# cwd, titles, retention) is reused from ~/.claude, never duplicated here.
+TGBOT_DIR = HOME / ".tgbot"
+TGBOT_DIR.mkdir(mode=0o700, exist_ok=True)
+RESTART_FLAG = TGBOT_DIR / "restart-requested"
+RESTART_FLAG_TMP = Path("/tmp/tgbot-restart-requested")  # legacy location
 # Self-rescue flag inside the repo: reachable via an agent's Write tool even
 # when Bash/permission escalation is broken (learned the hard way when a
 # permission-bridge bug locked the agent out of `touch /tmp/...`).
 RESTART_FLAG_LOCAL = Path(__file__).resolve().parent / ".tgbot-restart-requested"
-RESTART_NOTICE = Path("/tmp/tgbot-restart-notice.json")
+RESTART_NOTICE = TGBOT_DIR / "restart-notice.json"
 
 _LOCAL_OUT_RE = re.compile(
     r"<local-command-stdout>(.*?)</local-command-stdout>", re.S
@@ -224,10 +230,25 @@ app_ref: Optional[Application] = None
 # ---------- durable routing state ----------
 # First principles: graceful drain can never cover a crash or power loss, so
 # the only reliable invariant is "state is on disk at all times; restart =
-# reconcile from disk". The CLI owns all *conversation* state (transcripts);
-# the bot owns *routing* state — which TG topic points at which session, and
-# which TG messages are wearing an in-progress reaction. Both live here.
-STATE_FILE = HOME / ".claude" / "tgbot_state.json"
+# reconcile from disk". The CLI transcript already persists every in-flight
+# turn's *content* (the user message and completed tool calls land in the
+# session jsonl as they happen), so crash recovery needs only *pointers*:
+#   bindings — which TG topic resumes which session (one id per topic;
+#              cwd/title come from the CLI's own files, model/effort only
+#              when overridden). Pruned against the CLI's session store at
+#              startup, so the CLI's retention is our GC.
+#   inflight — message ids mid-turn right now, per topic; deleted the moment
+#              the turn completes. Bounded by concurrent conversations.
+STATE_FILE = TGBOT_DIR / "state.json"
+for _old, _new in (
+    (HOME / ".claude" / "tgbot_state.json", STATE_FILE),
+    (HOME / ".claude" / "tgbot_models_cache.json", TGBOT_DIR / "models.json"),
+):
+    try:
+        if _old.exists() and not _new.exists():
+            _old.rename(_new)
+    except OSError:
+        pass
 _state: dict = {}
 
 
@@ -249,10 +270,12 @@ def _state_save() -> None:
 
 
 def persist_binding(conv: "Conversation") -> None:
-    _state.setdefault("bindings", {})[f"{conv.key[0]}:{conv.key[1]}"] = {
-        "session_id": conv.session_id, "cwd": conv.cwd,
-        "model": conv.model, "effort": conv.effort,
-    }
+    entry: dict = {"session_id": conv.session_id}
+    if conv.model:  # store overrides only; defaults stay implicit
+        entry["model"] = conv.model
+    if conv.effort:
+        entry["effort"] = conv.effort
+    _state.setdefault("bindings", {})[f"{conv.key[0]}:{conv.key[1]}"] = entry
     _state_save()
 
 
@@ -260,16 +283,24 @@ def stored_binding(key: ConvKey) -> Optional[dict]:
     return _state.get("bindings", {}).get(f"{key[0]}:{key[1]}")
 
 
-def track_reaction(msg, on: bool) -> None:
-    """Record which TG messages currently wear a 👀/👨‍💻 reaction so a
-    restart can clear them instead of leaving zombie in-progress status."""
-    lst = _state.setdefault("reactions", [])
-    entry = [msg.chat_id, msg.message_id]
-    if on and entry not in lst:
-        lst.append(entry)
-    elif not on and entry in lst:
-        lst.remove(entry)
-    _state_save()
+def _inflight_add(conv: "Conversation", msg) -> None:
+    """A message's turn (or queue wait) is in progress: remember its id so an
+    unclean restart can clear its reaction and offer to continue."""
+    lst = _state.setdefault("inflight", {}).setdefault(
+        f"{conv.key[0]}:{conv.key[1]}", [])
+    if msg.message_id not in lst:
+        lst.append(msg.message_id)
+        _state_save()
+
+
+def _inflight_del(conv: "Conversation", msg) -> None:
+    key = f"{conv.key[0]}:{conv.key[1]}"
+    lst = _state.get("inflight", {}).get(key, [])
+    if msg.message_id in lst:
+        lst.remove(msg.message_id)
+        if not lst:
+            _state["inflight"].pop(key, None)
+        _state_save()
 
 
 async def ask_buttons(
@@ -433,12 +464,14 @@ def get_conv(update: Update) -> Conversation:
             )
         # Restart continuity: a topic keeps pointing at the session it was on.
         # The stored binding wins over static defaults — it is more recent.
+        # cwd comes from the CLI's own session file, not from our state.
         stored = stored_binding(key)
         if stored:
             ssid = stored.get("session_id")
-            if ssid and find_session(ssid):
+            meta = find_session(ssid) if ssid else None
+            if meta:
                 conv.session_id = ssid
-                conv.cwd = stored.get("cwd") or conv.cwd
+                conv.cwd = meta["cwd"] or conv.cwd
             conv.model = stored.get("model") or conv.model
             conv.effort = stored.get("effort") or conv.effort
         conversations[key] = conv
@@ -955,7 +988,7 @@ async def run_turn(
         try:
             # native ack: a 👀 reaction instead of a noisy "queued" bubble
             await update.effective_message.set_reaction("👀")
-            track_reaction(update.effective_message, True)
+            _inflight_add(conv, update.effective_message)
         except Exception:
             try:
                 await update.effective_message.reply_text(
@@ -970,7 +1003,7 @@ async def run_turn(
         if sender_id is None:  # direct turn: mark the message being worked on
             try:
                 await update.effective_message.set_reaction("👨‍💻")
-                track_reaction(update.effective_message, True)
+                _inflight_add(conv, update.effective_message)
             except Exception:
                 pass
         try:
@@ -1095,7 +1128,7 @@ async def run_turn(
             await update.effective_message.set_reaction(None)
         except Exception:
             pass
-        track_reaction(update.effective_message, False)
+        _inflight_del(conv, update.effective_message)
     # drain messages queued while this turn was running
     if conv.queue:
         queued = conv.queue[:]
@@ -1117,7 +1150,7 @@ async def run_turn(
                 await m.set_reaction(None)
             except Exception:
                 pass
-            track_reaction(m, False)
+            _inflight_del(conv, m)
 
 
 # ---------- handlers ----------
@@ -1250,7 +1283,7 @@ def _oauth_token() -> str:
 
 
 _models_cache: dict = {"ts": 0.0, "data": []}
-_MODELS_DISK_CACHE = HOME / ".claude" / "tgbot_models_cache.json"
+_MODELS_DISK_CACHE = TGBOT_DIR / "models.json"
 
 
 def _models_disk_load() -> list:
@@ -1825,7 +1858,8 @@ async def restart_watcher(app: Application) -> None:
     wait_notified = False
     while True:
         await asyncio.sleep(5)
-        flags = [f for f in (RESTART_FLAG, RESTART_FLAG_LOCAL) if f.exists()]
+        flags = [f for f in (RESTART_FLAG, RESTART_FLAG_TMP, RESTART_FLAG_LOCAL)
+                 if f.exists()]
         owned = [f for f in flags if _own_file(f)]
         if flags and not owned and not _foreign_flag_warned:
             _foreign_flag_warned = True
@@ -1833,7 +1867,10 @@ async def restart_watcher(app: Application) -> None:
         if not owned:
             wait_notified = False
             continue
-        busy = [c for c in conversations.values() if c.lock.locked()]
+        # Strict gate: mid-turn OR queued messages count as busy. The stricter
+        # the gate, the less state a planned restart ever has to carry.
+        busy = [c for c in conversations.values()
+                if c.lock.locked() or c.queue]
         if busy:
             if not wait_notified:
                 wait_notified = True
@@ -1875,32 +1912,46 @@ async def restart_watcher(app: Application) -> None:
 
 
 async def _reconcile_state(app: Application) -> None:
-    """Restart = reconcile from disk: clear in-progress reactions left by the
-    previous process and tell the owner what was interrupted, instead of
-    leaving zombie status the user has to puzzle over."""
+    """Restart = reconcile from disk. Clean restarts (strict idle gate) leave
+    nothing to do and stay silent. After an unclean death: clear in-progress
+    reactions and tell each affected *topic* its turn was interrupted — the
+    CLI transcript still holds everything up to the interruption, so `continue`
+    picks the work back up with zero content loss."""
     _state_load()
-    stale = list(_state.get("reactions", []))
-    if not stale:
-        return
-    for chat_id, msg_id in stale:
+    # GC: the CLI's own session retention prunes our binding table.
+    binds = _state.get("bindings", {})
+    dead = [k for k, v in binds.items()
+            if not (v.get("session_id") and find_session(v["session_id"]))]
+    for k in dead:
+        binds.pop(k)
+    inflight = _state.pop("inflight", {})
+    legacy = _state.pop("reactions", None) or []  # pre-consolidation schema
+    _state_save()
+    for chat_id, msg_id in legacy:
         try:
             await app.bot.set_message_reaction(
                 chat_id=chat_id, message_id=msg_id, reaction=None)
         except Exception:
             pass
-    _state["reactions"] = []
-    _state_save()
-    try:
-        await app.bot.send_message(
-            chat_id=OWNER_ID,
-            text=(f"♻️ Restarted. {len(stale)} message(s) were still marked "
-                  "in-progress; their turns were interrupted — resend them "
-                  "if the work didn't complete. Session bindings are "
-                  "preserved."),
-            disable_notification=True,
-        )
-    except Exception:
-        pass
+    for key, msg_ids in inflight.items():
+        chat_s, _, thread_s = key.partition(":")
+        chat_id, thread = int(chat_s), int(thread_s or 0)
+        for mid in msg_ids:
+            try:
+                await app.bot.set_message_reaction(
+                    chat_id=chat_id, message_id=mid, reaction=None)
+            except Exception:
+                pass
+        try:
+            await app.bot.send_message(
+                chat_id=chat_id, message_thread_id=thread or None,
+                text=("⚡ Restarted mid-turn. Nothing is lost — the session "
+                      "transcript has everything up to the interruption. "
+                      "Send \"continue\" to pick the work back up."),
+                disable_notification=True,
+            )
+        except Exception:
+            pass
 
 
 async def post_init(app: Application) -> None:
