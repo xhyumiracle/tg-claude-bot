@@ -1179,7 +1179,7 @@ async def _consume_orphan_turn(update: Update, conv: "Conversation",
 async def run_turn(
     update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str,
     blocks: Optional[list] = None, status_text: Optional[str] = None,
-    sender_id: Optional[int] = None,
+    sender_id: Optional[int] = None, anchor=None,
 ) -> None:
     """Thin shell so the inflight/reaction cleanup survives task
     cancellation (user interrupts): sync state delete first — un-skippable —
@@ -1187,7 +1187,8 @@ async def run_turn(
     inflight entries that a later unclean restart falsely replays."""
     conv = get_conv(update)
     try:
-        await _run_turn_inner(update, ctx, text, blocks, status_text, sender_id)
+        await _run_turn_inner(update, ctx, text, blocks, status_text,
+                              sender_id, anchor)
     finally:
         conv.turn_active = False
         conv.interrupt_asap = False  # never let a stale /esc kill a later turn
@@ -1215,7 +1216,7 @@ async def run_turn(
 async def _run_turn_inner(
     update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str,
     blocks: Optional[list] = None, status_text: Optional[str] = None,
-    sender_id: Optional[int] = None,
+    sender_id: Optional[int] = None, anchor=None,
 ) -> None:
     conv = get_conv(update)
     uid = (sender_id if sender_id is not None
@@ -1236,7 +1237,7 @@ async def _run_turn_inner(
             try:
                 await conv.client.query(text)
                 conv.steered.append(update.effective_message)
-                conv.reply_anchor = update.effective_message
+                conv.reply_anchor = anchor or update.effective_message
                 conv.last_steer = time.time()
                 log.info("conv %s steered into live turn", conv.key)
                 try:
@@ -1267,7 +1268,7 @@ async def _run_turn_inner(
         return
     async with conv.lock:
         conv.last_user_id = uid
-        conv.reply_anchor = update.effective_message
+        conv.reply_anchor = anchor or update.effective_message
         if sender_id is None:  # direct turn: mark the message being worked on
             _inflight_add(conv, update.effective_message)
             try:
@@ -2636,8 +2637,12 @@ async def _fwd_flush(key: tuple) -> None:
         else:
             body += f" (forwarded {len(fwds)} messages):\n{numbered}"
     log.info("fwd batch %s flushed: %d message(s)", key, len(items))
+    # reply anchor = the user's own words: the typed comment if there is
+    # one, else the FIRST forwarded message (the user's msg leads the
+    # gesture — owner preference), never the arbitrary last arrival
+    anchor_msg = next((m for m, fc, _ in items if not fc), items[0][0])
     try:
-        await run_turn(update, ctx, body)
+        await run_turn(update, ctx, body, anchor=anchor_msg)
     finally:
         # batch content now lives in the turn (or in the representative's
         # queue entry if run_turn queued it) — release the member markers
