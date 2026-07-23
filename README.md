@@ -146,6 +146,7 @@ events and statelessness.
 | `/status` | Current binding: session, project, model, effort |
 | `/model` | Live model picker — real names and context windows from `/v1/models` |
 | `/effort` | Reasoning-effort picker — levels discovered from the CLI itself |
+| `/mode` | Native permission modes: default · acceptEdits · plan · bypassPermissions |
 | `/usage` | Subscription limits (5h / weekly / per-model / credits) |
 | `/whisper` | Pick the voice-transcription model |
 | `/esc` (`/stop`) | Interrupt the current turn — the CLI's ESC |

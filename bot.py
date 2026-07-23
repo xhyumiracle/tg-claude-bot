@@ -225,6 +225,7 @@ class Conversation:
     queue: list = field(default_factory=list)
     model: Optional[str] = None
     effort: Optional[str] = None
+    perm_mode: Optional[str] = None  # native CLI permission mode override
     current_model: Optional[str] = None
     ctx_warned: int = 0
 
@@ -273,6 +274,8 @@ def persist_binding(conv: "Conversation") -> None:
         entry["model"] = conv.model
     if conv.effort:
         entry["effort"] = conv.effort
+    if conv.perm_mode:
+        entry["perm_mode"] = conv.perm_mode
     _state.setdefault("bindings", {})[f"{conv.key[0]}:{conv.key[1]}"] = entry
     _state_save()
 
@@ -507,6 +510,7 @@ def get_conv(update: Update) -> Conversation:
                 conv.cwd = meta["cwd"] or conv.cwd
             conv.model = stored.get("model") or conv.model
             conv.effort = stored.get("effort") or conv.effort
+            conv.perm_mode = stored.get("perm_mode") or conv.perm_mode
         conversations[key] = conv
     return conversations[key]
 
@@ -537,7 +541,7 @@ def build_options(conv: Conversation) -> ClaudeAgentOptions:
             },
             cwd=conv.cwd,
             resume=conv.session_id,
-            permission_mode="default",
+            permission_mode=conv.perm_mode or "default",
             can_use_tool=make_owner_cb(conv),
             model=conv.model,
             effort=conv.effort,
@@ -550,7 +554,7 @@ def build_options(conv: Conversation) -> ClaudeAgentOptions:
         add_dirs=[str(d) for d in GUEST_WRITE_DIRS],
         allowed_tools=sorted(READ_TOOLS | WRITE_TOOLS | WEB_TOOLS),
         can_use_tool=make_permission_cb(conv),
-        permission_mode="default",
+        permission_mode=conv.perm_mode or "default",
         resume=conv.session_id,
         setting_sources=["user", "project"],
     )
@@ -1674,6 +1678,57 @@ async def _menu_models(update: Update):
     return title, items, footer
 
 
+# The CLI's native permission modes, verbatim (shift+tab in the terminal).
+PERM_MODES = [
+    ("default", "rules + per-call prompts"),
+    ("acceptEdits", "auto-allow file edits"),
+    ("plan", "read-only; plan needs approval"),
+    ("bypassPermissions", "⚠️ no prompts at all"),
+]
+
+
+@menu("pm")
+async def _menu_perm_mode(update: Update):
+    conv = get_conv(update)
+    active = conv.perm_mode or "default"
+    items = [[InlineKeyboardButton(
+        f"{'✓ ' if m == active else ''}{m} — {hint}",
+        callback_data=f"pm:{m}",
+    )] for m, hint in PERM_MODES]
+    title = ("Permission mode for this conversation — the CLI's own modes.\n"
+             "⚠️ bypassPermissions removes every guardrail here, including "
+             "the guest sandbox.")
+    return title, items, []
+
+
+async def apply_perm_mode(reply, conv: Conversation, mode: str) -> None:
+    if mode not in {m for m, _ in PERM_MODES}:
+        await reply(f"Unknown mode: {mode}")
+        return
+    conv.perm_mode = None if mode == "default" else mode
+    persist_binding(conv)
+    if conv.client is not None:
+        try:
+            await conv.client.set_permission_mode(mode)
+            await reply(f"Permission mode: {mode} (live, this conversation).")
+            return
+        except Exception:
+            await drop_client(conv)  # rebuilt with the mode on next message
+    await reply(f"Permission mode: {mode} (applies from the next message).")
+
+
+async def cmd_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    # Owner-gated everywhere: modes change the guardrails themselves.
+    if not chat_allowed(update) or not is_owner(update):
+        return
+    conv = get_conv(update)
+    if ctx.args:
+        await apply_perm_mode(update.effective_message.reply_text,
+                              conv, ctx.args[0])
+        return
+    await show_menu(update, "pm")
+
+
 async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not chat_allowed(update) or not is_owner(update):
         return
@@ -1859,6 +1914,16 @@ async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             await apply_model(_edit2, conv, data[3:])
         else:
             await apply_effort(_edit2, conv, data[3:])
+    elif data.startswith("pm:"):
+        await q.answer()
+        conv = get_conv(update)
+
+        async def _edit3(text: str) -> None:
+            try:
+                await q.edit_message_text(text)
+            except Exception:
+                pass
+        await apply_perm_mode(_edit3, conv, data[3:])
     else:
         await q.answer()
 
@@ -2137,6 +2202,7 @@ async def post_init(app: Application) -> None:
         BotCommand("esc", "Interrupt the current turn (the CLI's ESC)"),
         BotCommand("model", "Set the model for this conversation"),
         BotCommand("effort", "Set effort level for this conversation"),
+        BotCommand("mode", "Permission mode (default/acceptEdits/plan/bypass)"),
         BotCommand("compact", "Clear history but keep a summary in context"),
         BotCommand("context", "Show current context usage"),
         BotCommand("cost", "Show session cost"),
@@ -2471,6 +2537,7 @@ def main() -> None:
     app.add_handler(CommandHandler("esc", cmd_stop))
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("effort", cmd_effort))
+    app.add_handler(CommandHandler("mode", cmd_mode))
     app.add_handler(CommandHandler("whisper", cmd_whisper))
     app.add_handler(CommandHandler("usage", cmd_usage))
     app.add_handler(CallbackQueryHandler(on_callback))
