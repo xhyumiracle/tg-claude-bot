@@ -1975,6 +1975,77 @@ async def on_unknown_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
                    status_text=f"⏳ {text.split()[0]} running…")
 
 
+# ---------- forward-batch aggregation ----------
+# Telegram gives multi-forwards NO batch id (unlike albums' media_group_id):
+# N selected messages arrive as N unrelated updates. Group with the albums'
+# settle heuristic — same sender + forward_origin + tight timing. Both failure
+# modes are benign: over-merge ≈ what queue batching does anyway; over-split
+# yields smaller but self-contained batches.
+FWD_SETTLE_S = 1.2
+_fwd_batches: Dict[tuple, dict] = {}
+
+
+def _fwd_key(update: Update) -> tuple:
+    msg = update.effective_message
+    return (*conv_key_of(update),
+            msg.from_user.id if msg.from_user else 0)
+
+
+async def _fwd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    key = _fwd_key(update)
+    e = _fwd_batches.get(key)
+    if e is None:
+        e = _fwd_batches[key] = {"items": [], "update": update, "ctx": ctx,
+                                 "task": None}
+    # settle buffer is memory: ride inflight (persist-first) so a crash here
+    # replays instead of silently dropping
+    _inflight_add(get_conv(update), msg,
+                  queued_text=f"{forward_context(msg)}{msg.text}")
+    e["items"].append((msg, forward_context(msg), msg.text))
+    e["update"], e["ctx"] = update, ctx
+    if e["task"]:
+        e["task"].cancel()
+    e["task"] = asyncio.create_task(_fwd_settle(key))
+
+
+async def _fwd_settle(key: tuple) -> None:
+    try:
+        await asyncio.sleep(FWD_SETTLE_S)
+    except asyncio.CancelledError:
+        return
+    await _fwd_flush(key)
+
+
+async def _fwd_flush(key: tuple) -> None:
+    e = _fwd_batches.pop(key, None)
+    if e is None:
+        return
+    if e["task"] and e["task"] is not asyncio.current_task():
+        e["task"].cancel()
+    update, ctx = e["update"], e["ctx"]
+    conv = get_conv(update)
+    user = update.effective_user
+    name = user.full_name if user else "unknown"
+    uid = user.id if user else 0
+    items = e["items"]
+    if len(items) == 1:
+        m, fc, text = items[0]
+        body = f"[{name} ({uid})]: {fc}{reply_context(m)}{text}"
+    else:
+        lines = [f"{i + 1}) {fc}{t}" for i, (_, fc, t) in enumerate(items)]
+        body = (f"[{name} ({uid})] (forwarded {len(items)} messages):\n"
+                + "\n".join(lines))
+    log.info("fwd batch %s flushed: %d message(s)", key, len(items))
+    try:
+        await run_turn(update, ctx, body)
+    finally:
+        # batch content now lives in the turn (or in the representative's
+        # queue entry if run_turn queued it) — release the member markers
+        for m, _, _ in items:
+            _inflight_del(conv, m)
+
+
 async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not chat_allowed(update):
         return
@@ -1984,6 +2055,13 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     log.info("msg %s user=%s text=%r", conv_key_of(update),
              update.effective_user.id if update.effective_user else None,
              msg.text[:120])
+    if getattr(msg, "forward_origin", None):
+        await _fwd_add(update, ctx)
+        return
+    # a typed follow-up must not overtake a still-settling forward batch:
+    # flush the batch first, then run this message (order preserved)
+    if _fwd_key(update) in _fwd_batches:
+        await _fwd_flush(_fwd_key(update))
     await run_turn(update, ctx, format_incoming(update))
 
 
