@@ -1479,11 +1479,8 @@ async def _run_turn_inner(
         # least-privileged attribution: any non-owner sender wins
         uids = {u for _, _, u, _ in queued}
         drain_uid = next((u for u in uids if u != OWNER_ID), OWNER_ID)
-        for _, _, _, m in queued:
-            try:
-                await m.set_reaction("👨‍💻")
-            except Exception:
-                pass
+        # queued messages already carry 👀 ("seen"); no 👨‍💻 re-reaction —
+        # it's N redundant API calls, kept 👀 until the drain clears it below
         await run_turn(update, ctx, "\n".join(texts), blks or None,
                        sender_id=drain_uid, anchor=queued[0][3])
         for _, _, _, m in queued:
