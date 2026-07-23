@@ -1693,13 +1693,15 @@ async def _menu_models(update: Update):
     return title, items, footer
 
 
-# The CLI's native permission modes, verbatim (shift+tab in the terminal).
+# The CLI's shift+tab cycle, labels verbatim from the binary's own
+# indicator table (symbol + label + the bypass dialog's term).
 PERM_MODES = [
-    ("default", "rules + per-call prompts"),
-    ("acceptEdits", "auto-allow file edits"),
-    ("plan", "read-only; plan needs approval"),
-    ("bypassPermissions", "⚠️ no prompts at all"),
+    ("default", "default"),
+    ("acceptEdits", "⏵⏵ accept edits on"),
+    ("plan", "⏸ plan mode on"),
+    ("bypassPermissions", "⏵⏵ auto mode on (bypass permissions)"),
 ]
+PERM_MODE_LABEL = dict(PERM_MODES)
 
 
 @menu("pm")
@@ -1707,11 +1709,11 @@ async def _menu_perm_mode(update: Update):
     conv = get_conv(update)
     active = conv.perm_mode or "default"
     items = [[InlineKeyboardButton(
-        f"{'✓ ' if m == active else ''}{m} — {hint}",
+        f"{'✓ ' if m == active else ''}{label}",
         callback_data=f"pm:{m}",
-    )] for m, hint in PERM_MODES]
-    title = ("Permission mode for this conversation — the CLI's own modes.\n"
-             "⚠️ bypassPermissions removes every guardrail here, including "
+    )] for m, label in PERM_MODES]
+    title = ("Permission mode — the CLI's shift+tab cycle, per conversation.\n"
+             "⚠️ bypass permissions removes every guardrail here, including "
              "the guest sandbox.")
     return title, items, []
 
@@ -1722,14 +1724,15 @@ async def apply_perm_mode(reply, conv: Conversation, mode: str) -> None:
         return
     conv.perm_mode = None if mode == "default" else mode
     persist_binding(conv)
+    label = PERM_MODE_LABEL.get(mode, mode)
     if conv.client is not None:
         try:
             await conv.client.set_permission_mode(mode)
-            await reply(f"Permission mode: {mode} (live, this conversation).")
+            await reply(f"{label} (live, this conversation).")
             return
         except Exception:
             await drop_client(conv)  # rebuilt with the mode on next message
-    await reply(f"Permission mode: {mode} (applies from the next message).")
+    await reply(f"{label} (applies from the next message).")
 
 
 async def cmd_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
