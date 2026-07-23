@@ -229,6 +229,13 @@ class Conversation:
     perm_mode: Optional[str] = None  # native CLI permission mode override
     current_model: Optional[str] = None
     ctx_warned: int = 0
+    # steering: turn_active is True only while a queried turn is streaming
+    # (flips False the instant its ResultMessage is parsed); steered holds the
+    # TG messages injected into the live turn; last_steer feeds the orphan
+    # probe that catches a write racing the turn's final milliseconds.
+    turn_active: bool = False
+    steered: list = field(default_factory=list)
+    last_steer: float = 0.0
 
 
 conversations: Dict[ConvKey, Conversation] = {}
@@ -1102,6 +1109,36 @@ async def check_context_usage(update: Update, conv: Conversation) -> None:
         pass
 
 
+async def _consume_orphan_turn(update: Update, conv: "Conversation",
+                               client) -> None:
+    """Drain one un-queried turn a raced steer write may have started on the
+    CLI side. 6s decides: a real orphan turn emits its init events almost
+    immediately; silence means the steer landed inside the finished turn."""
+    agen = client.receive_response()
+    try:
+        async with asyncio.timeout(6):
+            first = await anext(agen)
+    except (TimeoutError, StopAsyncIteration):
+        return
+    log.info("conv %s consuming orphan steered turn", conv.key)
+    buf: list[str] = []
+
+    def _take(m) -> None:
+        if isinstance(m, AssistantMessage):
+            for b in m.content:
+                if isinstance(b, TextBlock):
+                    buf.append(b.text)
+        elif isinstance(m, ResultMessage) and m.is_error:
+            buf.append(f"⚠️ Turn failed: {str(m.result)[:300]}")
+
+    _take(first)
+    async for m in agen:
+        _take(m)
+    out = "\n".join(p for p in buf if p).strip()
+    if out and not out.startswith("<pass>"):
+        await send_long(update, _tg_markdown(out))
+
+
 async def run_turn(
     update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str,
     blocks: Optional[list] = None, status_text: Optional[str] = None,
@@ -1115,8 +1152,21 @@ async def run_turn(
     try:
         await _run_turn_inner(update, ctx, text, blocks, status_text, sender_id)
     finally:
+        conv.turn_active = False
+        # steered messages belong to this turn exactly like the direct one:
+        # sync state deletes first (un-skippable), best-effort reactions after
+        steered = conv.steered[:]
+        conv.steered.clear()
+        for m in steered:
+            _inflight_del(conv, m)
         if sender_id is None:
             _inflight_del(conv, update.effective_message)
+        for m in steered:
+            try:
+                await m.set_reaction(None)
+            except BaseException:
+                pass
+        if sender_id is None:
             try:
                 await update.effective_message.set_reaction(None)
             except BaseException:
@@ -1132,6 +1182,32 @@ async def _run_turn_inner(
     uid = (sender_id if sender_id is not None
            else update.effective_user.id if update.effective_user else 0)
     if conv.lock.locked():
+        # ---- steering: inject into the LIVE turn (CLI-native) ----
+        # In stream-json mode the CLI absorbs user lines mid-turn at the next
+        # tool boundary — same turn, one ResultMessage, no echo (verified).
+        # So "type while it works" ≈ query() into the live client. Guards:
+        # text-only (media keeps its blocks plumbing in a fresh turn) and no
+        # privilege change (a guest can't inject into someone else's turn —
+        # the running turn keeps its original permission context).
+        if (conv.turn_active and conv.client is not None and not blocks
+                and (uid == OWNER_ID or uid == conv.last_user_id)):
+            # persist first: a crash between here and turn end replays this
+            _inflight_add(conv, update.effective_message,
+                          queued_text=(text or "").strip() or "[media]")
+            try:
+                await conv.client.query(text)
+                conv.steered.append(update.effective_message)
+                conv.last_steer = time.time()
+                log.info("conv %s steered into live turn", conv.key)
+                try:
+                    await update.effective_message.set_reaction("👀")
+                except Exception:
+                    pass
+                return
+            except Exception:
+                # transport hiccup or turn just ended — queue path below
+                log.exception("steer failed for %s; queueing", conv.key)
+        # ---- fallback: queue for the drain turn after this one ----
         conv.queue.append((text, blocks, uid, update.effective_message))
         log.info("conv %s busy, queued (%d waiting)", conv.key, len(conv.queue))
         # persist first, act second: a crash here costs one idempotent cleanup
@@ -1179,6 +1255,7 @@ async def _run_turn_inner(
                 await client.query(_gen())
             else:
                 await client.query(text)
+            conv.turn_active = True  # steering may now inject into this turn
             status = LiveStatus()
             if status_text:
                 await status.update(update, status_text)
@@ -1235,6 +1312,9 @@ async def _run_turn_inner(
                                 await flush_segment()
                             await status.update(update, "💭 Thinking…")
                 elif isinstance(m, ResultMessage):
+                    # same-tick flip, before any await: from here a steer
+                    # write can no longer believe the turn is still alive
+                    conv.turn_active = False
                     # errors come back as results, not exceptions — never
                     # swallow them or the user sees their message vanish
                     if m.is_error:
@@ -1259,6 +1339,14 @@ async def _run_turn_inner(
                                 buf.append(out.strip())
             ticker_task.cancel()
             await flush_segment()
+            # orphan probe: a steer racing the turn's final milliseconds may
+            # have missed the last boundary — the CLI then runs it as a NEW
+            # turn nobody consumes, and every later reply would shift one
+            # turn. An absorbed steer extends the turn by ≥ one model
+            # response (multi-second), so "steer written <1.5s before the
+            # Result" ⇒ near-certainly raced: probe and consume it now.
+            if conv.steered and time.time() - conv.last_steer < 1.5:
+                await _consume_orphan_turn(update, conv, client)
             await check_context_usage(update, conv)
         except Exception as e:
             try:
@@ -2008,6 +2096,9 @@ async def cmd_status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         n = max(0, min(10, round(pct / 10)))
         lines.append(f"{icon} Context {pct:.0f}% {'█' * n}{'░' * (10 - n)} "
                      f"({total // 1000}k / {limit // 1000}k)")
+    if conv.steered:
+        lines.append(f"↪️ {len(conv.steered)} message(s) steered into the "
+                     "current turn")
     if conv.queue:
         lines.append(f"📥 {len(conv.queue)} message(s) queued")
     await update.effective_message.reply_text("\n".join(lines))
