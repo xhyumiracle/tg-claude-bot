@@ -361,6 +361,10 @@ async def ask_buttons(
                         exc_info=True)
     pending_btns[token] = (fut, msg, allowed_user,
                            [str(o) for o in options], ephemeral)
+    # persist the prompt's location: if the process dies while it waits, the
+    # boot reconcile rewrites it to "expired" instead of leaving zombie buttons
+    _state.setdefault("prompts", {})[token] = [msg.chat_id, msg.message_id]
+    _state_save()
     try:
         return await asyncio.wait_for(fut, timeout=timeout)
     except asyncio.TimeoutError:
@@ -372,6 +376,8 @@ async def ask_buttons(
         return None
     finally:
         pending_btns.pop(token, None)
+        if _state.get("prompts", {}).pop(token, None) is not None:
+            _state_save()
 
 
 # ---------- session discovery ----------
@@ -1009,6 +1015,27 @@ async def run_turn(
     blocks: Optional[list] = None, status_text: Optional[str] = None,
     sender_id: Optional[int] = None,
 ) -> None:
+    """Thin shell so the inflight/reaction cleanup survives task
+    cancellation (user interrupts): sync state delete first — un-skippable —
+    then a best-effort reaction clear. Without this, interrupted turns leak
+    inflight entries that a later unclean restart falsely replays."""
+    conv = get_conv(update)
+    try:
+        await _run_turn_inner(update, ctx, text, blocks, status_text, sender_id)
+    finally:
+        if sender_id is None:
+            _inflight_del(conv, update.effective_message)
+            try:
+                await update.effective_message.set_reaction(None)
+            except BaseException:
+                pass
+
+
+async def _run_turn_inner(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str,
+    blocks: Optional[list] = None, status_text: Optional[str] = None,
+    sender_id: Optional[int] = None,
+) -> None:
     conv = get_conv(update)
     uid = (sender_id if sender_id is not None
            else update.effective_user.id if update.effective_user else 0)
@@ -1155,12 +1182,9 @@ async def run_turn(
                     "Something went wrong; please try again."
                 )
 
-    if sender_id is None:
-        try:
-            await update.effective_message.set_reaction(None)
-        except Exception:
-            pass
-        _inflight_del(conv, update.effective_message)
+    # cleanup for the direct message lives in run_turn's finally (survives
+    # cancellation); only the drain belongs here — it must NOT run when the
+    # turn was cancelled, so queued messages stay inflight for recovery.
     # drain messages queued while this turn was running
     if conv.queue:
         queued = conv.queue[:]
@@ -1750,6 +1774,10 @@ async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         entry = pending_btns.get(token)
         if entry is None:
             await q.answer("Expired.")
+            try:  # neutralize the zombie UI instead of leaving live-looking buttons
+                await q.edit_message_text("⌛️ expired")
+            except Exception:
+                pass
             return
         fut, msg, allowed_user, labels, ephemeral = entry
         if uid != OWNER_ID and uid != allowed_user:
@@ -2062,7 +2090,14 @@ async def _reconcile_state(app: Application) -> None:
         binds.pop(k)
     inflight = _state.pop("inflight", {})
     legacy = _state.pop("reactions", None) or []  # pre-consolidation schema
+    zombie_prompts = _state.pop("prompts", {})
     _state_save()
+    for chat_id, msg_id in zombie_prompts.values():
+        try:  # dead process's button prompts: rewrite so they can't mislead
+            await app.bot.edit_message_text(
+                chat_id=chat_id, message_id=msg_id, text="⌛️ expired")
+        except Exception:
+            pass
     for chat_id, msg_id in legacy:
         try:
             await app.bot.set_message_reaction(
