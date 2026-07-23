@@ -489,9 +489,18 @@ def _session_meta(path: Path) -> Tuple[Optional[str], str]:
             tail = f.read().decode("utf-8", errors="ignore")
     except OSError:
         return None, ""
-    m = _CWD_RE.search(head)
+    # cwd is in every real message record; the head can be all queue-ops
+    # (→ [?] in the picker), so fall back to the tail. Last resort: the
+    # CLI's native project key IS the parent dir name (cwd with each '/'
+    # → '-'), lossy on real dashes so only trusted when it resolves to an
+    # existing directory.
+    m = _CWD_RE.search(head) or _CWD_RE.search(tail)
     if m:
         cwd = m.group(1)
+    else:
+        guess = "/" + path.parent.name.lstrip("-").replace("-", "/")
+        if path.parent.name.startswith("-") and os.path.isdir(guess):
+            cwd = guess
     summary = ""
     for chunk in (head, tail):
         for line in chunk.splitlines():
