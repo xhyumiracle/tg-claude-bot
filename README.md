@@ -31,15 +31,15 @@ owns everything.
 | 🔁 **Resume any real session** | Inline picker over your actual session store (`~/.claude/projects`), with the CLI's own AI titles; cross-project, working directory auto-detected. |
 | 🧵 **Per-topic sessions** | Every forum topic is its own independent conversation — switch projects by switching topics. |
 | 🌊 **Streaming replies** | Watch the answer build live: thinking, each tool call, then text — one `⏳ Working…` message edited in place that morphs into the final reply, with an elapsed ticker on long runs. |
-| 💬 **Type while it works** | Fire follow-ups mid-turn and they steer straight into the running answer (👀 to confirm) — never dropped, never spawning a second turn. Each reply quotes the message it answers; multi-forwards and 4096-split long texts arrive as one coherent message. |
+| 💬 **Reads like a conversation** | The bot answers right under the message it's replying to, so even a fast-moving topic stays easy to follow. Reply to any message to quote it into context; multi-forwards and 4096-split long texts arrive as one coherent message. |
+| ⚡ **Type while it works** | Send follow-ups mid-turn and they steer straight into the running answer (👀 to confirm) — never dropped, never spawning a second turn. |
 | 🔘 **Buttons instead of a TUI** | Permissions — including the CLI's native *don't-ask-again* — plan approval, and clarifying questions are all inline buttons. Answered prompts clean up after themselves. |
 | ⏩ **Zero command remapping** | Unknown `/commands` go verbatim to the CLI: `/compact`, skills, anything headless — its output relayed straight back. |
 | 🎤 **Voice messages** | Local faster-whisper, bilingual zh/en, editable 🎤 transcript. No audio leaves your machine. |
 | 🖼 **Native media** | Images ride inside the message for the model to see; other files land in a TTL-cleaned media dir. |
 | 🎛 **CLI parity** | `/model`, `/effort`, `/mode` (the shift+tab cycle), `/permissions`, `/usage`, `!shell` — sourced from official APIs and the CLI itself, nothing hardcoded. |
-| 🔑 **Re-auth from your phone** | When your CLI login expires, `/login` relays the real sign-in link — tap it, paste the code back, done. Never leave the chat. |
 | ♻️ **Restart-proof** | Topics stay bound to their sessions across restarts — even hard crashes: interrupted turns auto-resume from the transcript, and messages you sent while it was down are replayed. |
-| 🛡 **Never a dropped reply** | Bursts pace themselves and Telegram's flood-control is retried automatically — replies and reactions just arrive, you never see a rate-limit error. |
+| 🛡 **Reliable under load** | Send as fast as you like — replies and reactions pace and retry themselves against Telegram's rate limits, so nothing stalls out with an error and no message is lost. |
 | 🟠 **Context warnings** | 🟠 at 80% / 🔴 at 90% of the real context window, same source as `/context`. |
 | 🔒 **Owner/guest profiles** | Allowlisted chats only; owner full access, guests scoped to specific dirs with Allow/Deny escalation to the owner. |
 
