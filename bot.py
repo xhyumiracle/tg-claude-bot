@@ -1187,31 +1187,40 @@ async def run_turn(
     then a best-effort reaction clear. Without this, interrupted turns leak
     inflight entries that a later unclean restart falsely replays."""
     conv = get_conv(update)
+    # owned = this invocation ran a real turn (acquired the lock). Steer /
+    # queue invocations return early WITHOUT owning: their 👀 and state
+    # belong to the live turn, so they must skip the owner cleanup below —
+    # otherwise the steer's own finally instantly clears the 👀 it just set
+    # and clobbers the running turn's turn_active/anchor/steered. Default
+    # True so a cancelled owner turn (CancelledError out of _inner) still
+    # cleans up.
+    owned = True
     try:
-        await _run_turn_inner(update, ctx, text, blocks, status_text,
-                              sender_id, anchor)
+        owned = not await _run_turn_inner(update, ctx, text, blocks,
+                                          status_text, sender_id, anchor)
     finally:
-        conv.turn_active = False
-        conv.interrupt_asap = False  # never let a stale /esc kill a later turn
-        conv.reply_anchor = None
-        # steered messages belong to this turn exactly like the direct one:
-        # sync state deletes first (un-skippable), best-effort reactions after
-        steered = conv.steered[:]
-        conv.steered.clear()
-        for m in steered:
-            _inflight_del(conv, m)
-        if sender_id is None:
-            _inflight_del(conv, update.effective_message)
-        for m in steered:
-            try:
-                await m.set_reaction(None)
-            except BaseException:
-                pass
-        if sender_id is None:
-            try:
-                await update.effective_message.set_reaction(None)
-            except BaseException:
-                pass
+        if owned:
+            conv.turn_active = False
+            conv.interrupt_asap = False  # no stale /esc kills a later turn
+            conv.reply_anchor = None
+            # steered messages belong to this turn exactly like the direct
+            # one: sync state deletes first (un-skippable), reactions after
+            steered = conv.steered[:]
+            conv.steered.clear()
+            for m in steered:
+                _inflight_del(conv, m)
+            if sender_id is None:
+                _inflight_del(conv, update.effective_message)
+            for m in steered:
+                try:
+                    await m.set_reaction(None)
+                except BaseException:
+                    pass
+            if sender_id is None:
+                try:
+                    await update.effective_message.set_reaction(None)
+                except BaseException:
+                    pass
 
 
 async def _run_turn_inner(
@@ -1245,7 +1254,7 @@ async def _run_turn_inner(
                     await update.effective_message.set_reaction("👀")
                 except Exception:
                     pass
-                return
+                return True  # deferred into the live turn; skip owner cleanup
             except Exception:
                 # transport hiccup or turn just ended — queue path below
                 log.exception("steer failed for %s; queueing", conv.key)
@@ -1266,7 +1275,7 @@ async def _run_turn_inner(
                 )
             except Exception:
                 pass
-        return
+        return True  # queued for the drain; owner cleanup belongs to the turn
     async with conv.lock:
         conv.last_user_id = uid
         conv.reply_anchor = anchor or update.effective_message
