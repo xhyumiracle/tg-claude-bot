@@ -3294,9 +3294,14 @@ class FloodLimiter(BaseRateLimiter):
     already app-throttled or must stay instant, so streaming keeps its feel.
     """
 
+    # Only NEW-message endpoints are paced. Reactions are deliberately NOT
+    # here: their whole value is instant "I saw your message" feedback, and
+    # pacing them behind a turn's own sends made the 👀 lag or vanish. They
+    # keep the retry safety net below; a rare reaction burst self-heals via
+    # RetryAfter instead of pre-emptive spacing.
     PACED = {"sendMessage", "sendPhoto", "sendDocument", "sendVoice",
              "sendAudio", "sendAnimation", "sendMediaGroup",
-             "forwardMessage", "copyMessage", "setMessageReaction"}
+             "forwardMessage", "copyMessage"}
 
     def __init__(self, cap: int = 8, rate: float = 1.0,
                  max_retries: int = 3) -> None:
