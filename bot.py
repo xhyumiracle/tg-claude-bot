@@ -274,7 +274,7 @@ def track_reaction(msg, on: bool) -> None:
 
 async def ask_buttons(
     conv: "Conversation", text: str, options: list, timeout: float = 3600,
-    allowed_user: int = 0,
+    allowed_user: int = 0, parse_mode: Optional[str] = None,
 ) -> Optional[int]:
     """Post inline buttons in the conversation; return chosen index or None.
 
@@ -288,16 +288,21 @@ async def ask_buttons(
         for i, label in enumerate(options)
     ]
     chat_id, thread = conv.key
-    try:
-        msg = await app_ref.bot.send_message(
-            chat_id=chat_id,
-            message_thread_id=thread or None,
-            text=text[:3900],
-            reply_markup=InlineKeyboardMarkup(rows),
-        )
-    except Exception:
-        log.exception("ask_buttons send failed")
-        return None
+    msg = None
+    for pm in ((parse_mode, None) if parse_mode else (None,)):
+        try:
+            msg = await app_ref.bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=thread or None,
+                text=text[:3900],
+                reply_markup=InlineKeyboardMarkup(rows),
+                parse_mode=pm,
+            )
+            break
+        except Exception:
+            if pm is None:  # plain-text attempt also failed: give up
+                log.exception("ask_buttons send failed")
+                return None
     pending_btns[token] = (fut, msg, allowed_user, len(options))
     try:
         return await asyncio.wait_for(fut, timeout=timeout)
@@ -547,30 +552,63 @@ def _parse_permission_suggestions(suggestions) -> list:
     return parsed
 
 
+def _shorten_home(s: str) -> str:
+    h = str(HOME)
+    return s.replace("//" + h.lstrip("/"), "~").replace(h, "~")
+
+
 def _fmt_permission_rules(updates) -> str:
     parts = []
     for u in updates:
         for r in (u.rules or []):
-            parts.append(r.tool_name + (f"({r.rule_content})" if r.rule_content else ""))
+            rc = _shorten_home(r.rule_content or "")
+            if len(rc) > 60:  # e.g. a whole inline script; the gist is enough
+                rc = rc[:57] + "…"
+            parts.append(r.tool_name + (f"({rc})" if rc else ""))
         if u.type in ("addDirectories", "removeDirectories") and u.directories:
-            parts.append(f"{u.type}: {', '.join(u.directories)}")
+            dirs = ", ".join(_shorten_home(d) for d in u.directories)
+            parts.append(f"{u.type}: {dirs}")
     return ", ".join(parts)
 
 
-async def ask_owner_permission(conv: Conversation, tool_name: str, detail: str,
+def _fmt_tool_request(tool_name: str, tool_input: dict, path) -> str:
+    """Compact HTML permission prompt: bold headline, monospace payload."""
+    import html as _h
+    desc = str(tool_input.get("description") or "").strip()
+    head = f"🔐 <b>{_h.escape(tool_name)}</b>"
+    if desc:
+        head += f" — {_h.escape(desc)}"
+    if tool_name == "Bash":
+        cmd = _shorten_home(str(tool_input.get("command", "")).strip())
+        if len(cmd) > 400:
+            cmd = cmd[:400] + " …"
+        body = f"<pre>{_h.escape(cmd)}</pre>"
+    elif path:
+        body = f"📄 <code>{_h.escape(_shorten_home(str(path)))}</code>"
+    else:
+        rest = {k: v for k, v in tool_input.items() if k != "description"}
+        payload = json.dumps(rest, ensure_ascii=False, default=str)[:300]
+        body = f"<code>{_h.escape(payload)}</code>"
+    return f"{head}\n{body}"
+
+
+async def ask_owner_permission(conv: Conversation, tool_name: str,
+                               tool_input: dict, path,
                                suggestions: list) -> str:
     """Returns 'once', 'always', or 'deny' — mirroring the CLI's native
     Yes / Yes-don't-ask-again / No prompt. 'always' is only offered when the
     CLI supplied permission-rule suggestions (same source as the native
-    don't-ask-again option)."""
-    text = f"Permission request: {tool_name}\n{detail[:300]}"
+    don't-ask-again option); for e.g. compound shell commands the CLI sends
+    none, and the native CLI hides the option too."""
+    import html as _h
+    text = _fmt_tool_request(tool_name, tool_input, path)
     labels = ["✅ Allow once", "❌ Deny"]
     if suggestions:
         rules = _fmt_permission_rules(suggestions)
         if rules:
-            text += f"\n\nDon't-ask-again rule: {rules}"
+            text += f"\n♻️ <i>Don't ask again = {_h.escape(rules)}</i>"
         labels.insert(1, "♻️ Always allow (don't ask again)")
-    idx = await ask_buttons(conv, text, labels, timeout=180)
+    idx = await ask_buttons(conv, text, labels, timeout=180, parse_mode="HTML")
     if idx is None:
         return "deny"
     label = labels[idx]
@@ -692,7 +730,7 @@ def make_permission_cb(conv: Conversation):
         if conv.last_user_id == OWNER_ID:
             suggestions = _parse_permission_suggestions(ctx.suggestions)
             choice = await ask_owner_permission(
-                conv, tool_name, path or str(tool_input)[:200], suggestions)
+                conv, tool_name, tool_input, path, suggestions)
             if choice == "once":
                 return PermissionResultAllow(updated_input=tool_input)
             if choice == "always":
