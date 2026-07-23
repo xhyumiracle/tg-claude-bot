@@ -1,9 +1,16 @@
 import asyncio
+import fcntl
 import json
 import logging
 import os
+import pty
 import re
+import select
 import shutil
+import signal
+import struct
+import subprocess
+import termios
 import time
 import hashlib
 import uuid
@@ -236,6 +243,10 @@ class Conversation:
     turn_active: bool = False
     steered: list = field(default_factory=list)
     last_steer: float = 0.0
+    # /login flow: {"proc","fd","expiry","busy"} while a pty-relayed
+    # `claude setup-token` awaits its auth code. Ephemeral by design — a
+    # restart mid-login just means running /login again.
+    login: Optional[dict] = None
 
 
 conversations: Dict[ConvKey, Conversation] = {}
@@ -1686,6 +1697,178 @@ def _persist_env(key: str, value: str) -> None:
     env_path.write_text("\n".join(lines) + "\n")
 
 
+# ---------- /login: pty-relayed `claude setup-token` ----------
+# The CLI's login is a TUI: words are painted with cursor-positioning escapes
+# (so "Paste code here" arrives as "Paste\x1b[23Gcode\x1b[28Ghere"), and long
+# strings wrap at the terminal width. Two countermeasures, both verified
+# against the real flow: match phrases on ANSI-stripped text with spaces
+# removed, and open the pty 4000 columns wide so URL and token never wrap —
+# then a raw-buffer regex stops cleanly at the next escape byte.
+_LOGIN_ANSI_RE = re.compile(
+    r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|[\r\x08]")
+_LOGIN_URL_RE = re.compile(r"https://claude\.com/[^\s\x07\x1b\"]+")
+_LOGIN_TOKEN_RE = re.compile(r"sk-ant-oat[0-9A-Za-z_-]{24,}")
+_LOGIN_ERRS = ("OAutherror", "Invalidcode", "Failedtoexchange",
+               "Authenticationfailed")
+
+
+def _login_squash(raw: str) -> str:
+    return _LOGIN_ANSI_RE.sub("", raw).replace(" ", "")
+
+
+def _pty_read(fd: int, secs: float, stop) -> str:
+    """Blocking (thread-run) accumulate-until: stop(text) truthy, EOF, or
+    timeout. Returns everything read."""
+    buf = b""
+    deadline = time.time() + secs
+    while time.time() < deadline:
+        r, _, _ = select.select([fd], [], [], 0.5)
+        if not r:
+            continue
+        try:
+            chunk = os.read(fd, 65536)
+        except OSError:
+            break
+        if not chunk:
+            break
+        buf += chunk
+        if stop(buf.decode("utf-8", "replace")):
+            break
+    return buf.decode("utf-8", "replace")
+
+
+def _login_spawn() -> tuple:
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 4000, 0, 0))
+    proc = subprocess.Popen(
+        [SYSTEM_CLI or "claude", "setup-token"],
+        stdin=slave, stdout=slave, stderr=slave,
+        start_new_session=True, close_fds=True,
+    )
+    os.close(slave)
+    return proc, master
+
+
+def _login_kill(proc, fd: int) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+async def _login_cancel(conv: "Conversation") -> bool:
+    st, conv.login = conv.login, None
+    if not st:
+        return False
+    t = st.get("expiry")
+    if t and t is not asyncio.current_task():
+        t.cancel()
+    _login_kill(st["proc"], st["fd"])
+    return True
+
+
+async def _login_expire(update: Update, conv: "Conversation") -> None:
+    try:
+        await asyncio.sleep(300)
+    except asyncio.CancelledError:
+        return
+    if await _login_cancel(conv):
+        try:
+            await update.effective_message.reply_text("⌛️ /login expired.")
+        except Exception:
+            pass
+
+
+async def cmd_login(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    if not chat_allowed(update) or not is_owner(update):
+        return
+    conv = get_conv(update)
+    await _login_cancel(conv)  # replace any stale flow
+    try:
+        proc, fd = await asyncio.to_thread(_login_spawn)
+    except Exception as e:
+        await update.effective_message.reply_text(f"⚠️ /login failed: {e}")
+        return
+    raw = await asyncio.to_thread(
+        _pty_read, fd, 20, lambda s: "Pastecodehere" in _login_squash(s))
+    m = _LOGIN_URL_RE.search(raw)
+    if not m:
+        _login_kill(proc, fd)
+        await update.effective_message.reply_text(
+            "⚠️ /login: the CLI produced no sign-in URL. Tail:\n"
+            + _LOGIN_ANSI_RE.sub("", raw)[-300:])
+        return
+    conv.login = {"proc": proc, "fd": fd, "busy": False}
+    conv.login["expiry"] = asyncio.create_task(_login_expire(update, conv))
+    await update.effective_message.reply_text(
+        "🔑 Open this link, sign in, then paste the code back here as a "
+        f"normal message:\n\n{m.group(0)}\n\n(5 min · /esc cancels)")
+
+
+async def _login_paste(update: Update, conv: "Conversation",
+                       code: str) -> None:
+    st = conv.login
+    if st.get("busy"):
+        await update.effective_message.reply_text(
+            "⏳ Still exchanging the previous code…")
+        return
+    st["busy"] = True
+    fd = st["fd"]
+    try:
+        try:
+            await asyncio.to_thread(os.write, fd, (code.strip() + "\r").encode())
+        except OSError:
+            await _login_cancel(conv)
+            await update.effective_message.reply_text(
+                "⚠️ /login process died; run /login again.")
+            return
+        raw = await asyncio.to_thread(
+            _pty_read, fd, 45,
+            lambda s: bool(_LOGIN_TOKEN_RE.search(s))
+            or any(e in _login_squash(s) for e in _LOGIN_ERRS))
+        tok = _LOGIN_TOKEN_RE.search(raw)
+        if tok:
+            token = tok.group(0)
+            await _login_cancel(conv)
+            _persist_env("CLAUDE_CODE_OAUTH_TOKEN", token)
+            os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = token
+            # never echo the token — prefix only
+            await update.effective_message.reply_text(
+                f"✅ Logged in. Long-lived token saved to .env "
+                f"({token[:14]}…) — new turns and API calls use it "
+                "immediately.")
+            return
+        if any(e in _login_squash(raw) for e in _LOGIN_ERRS):
+            # CLI offers "Press Enter to retry" and mints a FRESH challenge —
+            # the old link's code is now stale, so relay the new URL
+            try:
+                await asyncio.to_thread(os.write, fd, b"\r")
+                raw2 = await asyncio.to_thread(
+                    _pty_read, fd, 15,
+                    lambda s: "Pastecodehere" in _login_squash(s))
+            except OSError:
+                raw2 = ""
+            m = _LOGIN_URL_RE.search(raw2)
+            if m and conv.login is st:
+                await update.effective_message.reply_text(
+                    "❌ Invalid code. Fresh link (the old one is stale now) — "
+                    f"sign in again and paste the new code:\n\n{m.group(0)}")
+                return
+        await _login_cancel(conv)
+        await update.effective_message.reply_text(
+            "⚠️ /login: unexpected CLI output; cancelled. Tail:\n"
+            + _LOGIN_ANSI_RE.sub("", raw)[-300:])
+    finally:
+        st["busy"] = False
+
+
 async def cmd_whisper(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     global WHISPER_MODEL, _whisper_model
     if not chat_allowed(update) or not is_owner(update):
@@ -2045,6 +2228,10 @@ async def cmd_stop(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     if not chat_allowed(update) or not is_owner(update):
         return
     conv = get_conv(update)
+    if conv.login:
+        await _login_cancel(conv)
+        await update.effective_message.reply_text("⏹ /login cancelled.")
+        return
     if conv.client is None or not conv.lock.locked():
         await update.effective_message.reply_text("Nothing running.")
         return
@@ -2410,6 +2597,14 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     log.info("msg %s user=%s text=%r", conv_key_of(update),
              update.effective_user.id if update.effective_user else None,
              msg.text[:120])
+    # /login awaiting its auth code: the owner's next TYPED message IS the
+    # code — consume it before bash mode and the settle buffer, never let it
+    # enter a turn (guests and forwards pass through untouched)
+    conv = get_conv(update)
+    if (conv.login and is_owner(update)
+            and not getattr(msg, "forward_origin", None)):
+        await _login_paste(update, conv, msg.text)
+        return
     # `!` bash mode (CLI parity): owner-TYPED only — forwards are quotes
     if (msg.text.startswith("!") and len(msg.text) > 1
             and not getattr(msg, "forward_origin", None)
@@ -2668,6 +2863,7 @@ async def post_init(app: Application) -> None:
         BotCommand("loop", "Run a prompt on a recurring interval"),
         BotCommand("schedule", "Manage scheduled cloud agents"),
         BotCommand("init", "Initialize CLAUDE.md for a codebase"),
+        BotCommand("login", "Re-authenticate the CLI (claude setup-token)"),
         BotCommand("whisper", "Show or set the voice transcription model"),
         BotCommand("new", "Same as /clear"),
         BotCommand("reset", "Same as /clear"),
@@ -2998,6 +3194,7 @@ def main() -> None:
                                    filters=~filters.FORWARDED))
     app.add_handler(CommandHandler("export", cmd_export,
                                    filters=~filters.FORWARDED))
+    app.add_handler(CommandHandler("login", cmd_login, filters=~filters.FORWARDED))
     app.add_handler(CommandHandler("whisper", cmd_whisper, filters=~filters.FORWARDED))
     app.add_handler(CommandHandler("usage", cmd_usage, filters=~filters.FORWARDED))
     app.add_handler(CallbackQueryHandler(on_callback))

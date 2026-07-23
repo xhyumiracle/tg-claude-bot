@@ -32,7 +32,7 @@ owns everything.
 | 🧵 **Per-topic sessions** | Every forum topic is an independent session — one conversation per `(chat, topic)`. |
 | ⏩ **Zero command remapping** | Unknown `/commands` go verbatim to the CLI: `/compact`, skills, anything headless. `/context`-style output is relayed. |
 | 🔘 **Buttons instead of a TUI** | Permissions — including the CLI's native *don't-ask-again* option — plan approval, clarifying questions: all inline buttons. Answered prompts clean up after themselves. |
-| 💬 **Chat-native ergonomics** | Reply to any message to quote it into context. Mid-turn messages queue with a 👀 reaction and switch to 👨‍💻 while processing — never dropped, never noisy. Multi-forwards and 4096-split long texts arrive as one coherent message. |
+| 💬 **Chat-native ergonomics** | Reply to any message to quote it into context. Type while it works: mid-turn messages steer straight into the running turn (the CLI's native injection), acked with 👀 — never dropped, never noisy. Multi-forwards and 4096-split long texts arrive as one coherent message. |
 | 🎤 **Voice messages** | Local faster-whisper, bilingual zh/en, editable 🎤 transcript. No audio leaves your machine. |
 | 🖼 **Native media** | Images ride inside the message as base64 blocks, lifecycle owned by the CLI transcript; other files get a TTL-cleaned media dir. |
 | 📟 **Live status** | One `⏳ Working…` message edited in place, morphing into the reply; elapsed ticker for long commands. |
@@ -151,6 +151,7 @@ events and statelessness.
 | `/export` | Send this session's transcript file |
 | `!command` | Bash mode — run a shell command directly in the session's cwd (owner-typed only) |
 | `/usage` | Subscription limits (5h / weekly / per-model / credits) |
+| `/login` | Re-authenticate from your phone — relays `claude setup-token`: tap the link, paste the code back |
 | `/whisper` | Pick the voice-transcription model |
 | `/esc` (`/stop`) | Interrupt the current turn — the CLI's ESC |
 | anything else | Forwarded verbatim to the CLI: `/compact`, `/context`, `/cost`, your skills… |
@@ -182,6 +183,9 @@ turns continue automatically.
 - Session management commands are owner-gated everywhere; so is `/mode` —
   permission modes change the guardrails themselves, and `bypass permissions`
   disables the guest sandbox for that conversation.
+- `/login` relays the CLI's own `claude setup-token` flow; the resulting
+  token goes straight into `.env` and is never echoed to the chat (prefix
+  only). Owner-typed messages only, 5-minute window, `/esc` cancels.
 - Voice notes are transcribed locally and deleted; images follow the CLI's
   transcript retention.
 - Full threat model, verified controls, and accepted risks:
