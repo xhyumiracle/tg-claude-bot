@@ -1897,11 +1897,12 @@ async def restart_watcher(app: Application) -> None:
         if not owned:
             wait_notified = False
             continue
-        # Strict gate: mid-turn OR queued messages count as busy. The stricter
-        # the gate, the less state a planned restart ever has to carry.
+        # Strict gate: lock, queue, AND the on-disk inflight table must all be
+        # clear. The state file is the ground truth — gating on it closes the
+        # race where a turn has finished but its cleanup hasn't flushed yet.
         busy = [c for c in conversations.values()
                 if c.lock.locked() or c.queue]
-        if busy:
+        if busy or _state.get("inflight"):
             if not wait_notified:
                 wait_notified = True
                 try:
@@ -1941,6 +1942,88 @@ async def restart_watcher(app: Application) -> None:
         return
 
 
+async def _recover_conv(app: Application, key: ConvKey, ent: dict) -> None:
+    """Auto-continue a turn interrupted by an unclean restart. Lightweight by
+    construction: the transcript already holds the turn's content and our
+    state holds any queued text, so recovery is just one ordinary resumed
+    turn with a continuation nudge. Self-limiting: the inflight marker was
+    consumed before we run, so a crash during recovery degrades to a manual
+    notice instead of a loop."""
+    chat_id, thread = key
+    lost = list((ent.get("q") or {}).values())
+
+    async def say(text: str) -> None:
+        await app.bot.send_message(
+            chat_id=chat_id, message_thread_id=thread or None,
+            text=text, disable_notification=True)
+
+    binding = _state.get("bindings", {}).get(f"{chat_id}:{thread}")
+    sid = binding.get("session_id") if binding else None
+    meta = find_session(sid) if sid else None
+    if not meta:  # nothing to resume into: fall back to the honest notice
+        try:
+            text = ("⚡ Restarted mid-turn and the session could not be "
+                    "auto-resumed. Send \"continue\" to pick it back up.")
+            if lost:
+                text += "\nAlso dropped from the queue:\n" + "\n".join(
+                    f"• {t[:150]}" for t in lost[:10])
+            await say(text)
+        except Exception:
+            pass
+        return
+    conv = conversations.get(key)
+    if conv is None:
+        conv = Conversation(
+            key=key,
+            profile="owner" if (chat_id == OWNER_ID and thread == 0) else "guest",
+            cwd=meta["cwd"] or (str(GUEST_READ_DIRS[0]) if GUEST_READ_DIRS
+                                else "/tmp"),
+            session_id=sid,
+        )
+        conv.model = binding.get("model")
+        conv.effort = binding.get("effort")
+        conversations[key] = conv
+    prompt = ("[bridge] The bot process restarted mid-turn. The transcript "
+              "above is complete up to the interruption; completed tool "
+              "calls are recorded there. Continue the work exactly where it "
+              "left off — or, if it had already finished, reply with a brief "
+              "status instead. Do not redo completed side effects.")
+    if lost:
+        prompt += ("\nThese user messages were queued behind the turn and "
+                   "never delivered until now:\n"
+                   + "\n".join(f"- {t}" for t in lost))
+    async with conv.lock:
+        try:
+            await say("⚡ Restarted mid-turn — continuing automatically…")
+        except Exception:
+            pass
+        try:
+            client = await ensure_client(conv)
+            await client.query(prompt)
+            buf: list = []
+            async for m in client.receive_response():
+                sid2 = getattr(m, "session_id", None)
+                if sid2 and sid2 != conv.session_id:
+                    conv.session_id = sid2
+                    persist_binding(conv)
+                if isinstance(m, AssistantMessage):
+                    for b in m.content:
+                        if isinstance(b, TextBlock):
+                            buf.append(b.text)
+                if isinstance(m, ResultMessage) and m.is_error:
+                    buf.append(f"⚠️ {getattr(m, 'result', 'turn failed')}")
+            out = _tg_markdown("\n".join(buf).strip()) or "✅ (recovered)"
+            for i in range(0, len(out), 3900):
+                await say(out[i:i + 3900])
+        except Exception:
+            log.exception("auto-recovery failed for %s", key)
+            try:
+                await say("⚡ Auto-recovery failed — send \"continue\" to "
+                          "resume manually.")
+            except Exception:
+                pass
+
+
 async def _reconcile_state(app: Application) -> None:
     """Restart = reconcile from disk. Clean restarts (strict idle gate) leave
     nothing to do and stay silent. After an unclean death: clear in-progress
@@ -1974,24 +2057,9 @@ async def _reconcile_state(app: Application) -> None:
                     chat_id=chat_id, message_id=mid, reaction=None)
             except Exception:
                 pass
-        # Two kinds of interruption, honestly distinguished: the running
-        # turn is safe in the CLI transcript; queued messages never reached
-        # it and exist only here — show them so nothing silently vanishes.
-        lost = [t for t in ent["q"].values()]
-        text = ("⚡ Restarted mid-turn. The interrupted turn is safe in the "
-                "session transcript — send \"continue\" to pick it back up.")
-        if lost:
-            shown = "\n".join(f"• {t[:150]}" for t in lost[:10])
-            text += (f"\n\n{len(lost)} queued message(s) never reached the "
-                     f"session and were dropped:\n{shown}\n"
-                     "Resend whichever still matter.")
-        try:
-            await app.bot.send_message(
-                chat_id=chat_id, message_thread_id=thread or None,
-                text=text, disable_notification=True,
-            )
-        except Exception:
-            pass
+        # Fire recovery in the background: polling must start immediately;
+        # the conv lock keeps recovery and fresh messages properly ordered.
+        asyncio.create_task(_recover_conv(app, (chat_id, thread), ent))
 
 
 async def post_init(app: Application) -> None:
