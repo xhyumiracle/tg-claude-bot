@@ -19,29 +19,28 @@ prompts with buttons.
 
 ---
 
-Messaging the bot is like typing `claude` in a shell: fresh session, same
-tools, skills, and config — it *is* your local CLI. `/resume` picks up any
-session you left in the terminal. The bot is a thin stateless router; the CLI
-owns everything.
+Messaging the bot is like typing `claude` in a shell — same tools, skills, and
+config. It *is* your local CLI: `/resume` picks up any session from the
+terminal. The bot is a thin stateless router; the CLI owns everything.
 
 ## ✨ Highlights
 
 | | |
 |---|---|
-| 🔁 **Resume any real session** | Pick up your actual terminal sessions from your phone — an inline picker over your real store (`~/.claude/projects`) with the CLI's own AI titles; cross-project, working directory auto-detected. |
-| 🎤 **Vibe-code by voice** | Send a voice message and it just works: local faster-whisper, bilingual zh/en, editable 🎤 transcript. No audio leaves your machine. |
-| 🌊 **Streaming replies** | Watch the answer build live: thinking, each tool call, then text — one `⏳ Working…` message edited in place that morphs into the final reply, with an elapsed ticker on long runs. |
-| 🔘 **Buttons instead of a TUI** | Permissions — including the CLI's native *don't-ask-again* — plan approval, and clarifying questions are all inline buttons. Answered prompts clean up after themselves. |
-| ⚡ **Type while it works** | Send follow-ups mid-turn and they steer straight into the running answer (👀 to confirm) — never dropped, never spawning a second turn. |
-| 💬 **Reads like a conversation** | The bot answers right under the message it's replying to, so even a fast-moving topic stays easy to follow. Reply to any message to quote it into context; multi-forwards and 4096-split long texts arrive as one coherent message. |
-| 🧵 **Per-topic sessions** | Every forum topic is its own independent conversation — switch projects by switching topics. |
-| ⏩ **Every command and skill, verbatim** | Unknown `/commands` go straight to the CLI — `/compact`, your skills, anything headless — with the output relayed right back. Nothing is reimplemented. |
-| 🎛 **CLI parity** | `/model`, `/effort`, `/mode` (the shift+tab cycle), `/permissions`, `/usage`, `!shell` — sourced from official APIs and the CLI itself, nothing hardcoded. |
-| 🖼 **Native media** | Images ride inside the message for the model to see; other files land in a TTL-cleaned media dir. |
-| ♻️ **Restart-proof** | Topics stay bound to their sessions across restarts — even hard crashes: interrupted turns auto-resume from the transcript, and messages you sent while it was down are replayed. |
-| 🛡 **Reliable under load** | Send as fast as you like — replies and reactions pace and retry themselves against Telegram's rate limits, so nothing stalls out with an error and no message is lost. |
+| 🔁 **Resume any real session** | Pick up your actual terminal sessions from your phone — an inline picker over `~/.claude/projects`, with the CLI's own AI titles, cross-project, cwd auto-detected. |
+| 🎤 **Vibe-code by voice** | Voice messages just work: local faster-whisper, bilingual zh/en, editable 🎤 transcript. No audio leaves your machine. |
+| 🌊 **Streaming replies** | Watch it build live — thinking, each tool call, then text — in one `⏳ Working…` message that morphs into the reply, with an elapsed ticker. |
+| 🔘 **Buttons instead of a TUI** | Permissions (incl. the CLI's *don't-ask-again*), plan approval, and clarifying questions as inline buttons. Answered prompts clean themselves up. |
+| ⚡ **Type while it works** | Mid-turn follow-ups steer into the running answer (👀 to confirm) — never dropped, never a second turn. |
+| 💬 **Reads like a conversation** | Replies land right under the message they answer; reply to any message to quote it in; multi-forwards and split long texts arrive as one. |
+| 🧵 **Per-topic sessions** | Every forum topic is its own conversation — switch projects by switching topics. |
+| ⏩ **Every command and skill, verbatim** | Unknown `/commands` go straight to the CLI — `/compact`, your skills, anything headless — output relayed back. Nothing reimplemented. |
+| 🎛 **CLI parity** | `/model`, `/effort`, `/mode`, `/permissions`, `/usage`, `!shell` — from official APIs and the CLI itself, nothing hardcoded. |
+| 🖼 **Native media** | Images ride inside the message for the model to see; other files land in a TTL-cleaned dir. |
+| ♻️ **Restart-proof** | Topics stay bound across restarts — even hard crashes: interrupted turns auto-resume, and messages you sent while it was down are replayed. |
+| 🛡 **Reliable under load** | Send as fast as you like — replies and reactions pace and retry against Telegram's limits, so nothing errors out or is lost. |
 | 🟠 **Context warnings** | 🟠 at 80% / 🔴 at 90% of the real context window, same source as `/context`. |
-| 🔒 **Owner/guest profiles** | Allowlisted chats only; owner full access, guests scoped to specific dirs with Allow/Deny escalation to the owner. |
+| 🔒 **Owner/guest profiles** | Allowlisted chats only; owner full access, guests scoped to specific dirs with Allow/Deny escalation. |
 
 ## 🚀 Quick start
 
@@ -84,8 +83,8 @@ DM your bot `/status` — you're live.
 
 ### Run as a service (recommended)
 
-The whole point is being reachable when you're away from the machine, so once
-the foreground run works, put it under systemd:
+Once the foreground run works, put it under systemd so it stays reachable when
+you're away:
 
 ```bash
 # edit the YOUR_USER paths in tg-claude-bot.service first
@@ -94,10 +93,9 @@ sudo systemctl enable --now tg-claude-bot
 journalctl -u tg-claude-bot -f          # watch the logs
 ```
 
-To deploy an update gracefully: `touch ~/.tgclaude/restart-requested` — the bot
-restarts as soon as every conversation is idle, so no reply is ever cut off.
-Even on a hard crash nothing is lost: topics rebind to their sessions, and
-interrupted turns resume with `continue` (the CLI transcript has everything).
+Deploy an update with `touch ~/.tgclaude/restart-requested` — the bot restarts
+once every conversation is idle, so no reply is cut off. Even a hard crash loses
+nothing: topics rebind and interrupted turns resume from the transcript.
 
 ### Configuration
 
