@@ -1984,7 +1984,10 @@ async def on_unknown_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 # settle heuristic — same sender + forward_origin + tight timing. Both failure
 # modes are benign: over-merge ≈ what queue batching does anyway; over-split
 # yields smaller but self-contained batches.
-FWD_SETTLE_S = 1.2
+FWD_SETTLE_S = 1.2   # forwards/splits trickle in over a second or two
+TEXT_SETTLE_S = 0.25  # typed text: only same-instant companions (e.g. the
+                      # comment Telegram sends alongside a forward gesture);
+                      # imperceptible next to multi-second turn startup
 _fwd_batches: Dict[tuple, dict] = {}
 
 
@@ -2009,12 +2012,14 @@ async def _fwd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     e["update"], e["ctx"] = update, ctx
     if e["task"]:
         e["task"].cancel()
-    e["task"] = asyncio.create_task(_fwd_settle(key))
+    batchy = bool(getattr(msg, "forward_origin", None)) or len(msg.text) >= 4000
+    e["task"] = asyncio.create_task(
+        _fwd_settle(key, FWD_SETTLE_S if batchy else TEXT_SETTLE_S))
 
 
-async def _fwd_settle(key: tuple) -> None:
+async def _fwd_settle(key: tuple, delay: float) -> None:
     try:
-        await asyncio.sleep(FWD_SETTLE_S)
+        await asyncio.sleep(delay)
     except asyncio.CancelledError:
         return
     await _fwd_flush(key)
@@ -2032,15 +2037,22 @@ async def _fwd_flush(key: tuple) -> None:
     name = user.full_name if user else "unknown"
     uid = user.id if user else 0
     items = e["items"]
+    typed = [(m, t) for m, fc, t in items if not fc]
+    fwds = [(fc, t) for _, fc, t in items if fc]
     if len(items) == 1:
         m, fc, text = items[0]
         body = f"[{name} ({uid})]: {fc}{reply_context(m)}{text}"
-    elif any(fc for _, fc, _ in items):  # forwarded batch: numbered, sourced
-        lines = [f"{i + 1}) {fc}{t}" for i, (_, fc, t) in enumerate(items)]
-        body = (f"[{name} ({uid})] (forwarded {len(items)} messages):\n"
-                + "\n".join(lines))
-    else:  # client-split long message: reassemble seamlessly
-        body = f"[{name} ({uid})]: " + "\n".join(t for _, _, t in items)
+    elif not fwds:  # client-split long message: reassemble seamlessly
+        body = f"[{name} ({uid})]: " + "\n".join(t for _, t in typed)
+    else:  # forwards, optionally with the comment sent alongside them
+        numbered = "\n".join(f"{i + 1}) {fc}{t}"
+                             for i, (fc, t) in enumerate(fwds))
+        body = f"[{name} ({uid})]"
+        if typed:
+            body += (f": {' '.join(t for _, t in typed)}\n"
+                     f"(with {len(fwds)} forwarded message(s)):\n{numbered}")
+        else:
+            body += f" (forwarded {len(fwds)} messages):\n{numbered}"
     log.info("fwd batch %s flushed: %d message(s)", key, len(items))
     try:
         await run_turn(update, ctx, body)
@@ -2060,18 +2072,11 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     log.info("msg %s user=%s text=%r", conv_key_of(update),
              update.effective_user.id if update.effective_user else None,
              msg.text[:120])
-    # mechanically-batched arrivals (one gesture → many updates) settle into
-    # one turn: forwards, and long texts the client split at the 4096 limit.
-    # Typed bursts deliberately do NOT settle — their gaps are seconds long,
-    # and a window big enough to catch them would tax every message's latency.
-    if getattr(msg, "forward_origin", None) or len(msg.text) >= 4000:
-        await _fwd_add(update, ctx)
-        return
-    # a typed follow-up must not overtake a still-settling forward batch:
-    # flush the batch first, then run this message (order preserved)
-    if _fwd_key(update) in _fwd_batches:
-        await _fwd_flush(_fwd_key(update))
-    await run_turn(update, ctx, format_incoming(update))
+    # every text goes through the settle buffer; the window matches the
+    # arrival's signature. Forwards/splits trickle (1.2s); typed text only
+    # waits for same-instant companions (0.25s — invisible next to turn
+    # startup), so a forward-with-comment gesture lands as ONE turn.
+    await _fwd_add(update, ctx)
 
 
 async def notify_owner(app: Application, text: str) -> None:
