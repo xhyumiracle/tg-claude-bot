@@ -843,6 +843,20 @@ def is_owner(update: Update) -> bool:
 
 # ---------- messaging ----------
 
+def forward_context(msg) -> str:
+    """Annotate forwarded messages — otherwise quoted material is
+    indistinguishable from the sender's own words."""
+    o = getattr(msg, "forward_origin", None)
+    if o is None:
+        return ""
+    src = (getattr(getattr(o, "sender_user", None), "full_name", None)
+           or getattr(getattr(o, "sender_chat", None), "title", None)
+           or getattr(getattr(o, "chat", None), "title", None)
+           or getattr(o, "sender_user_name", None)  # hidden-privacy users
+           or "unknown")
+    return f"(forwarded from {src}) "
+
+
 def reply_context(msg) -> str:
     r = msg.reply_to_message
     if r is None:
@@ -865,7 +879,8 @@ def format_incoming(update: Update) -> str:
     name = user.full_name if user else "unknown"
     uid = user.id if user else 0
     msg = update.effective_message
-    return f"[{name} ({uid})]: {reply_context(msg)}{msg.text}"
+    return (f"[{name} ({uid})]: {forward_context(msg)}"
+            f"{reply_context(msg)}{msg.text}")
 
 
 async def send_long(update: Update, text: str) -> None:
@@ -2302,7 +2317,9 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     log.info("voice %s user=%s -> %r", conv_key_of(update), uid, text[:120])
     await show(f"🎤 {text}")
     await run_turn(
-        update, ctx, f"[{name} ({uid})] (voice): {reply_context(msg)}{text}"
+        update, ctx,
+        f"[{name} ({uid})] (voice): {forward_context(msg)}"
+        f"{reply_context(msg)}{text}"
     )
 
 
@@ -2405,6 +2422,7 @@ async def _album_flush(key) -> None:
     if e["lines"]:
         parts.append("sent files, saved at: " + "; ".join(e["lines"]))
     text = (f"[{name} ({uid})] ({'; '.join(parts)}): "
+            f"{forward_context(update.effective_message)}"
             f"{reply_context(update.effective_message)}{e['caption']}")
     log.info("album %s flushed: %d blocks, %d files",
              key, len(e["blocks"]), len(e["lines"]))
