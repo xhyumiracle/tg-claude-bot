@@ -119,11 +119,6 @@ SHELL_CMDS = {
 # `tgclaude` is the runtime identity (dir, env prefix); the repo keeps the
 # descriptive name tg-claude-bot for discoverability.
 TGCLAUDE_DIR = HOME / ".tgclaude"
-try:  # one-time rename from the short-lived ~/.tgbot location
-    if (HOME / ".tgbot").is_dir() and not TGCLAUDE_DIR.exists():
-        (HOME / ".tgbot").rename(TGCLAUDE_DIR)
-except OSError:
-    pass
 TGCLAUDE_DIR.mkdir(mode=0o700, exist_ok=True)
 RESTART_FLAG = TGCLAUDE_DIR / "restart-requested"
 RESTART_FLAG_TMP = Path("/tmp/tgbot-restart-requested")  # legacy location
@@ -247,19 +242,6 @@ app_ref: Optional[Application] = None
 #   inflight — message ids mid-turn right now, per topic; deleted the moment
 #              the turn completes. Bounded by concurrent conversations.
 STATE_FILE = TGCLAUDE_DIR / "state.json"
-for _old, _new in (
-    (HOME / ".claude" / "tgbot_state.json", STATE_FILE),
-    (HOME / ".claude" / "tgbot_models_cache.json", TGCLAUDE_DIR / "models.json"),
-):
-    try:
-        if _old.exists() and not _new.exists():
-            try:
-                _old.rename(_new)
-            except OSError:  # cross-device: copy, never silently reset state
-                shutil.copy2(_old, _new)
-                _old.unlink()
-    except OSError:
-        pass
 _state: dict = {}
 
 
