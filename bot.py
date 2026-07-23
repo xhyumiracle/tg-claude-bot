@@ -127,6 +127,11 @@ RESTART_FLAG_TMP = Path("/tmp/tgbot-restart-requested")  # legacy location
 # permission-bridge bug locked the agent out of `touch /tmp/...`).
 RESTART_FLAG_LOCAL = Path(__file__).resolve().parent / ".tgclaude-restart-requested"
 RESTART_NOTICE = TGCLAUDE_DIR / "restart-notice.json"
+# Prefer restarting idle, but never wait forever: past this grace the restart
+# fires anyway — safe, because interrupted turns auto-recover from the
+# transcript. Keeps a busy (or self-absorbed) conversation from blocking its
+# own requested restart indefinitely.
+RESTART_GRACE_S = 180
 
 _LOCAL_OUT_RE = re.compile(
     r"<local-command-stdout>(.*?)</local-command-stdout>", re.S
@@ -1897,19 +1902,30 @@ async def restart_watcher(app: Application) -> None:
         if not owned:
             wait_notified = False
             continue
-        # Strict gate: lock, queue, AND the on-disk inflight table must all be
-        # clear. The state file is the ground truth — gating on it closes the
-        # race where a turn has finished but its cleanup hasn't flushed yet.
+        # Idle gate: lock, queue, AND the on-disk inflight table must all be
+        # clear — but only within a grace window. Auto-recovery makes an
+        # interrupted turn lossless, so waiting for idle is politeness, not
+        # safety; a deadline kills the whole class of self-deadlocks where
+        # the conversation that requested the restart keeps itself busy
+        # (e.g. an agent developing this bot from inside a bot session).
+        # The flag file's own mtime is the deadline clock — no new state.
         busy = [c for c in conversations.values()
                 if c.lock.locked() or c.queue]
-        if busy or _state.get("inflight"):
+        try:
+            overdue = any(time.time() - f.stat().st_mtime > RESTART_GRACE_S
+                          for f in owned)
+        except OSError:
+            overdue = False
+        if (busy or _state.get("inflight")) and not overdue:
             if not wait_notified:
                 wait_notified = True
                 try:
                     await app.bot.send_message(
                         chat_id=OWNER_ID,
                         text=(f"⏳ Restart queued — waiting for {len(busy)} "
-                              "busy conversation(s) to finish."),
+                              "busy conversation(s); forcing in "
+                              f"≤{RESTART_GRACE_S // 60} min (interrupted "
+                              "turns auto-recover)."),
                         disable_notification=True,
                     )
                 except Exception:
