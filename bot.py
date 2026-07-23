@@ -44,8 +44,10 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatAction, ParseMode
+from telegram.error import RetryAfter
 from telegram.ext import (
     Application,
+    BaseRateLimiter,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -3280,6 +3282,75 @@ async def on_shutdown(app: Application) -> None:
         await drop_client(conv)
 
 
+class FloodLimiter(BaseRateLimiter):
+    """Wraps every bot API call (PTB applies it uniformly). Two jobs:
+
+    1. Auto-retry Telegram's "Flood control exceeded. Retry in Ns"
+       (RetryAfter) — sleep the required time and retry, so the error never
+       surfaces and no reply/reaction is lost.
+    2. Gently pace the *expensive* per-chat calls (new messages, reactions)
+       with a token bucket — bursts of `cap` go through instantly, then
+       `rate`/sec — so a tool-heavy turn or a big forward/queue batch can't
+       machine-gun a chat into flood control in the first place.
+
+    Edits (live status), callback answers and typing are EXEMPT: they're
+    already app-throttled or must stay instant, so streaming keeps its feel.
+    """
+
+    PACED = {"sendMessage", "sendPhoto", "sendDocument", "sendVoice",
+             "sendAudio", "sendAnimation", "sendMediaGroup",
+             "forwardMessage", "copyMessage", "setMessageReaction"}
+
+    def __init__(self, cap: int = 8, rate: float = 1.0,
+                 max_retries: int = 3) -> None:
+        self.cap = cap
+        self.rate = rate
+        self.max_retries = max_retries
+        self._buckets: dict = {}   # chat_id -> [tokens, last_ts]
+        self._locks: dict = {}     # chat_id -> asyncio.Lock
+
+    async def initialize(self) -> None:
+        pass
+
+    async def shutdown(self) -> None:
+        pass
+
+    def _lock(self, key) -> asyncio.Lock:
+        lk = self._locks.get(key)
+        if lk is None:
+            lk = self._locks[key] = asyncio.Lock()
+        return lk
+
+    async def _pace(self, chat_id) -> None:
+        now = time.time()
+        b = self._buckets.get(chat_id)
+        if b is None:
+            self._buckets[chat_id] = [self.cap - 1, now]
+            return
+        tokens = min(self.cap, b[0] + (now - b[1]) * self.rate)
+        if tokens >= 1:
+            b[0], b[1] = tokens - 1, now
+        else:
+            await asyncio.sleep((1 - tokens) / self.rate)
+            b[0], b[1] = 0, time.time()
+
+    async def process_request(self, callback, args, kwargs, endpoint, data,
+                              rate_limit_args):
+        chat_id = data.get("chat_id") if isinstance(data, dict) else None
+        if endpoint in self.PACED and chat_id is not None:
+            async with self._lock(chat_id):
+                await self._pace(chat_id)
+        for attempt in range(self.max_retries + 1):
+            try:
+                return await callback(*args, **kwargs)
+            except RetryAfter as e:
+                if attempt >= self.max_retries:
+                    raise
+                log.warning("flood control on %s (chat %s); retry in %ss",
+                            endpoint, chat_id, e.retry_after)
+                await asyncio.sleep(e.retry_after + 0.5)
+
+
 def main() -> None:
     global app_ref
     os.umask(0o077)  # temp media/flag files must not be world-readable
@@ -3292,6 +3363,8 @@ def main() -> None:
         # a deleted reply-anchor must never cost the reply itself:
         # fall back to sending unquoted instead of raising
         .defaults(Defaults(allow_sending_without_reply=True))
+        # pace bursts + auto-retry flood control (see FloodLimiter)
+        .rate_limiter(FloodLimiter())
         .post_init(post_init)
         .post_shutdown(on_shutdown)
         .build()
