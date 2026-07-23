@@ -116,15 +116,22 @@ SHELL_CMDS = {
 # All bot-owned durable state lives in ONE machine-global private dir.
 # Principle: keep it minimal — whatever the CLI already stores (transcripts,
 # cwd, titles, retention) is reused from ~/.claude, never duplicated here.
-TGBOT_DIR = HOME / ".tgbot"
-TGBOT_DIR.mkdir(mode=0o700, exist_ok=True)
-RESTART_FLAG = TGBOT_DIR / "restart-requested"
+# `tgclaude` is the runtime identity (dir, env prefix); the repo keeps the
+# descriptive name tg-claude-bot for discoverability.
+TGCLAUDE_DIR = HOME / ".tgclaude"
+try:  # one-time rename from the short-lived ~/.tgbot location
+    if (HOME / ".tgbot").is_dir() and not TGCLAUDE_DIR.exists():
+        (HOME / ".tgbot").rename(TGCLAUDE_DIR)
+except OSError:
+    pass
+TGCLAUDE_DIR.mkdir(mode=0o700, exist_ok=True)
+RESTART_FLAG = TGCLAUDE_DIR / "restart-requested"
 RESTART_FLAG_TMP = Path("/tmp/tgbot-restart-requested")  # legacy location
 # Self-rescue flag inside the repo: reachable via an agent's Write tool even
 # when Bash/permission escalation is broken (learned the hard way when a
 # permission-bridge bug locked the agent out of `touch /tmp/...`).
-RESTART_FLAG_LOCAL = Path(__file__).resolve().parent / ".tgbot-restart-requested"
-RESTART_NOTICE = TGBOT_DIR / "restart-notice.json"
+RESTART_FLAG_LOCAL = Path(__file__).resolve().parent / ".tgclaude-restart-requested"
+RESTART_NOTICE = TGCLAUDE_DIR / "restart-notice.json"
 
 _LOCAL_OUT_RE = re.compile(
     r"<local-command-stdout>(.*?)</local-command-stdout>", re.S
@@ -239,10 +246,10 @@ app_ref: Optional[Application] = None
 #              startup, so the CLI's retention is our GC.
 #   inflight — message ids mid-turn right now, per topic; deleted the moment
 #              the turn completes. Bounded by concurrent conversations.
-STATE_FILE = TGBOT_DIR / "state.json"
+STATE_FILE = TGCLAUDE_DIR / "state.json"
 for _old, _new in (
     (HOME / ".claude" / "tgbot_state.json", STATE_FILE),
-    (HOME / ".claude" / "tgbot_models_cache.json", TGBOT_DIR / "models.json"),
+    (HOME / ".claude" / "tgbot_models_cache.json", TGCLAUDE_DIR / "models.json"),
 ):
     try:
         if _old.exists() and not _new.exists():
@@ -1306,7 +1313,7 @@ def _oauth_token() -> str:
 
 
 _models_cache: dict = {"ts": 0.0, "data": []}
-_MODELS_DISK_CACHE = TGBOT_DIR / "models.json"
+_MODELS_DISK_CACHE = TGCLAUDE_DIR / "models.json"
 
 
 def _models_disk_load() -> list:
@@ -2100,18 +2107,29 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-MEDIA_TTL_DAYS = float(os.environ.get("TGBOT_MEDIA_TTL_DAYS", "14"))
+MEDIA_TTL_DAYS = float(
+    os.environ.get("TGCLAUDE_MEDIA_TTL_DAYS")
+    or os.environ.get("TGBOT_MEDIA_TTL_DAYS")  # legacy name
+    or "14"
+)
 
 
 def media_dir_for(conv: Conversation) -> Path:
-    d = Path(conv.cwd) / ".tgbot" / "media"
+    d = Path(conv.cwd) / ".tgclaude" / "media"
+    legacy = Path(conv.cwd) / ".tgbot" / "media"
+    try:  # one-time per-project rename from the old location
+        if legacy.is_dir() and not d.exists():
+            d.parent.mkdir(mode=0o700, exist_ok=True)
+            legacy.rename(d)
+    except OSError:
+        pass
     try:
         d.mkdir(parents=True, exist_ok=True)
         gi = d.parent / ".gitignore"
         if not gi.exists():
             gi.write_text("*\n")
     except OSError:
-        d = Path("/tmp/tgbot-media")
+        d = Path("/tmp/tgclaude-media")
         d.mkdir(exist_ok=True)
     # opportunistic TTL cleanup
     cutoff = time.time() - MEDIA_TTL_DAYS * 86400

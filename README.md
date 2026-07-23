@@ -92,7 +92,7 @@ sudo systemctl enable --now tg-claude-bot
 journalctl -u tg-claude-bot -f          # watch the logs
 ```
 
-To deploy an update gracefully: `touch ~/.tgbot/restart-requested` — the bot
+To deploy an update gracefully: `touch ~/.tgclaude/restart-requested` — the bot
 restarts as soon as every conversation is idle, so no reply is ever cut off.
 Even on a hard crash nothing is lost: topics rebind to their sessions, and
 interrupted turns resume with `continue` (the CLI transcript has everything).
@@ -112,7 +112,7 @@ All in `.env` (see [.env.example](.env.example)):
 | `GUEST_READ_DIRS` / `GUEST_WRITE_DIRS` | Colon-separated dirs guests may read / write |
 | `GUEST_SYSTEM_PROMPT_FILE` | Custom system prompt for the guest profile |
 | `WHISPER_MODEL` | faster-whisper model (default `large-v3-turbo`) |
-| `TGBOT_MEDIA_TTL_DAYS` | Retention for received files (default 14) |
+| `TGCLAUDE_MEDIA_TTL_DAYS` | Retention for received files (default 14) |
 
 ## ⚖️ How it compares
 
