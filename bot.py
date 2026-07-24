@@ -251,6 +251,9 @@ class Conversation:
     # showing a 👀 reaction that the pump clears on the next ResultMessage.
     pump: Optional[object] = None
     pending: list = field(default_factory=list)
+    # input-side clock for the live "working…" ticker: when this turn's input
+    # was handed to the CLI; the pump clears it on the turn's ResultMessage.
+    working_since: Optional[float] = None
     # /login flow: {"proc","fd","expiry","busy"} while a pty-relayed
     # `claude auth login` awaits its auth code. Ephemeral by design — a
     # restart mid-login just means running /login again.
@@ -1208,6 +1211,11 @@ class _BotTarget:
         )
 
 
+# spinner frames for the live "working…" ticker (a native-style ✽ that shows
+# the turn is alive even when the CLI streams nothing before the answer)
+_SPIN = ["✽", "✼", "✻", "✺"]
+
+
 async def _pump(conv: "Conversation") -> None:
     """The single continuous consumer of conv.client's message stream. Runs
     for the client's lifetime, never stopping at a ResultMessage, so no CLI
@@ -1217,6 +1225,9 @@ async def _pump(conv: "Conversation") -> None:
     status = LiveStatus()
     buf: list[str] = []
     n_tools = 0
+    head = "Working…"   # current activity label for the live ticker
+    detail = ""         # optional second line (e.g. the running tool)
+    spin_i = 0
 
     async def flush() -> None:
         nonlocal status
@@ -1227,6 +1238,36 @@ async def _pump(conv: "Conversation") -> None:
         await status.finalize(target, _tg_markdown(seg))
         status = LiveStatus()
 
+    async def show(min_elapsed: float = 0.0) -> None:
+        # Live "working…" bubble driven by conv.working_since (an INPUT-side
+        # clock set by run_turn), so liveness shows even when the CLI streams
+        # nothing until the final answer. The ticker passes min_elapsed to
+        # skip quick turns; event-driven calls pass 0 to show immediately.
+        nonlocal spin_i
+        ws = conv.working_since
+        if ws is None:
+            return
+        elapsed = time.time() - ws
+        if elapsed < min_elapsed:
+            return
+        spin_i += 1
+        eff = f" · {conv.effort}" if conv.effort else ""
+        line = f"{_SPIN[spin_i % len(_SPIN)]} {head} ({int(elapsed)}s{eff})"
+        await status.update(target, line + (f"\n{detail}" if detail else ""))
+
+    async def _ticker() -> None:
+        # refreshes the elapsed counter between CLI events; 3s grace so a
+        # sub-3s turn never flashes a working bubble
+        try:
+            while True:
+                await asyncio.sleep(2.0)
+                await show(min_elapsed=3.0)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.debug("ticker error for %s", conv.key, exc_info=True)
+
+    ticker = asyncio.create_task(_ticker())
     crashes: list[float] = []  # recent crash timestamps — anti-thrash gate
     try:
         while conv.client is not None:
@@ -1248,15 +1289,16 @@ async def _pump(conv: "Conversation") -> None:
                                 n_tools += 1
                                 if buf:
                                     await flush()
-                                await status.update(
-                                    target,
-                                    f"⏳ Working… ({n_tools})\n"
-                                    f"🔧 {_tool_brief(block)}")
+                                head = f"Working… ({n_tools})"
+                                detail = f"🔧 {_tool_brief(block)}"
+                                await show()
                             elif isinstance(block, ThinkingBlock):
                                 if buf:
                                     await flush()
-                                await status.update(target, "💭 Thinking…")
+                                head, detail = "Thinking…", ""
+                                await show()
                     elif isinstance(m, ResultMessage):
+                        conv.working_since = None  # turn done: stop the ticker
                         if m.is_error:
                             err = (m.result or "; ".join(
                                 str(e) for e in (m.errors or []))
@@ -1264,6 +1306,7 @@ async def _pump(conv: "Conversation") -> None:
                             buf.append(f"⚠️ Turn failed: {str(err)[:500]}")
                         await flush()
                         n_tools = 0
+                        head, detail = "Working…", ""
                         # a turn finished: clear the 👀 markers + inflight for
                         # every outstanding message (coarse — anchor next step)
                         pend = conv.pending[:]
@@ -1318,11 +1361,14 @@ async def _pump(conv: "Conversation") -> None:
                 status = LiveStatus()
                 buf.clear()
                 n_tools = 0
+                head, detail = "Working…", ""
     except asyncio.CancelledError:
         raise
     except Exception:
         log.exception("pump wrapper crashed for %s", conv.key)
     finally:
+        ticker.cancel()
+        conv.working_since = None
         # pump ended (stream closed, gave up after repeated crashes, or a
         # drop_client cancel — which already reset these): re-arm a fresh
         # client+pump on the next message so replies never silently stop
@@ -1375,8 +1421,13 @@ async def run_turn(
             await client.query(_gen())
         else:
             await client.query(text)
+        # input-side clock for the live "working…" ticker (the pump clears it
+        # on the ResultMessage); don't reset if a turn is already running
+        if conv.working_since is None:
+            conv.working_since = time.time()
     except Exception as e:
         log.exception("query failed for %s", conv.key)
+        conv.working_since = None
         await drop_client(conv)
         conv.pending.clear()
         if sender_id is None:
