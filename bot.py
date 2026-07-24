@@ -1125,11 +1125,6 @@ def _preview_tail(s: str, n: int = 160) -> str:
     return ("…" + s[-n:]) if len(s) > n else s
 
 
-def _ktok(n: int) -> str:
-    """Native-style compact token count: 650 -> '650', 6840 -> '6.8k'."""
-    return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
-
-
 async def _context_limit(conv: Conversation, used: int = 0) -> int:
     raw = (conv.model or conv.current_model
            or _session_model(conv.session_id) or "")
@@ -1347,7 +1342,7 @@ async def _pump(conv: "Conversation") -> None:
                                 # native. estimated, so it can only be rough.
                                 think_tokens += d.get("estimated_tokens") or 0
                                 head = "Thinking…"
-                                detail = (f"💭 ~{_ktok(think_tokens)} tokens"
+                                detail = (f"💭 ~{think_tokens:,} tokens"
                                           if think_tokens else "")
                             elif dt == "text_delta":
                                 txt += d.get("text", "")
