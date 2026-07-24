@@ -1257,10 +1257,12 @@ async def _pump(conv: "Conversation") -> None:
 
     async def _ticker() -> None:
         # refreshes the elapsed counter between CLI events; 3s grace so a
-        # sub-3s turn never flashes a working bubble
+        # sub-3s turn never flashes a working bubble. 5s cadence keeps edit
+        # volume low (Telegram edit limits) — the counter climbing by 5s is
+        # liveness enough.
         try:
             while True:
-                await asyncio.sleep(2.0)
+                await asyncio.sleep(5.0)
                 await show(min_elapsed=3.0)
         except asyncio.CancelledError:
             raise
