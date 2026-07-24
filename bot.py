@@ -262,6 +262,9 @@ class Conversation:
     # input-side clock for the live "working…" ticker: when this turn's input
     # was handed to the CLI; the pump clears it on the turn's ResultMessage.
     working_since: Optional[float] = None
+    # one-shot transform the pump applies to this turn's reply text then clears
+    # (e.g. /usage sets it to render 'N% used' limits as /status-style bars)
+    reply_transform: Optional[object] = None
     # /login flow: {"proc","fd","expiry","busy"} while a pty-relayed
     # `claude auth login` awaits its auth code. Ephemeral by design — a
     # restart mid-login just means running /login again.
@@ -1136,6 +1139,20 @@ def _preview_tail(s: str, n: int = 160) -> str:
     return ("…" + s[-n:]) if len(s) > n else s
 
 
+_USAGE_PCT_RE = re.compile(r"(\d+)% used")
+
+
+def _usage_barify(text: str) -> str:
+    """Render /usage's subscription-limit percentages (the 'N% used' lines) as
+    /status-style bars; the breakdown percentages ('N% of your usage…') are
+    left untouched. Applied as a one-shot pump transform, only for /usage."""
+    def repl(m):
+        pct = int(m.group(1))
+        n = max(0, min(10, round(pct / 10)))
+        return f"{pct}% {'█' * n}{'░' * (10 - n)}"
+    return _USAGE_PCT_RE.sub(repl, text)
+
+
 async def _context_limit(conv: Conversation, used: int = 0) -> int:
     raw = (conv.model or conv.current_model
            or _session_model(conv.session_id) or "")
@@ -1271,6 +1288,11 @@ async def _pump(conv: "Conversation") -> None:
         buf.clear()
         if seg.startswith("<pass>"):
             seg = ""
+        if seg and conv.reply_transform:
+            try:
+                seg = conv.reply_transform(seg)
+            except Exception:
+                pass
         await status.finalize(target, _tg_markdown(seg))
         status = LiveStatus()
 
@@ -1369,6 +1391,7 @@ async def _pump(conv: "Conversation") -> None:
                         await flush()
                         n_tools = 0
                         head, detail, txt, think_tokens = "Working…", "", "", 0
+                        conv.reply_transform = None  # one-shot: consumed
                         # a turn finished: clear the 👀 markers + inflight for
                         # every outstanding message (coarse — anchor next step)
                         pend = conv.pending[:]
@@ -2591,6 +2614,8 @@ async def on_unknown_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
             await msg.reply_text(body)
         return
     log.info("passthrough %s from %s", text.split()[0], update.effective_user.id)
+    if cmd == "usage":  # prettify the native /usage: 'N% used' limits -> bars
+        get_conv(update).reply_transform = _usage_barify
     await run_turn(update, ctx, text,
                    status_text=f"⏳ {text.split()[0]} running…")
 
