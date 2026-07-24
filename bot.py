@@ -34,6 +34,11 @@ try:
 except ImportError:
     class ThinkingBlock:  # sentinel, never matches
         pass
+try:
+    from claude_agent_sdk.types import StreamEvent
+except ImportError:
+    class StreamEvent:  # sentinel, never matches
+        pass
 from dotenv import load_dotenv
 from telegram import (
     BotCommand,
@@ -642,6 +647,7 @@ def build_options(conv: Conversation) -> ClaudeAgentOptions:
             can_use_tool=make_owner_cb(conv),
             model=conv.model,
             effort=conv.effort,
+            include_partial_messages=True,  # live thinking/text stream for status
             setting_sources=["user", "project"],
         )
     return ClaudeAgentOptions(
@@ -653,6 +659,7 @@ def build_options(conv: Conversation) -> ClaudeAgentOptions:
         can_use_tool=make_permission_cb(conv),
         permission_mode=conv.perm_mode or "default",
         resume=conv.session_id,
+        include_partial_messages=True,  # live thinking/text stream for status
         setting_sources=["user", "project"],
     )
 
@@ -1102,6 +1109,12 @@ def _tool_brief(block: ToolUseBlock) -> str:
     return block.name
 
 
+def _think_preview(s: str, n: int = 160) -> str:
+    """Single-line tail of the live thinking stream for the status bubble."""
+    s = " ".join(s.split())
+    return ("…" + s[-n:]) if len(s) > n else s
+
+
 async def _context_limit(conv: Conversation, used: int = 0) -> int:
     raw = (conv.model or conv.current_model
            or _session_model(conv.session_id) or "")
@@ -1226,7 +1239,8 @@ async def _pump(conv: "Conversation") -> None:
     buf: list[str] = []
     n_tools = 0
     head = "Working…"   # current activity label for the live ticker
-    detail = ""         # optional second line (e.g. the running tool)
+    detail = ""         # optional second line (running tool / thinking tail)
+    think = ""          # accumulated live thinking text (partial-message stream)
     spin_i = 0
 
     async def flush() -> None:
@@ -1256,13 +1270,15 @@ async def _pump(conv: "Conversation") -> None:
         await status.update(target, line + (f"\n{detail}" if detail else ""))
 
     async def _ticker() -> None:
-        # refreshes the elapsed counter between CLI events; 3s grace so a
-        # sub-3s turn never flashes a working bubble. 5s cadence keeps edit
-        # volume low (Telegram edit limits) — the counter climbing by 5s is
-        # liveness enough.
+        # first feedback at ~3s, then a sparse 5s cadence so long turns stay
+        # light on Telegram edit limits. With partial streaming on most turns
+        # get immediate delta-driven updates anyway; this backstops the gap
+        # before the first token and bumps the elapsed counter between deltas.
         try:
+            delay = 3.0
             while True:
-                await asyncio.sleep(5.0)
+                await asyncio.sleep(delay)
+                delay = 5.0
                 await show(min_elapsed=3.0)
         except asyncio.CancelledError:
             raise
@@ -1299,6 +1315,22 @@ async def _pump(conv: "Conversation") -> None:
                                     await flush()
                                 head, detail = "Thinking…", ""
                                 await show()
+                    elif isinstance(m, StreamEvent):
+                        # live partial stream: show what it's thinking/writing
+                        # right now. status.update's own throttle caps edits, so
+                        # deltas arriving many/sec cost no extra Telegram calls.
+                        ev = getattr(m, "event", None) or {}
+                        if ev.get("type") == "content_block_delta":
+                            d = ev.get("delta") or {}
+                            dt = d.get("type")
+                            if dt == "thinking_delta":
+                                think += d.get("thinking", "")
+                                head = "Thinking…"
+                                detail = "💭 " + _think_preview(think)
+                                await show()
+                            elif dt == "text_delta" and head != "Responding…":
+                                head, detail = "Responding…", ""
+                                await show()
                     elif isinstance(m, ResultMessage):
                         conv.working_since = None  # turn done: stop the ticker
                         if m.is_error:
@@ -1308,7 +1340,7 @@ async def _pump(conv: "Conversation") -> None:
                             buf.append(f"⚠️ Turn failed: {str(err)[:500]}")
                         await flush()
                         n_tools = 0
-                        head, detail = "Working…", ""
+                        head, detail, think = "Working…", "", ""
                         # a turn finished: clear the 👀 markers + inflight for
                         # every outstanding message (coarse — anchor next step)
                         pend = conv.pending[:]
@@ -1363,7 +1395,7 @@ async def _pump(conv: "Conversation") -> None:
                 status = LiveStatus()
                 buf.clear()
                 n_tools = 0
-                head, detail = "Working…", ""
+                head, detail, think = "Working…", "", ""
     except asyncio.CancelledError:
         raise
     except Exception:
