@@ -247,10 +247,13 @@ class Conversation:
     perm_mode: Optional[str] = None  # native CLI permission mode override
     current_model: Optional[str] = None
     ctx_warned: int = 0
-    # steering: turn_active is True only while a queried turn is streaming
-    # (flips False the instant its ResultMessage is parsed); steered holds the
-    # TG messages injected into the live turn; last_steer feeds the orphan
-    # probe that catches a write racing the turn's final milliseconds.
+    # continuous-consumer model: `pump` is the single task draining the CLI
+    # stream for this conv's whole client lifetime; `pending` holds messages
+    # showing a 👨‍💻 reaction that the pump clears on the next ResultMessage.
+    pump: Optional[object] = None
+    pending: list = field(default_factory=list)
+    # legacy steering fields (unused after the pump rewrite; kept only so
+    # stray references don't NameError until the cleanup pass).
     turn_active: bool = False
     steered: list = field(default_factory=list)
     last_steer: float = 0.0
@@ -625,6 +628,9 @@ def get_conv(update: Update) -> Conversation:
 
 
 async def drop_client(conv: Conversation) -> None:
+    if conv.pump is not None:
+        conv.pump.cancel()
+        conv.pump = None
     if conv.client is not None:
         try:
             await conv.client.disconnect()
@@ -674,6 +680,8 @@ async def ensure_client(conv: Conversation) -> ClaudeSDKClient:
         client = ClaudeSDKClient(options=build_options(conv))
         await client.connect()
         conv.client = client
+        # one continuous consumer for this client's whole life
+        conv.pump = asyncio.create_task(_pump(conv))
         log.info("connected %s profile=%s resume=%s cwd=%s",
                  conv.key, conv.profile, conv.session_id, conv.cwd)
     return conv.client
@@ -1303,6 +1311,20 @@ async def _pump(conv: "Conversation") -> None:
                     buf.append(f"⚠️ Turn failed: {str(err)[:500]}")
                 await flush()
                 n_tools = 0
+                # a turn finished: clear the 👨‍💻 markers + inflight for every
+                # outstanding message (coarse — anchor precision is next step)
+                pend = conv.pending[:]
+                conv.pending.clear()
+                for pm in pend:
+                    _inflight_del(conv, pm)
+                    try:
+                        await pm.set_reaction(None)
+                    except BaseException:
+                        pass
+                try:
+                    await check_context_usage(target, conv)
+                except Exception:
+                    pass
             elif isinstance(m, UserMessage):
                 # relay CLI local-command output (/context, /cost, ...)
                 content = getattr(m, "content", None)
@@ -1323,6 +1345,13 @@ async def _pump(conv: "Conversation") -> None:
         raise
     except Exception:
         log.exception("pump crashed for %s", conv.key)
+    finally:
+        # pump ended (stream closed or crash, NOT a drop_client cancel which
+        # already reset these): force a fresh client+pump on the next message
+        # so replies never silently stop
+        if conv.pump is asyncio.current_task():
+            conv.pump = None
+            conv.client = None
 # =================== end continuous-consumer rewrite (WIP) ===================
 
 
@@ -1331,45 +1360,61 @@ async def run_turn(
     blocks: Optional[list] = None, status_text: Optional[str] = None,
     sender_id: Optional[int] = None, anchor=None,
 ) -> None:
-    """Thin shell so the inflight/reaction cleanup survives task
-    cancellation (user interrupts): sync state delete first — un-skippable —
-    then a best-effort reaction clear. Without this, interrupted turns leak
-    inflight entries that a later unclean restart falsely replays."""
+    """Fire ONE input into the CLI and return. The reply is emitted by the
+    conv's pump (the single continuous consumer of the stream), so there is
+    no per-turn receive here and no ResultMessage is ever left buffered —
+    input and output are decoupled, like the native stream. `status_text`/
+    `anchor` are kept for call-site compatibility but unused (the pump shows
+    its own working status; anchor precision is a later step)."""
     conv = get_conv(update)
-    # owned = this invocation ran a real turn (acquired the lock). Steer /
-    # queue invocations return early WITHOUT owning: their 👀 and state
-    # belong to the live turn, so they must skip the owner cleanup below —
-    # otherwise the steer's own finally instantly clears the 👀 it just set
-    # and clobbers the running turn's turn_active/anchor/steered. Default
-    # True so a cancelled owner turn (CancelledError out of _inner) still
-    # cleans up.
-    owned = True
+    uid = (sender_id if sender_id is not None
+           else update.effective_user.id if update.effective_user else 0)
+    conv.last_user_id = uid
+    msg = update.effective_message
+    if sender_id is None:
+        # persist first (recovery), then the 👨‍💻 marker the pump clears when
+        # this input's turn produces a ResultMessage
+        _inflight_add(conv, msg, queued_text=(text or "").strip() or "[media]")
+        conv.pending.append(msg)
+        try:
+            await msg.set_reaction("👨‍💻")
+        except Exception:
+            pass
     try:
-        owned = not await _run_turn_inner(update, ctx, text, blocks,
-                                          status_text, sender_id, anchor)
-    finally:
-        if owned:
-            conv.turn_active = False
-            conv.interrupt_asap = False  # no stale /esc kills a later turn
-            conv.reply_anchor = None
-            # steered messages belong to this turn exactly like the direct
-            # one: sync state deletes first (un-skippable), reactions after
-            steered = conv.steered[:]
-            conv.steered.clear()
-            for m in steered:
-                _inflight_del(conv, m)
-            if sender_id is None:
-                _inflight_del(conv, update.effective_message)
-            for m in steered:
-                try:
-                    await m.set_reaction(None)
-                except BaseException:
-                    pass
-            if sender_id is None:
-                try:
-                    await update.effective_message.set_reaction(None)
-                except BaseException:
-                    pass
+        await ctx.bot.send_chat_action(
+            chat_id=conv.key[0], message_thread_id=conv.key[1] or None,
+            action=ChatAction.TYPING)
+    except Exception:
+        pass
+    try:
+        client = await ensure_client(conv)
+        if blocks:
+            content = list(blocks) + [{"type": "text", "text": text}]
+
+            async def _gen():
+                yield {"type": "user",
+                       "message": {"role": "user", "content": content},
+                       "parent_tool_use_id": None}
+            await client.query(_gen())
+        else:
+            await client.query(text)
+    except Exception as e:
+        log.exception("query failed for %s", conv.key)
+        await drop_client(conv)
+        conv.pending.clear()
+        if sender_id is None:
+            _inflight_del(conv, msg)
+            try:
+                await msg.set_reaction(None)
+            except BaseException:
+                pass
+        try:
+            if is_owner(update):
+                await msg.reply_text(f"Error: {e}")
+            elif update.effective_chat.type == "private":
+                await msg.reply_text("Something went wrong; please try again.")
+        except Exception:
+            pass
 
 
 async def _run_turn_inner(
@@ -2364,17 +2409,11 @@ async def cmd_stop(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             pass
         await update.effective_message.reply_text("⏹ Shell command killed.")
         return
-    if conv.lock.locked() and conv.client is None:
-        # turn accepted but the CLI is still booting (spawn + MCP servers
-        # can take seconds) — issue #1's "Nothing running." while it
-        # clearly was. Interrupt the moment the query is on the wire.
-        conv.interrupt_asap = True
-        await update.effective_message.reply_text(
-            "⏹ Turn is still starting — interrupt queued.")
-        return
-    if conv.client is None or not conv.lock.locked():
+    if conv.client is None:
         await update.effective_message.reply_text("Nothing running.")
         return
+    # interrupt is a no-op if the CLI is idle, so just send it whenever a
+    # client exists (the pump model has no turn-lock to gate on)
     try:
         await conv.client.interrupt()
         await update.effective_message.reply_text("⏹ Interrupt sent.")
@@ -2393,7 +2432,7 @@ async def cmd_status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             f"connected: {conv.client is not None}"
         )
         return
-    state = ("⏳ working" if conv.lock.locked()
+    state = ("⏳ working" if conv.pending
              else "🟢 connected" if conv.client is not None
              else "⚪ idle — connects on next message")
     lines = [f"👤 {conv.profile} · {state}"]
@@ -2423,11 +2462,8 @@ async def cmd_status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         n = max(0, min(10, round(pct / 10)))
         lines.append(f"{icon} Context {pct:.0f}% {'█' * n}{'░' * (10 - n)} "
                      f"({total // 1000}k / {limit // 1000}k)")
-    if conv.steered:
-        lines.append(f"↪️ {len(conv.steered)} message(s) steered into the "
-                     "current turn")
-    if conv.queue:
-        lines.append(f"📥 {len(conv.queue)} message(s) queued")
+    if conv.pending:
+        lines.append(f"⏳ {len(conv.pending)} message(s) being worked on")
     await update.effective_message.reply_text("\n".join(lines))
 
 
@@ -2729,13 +2765,15 @@ async def _fwd_flush(key: tuple) -> None:
     # one, else the FIRST forwarded message (the user's msg leads the
     # gesture — owner preference), never the arbitrary last arrival
     anchor_msg = next((m for m, fc, _ in items if not fc), items[0][0])
-    try:
-        await run_turn(update, ctx, body, anchor=anchor_msg)
-    finally:
-        # batch content now lives in the turn (or in the representative's
-        # queue entry if run_turn queued it) — release the member markers
-        for m, _, _ in items:
-            _inflight_del(conv, m)
+    # every batch member waits for the pump to clear it on the turn's
+    # ResultMessage (its inflight was persisted in _fwd_add). run_turn marks
+    # the representative (update.effective_message); add the rest to pending
+    # so the pump releases them too — NOT here (run_turn only fires the query;
+    # the reply hasn't landed yet, so clearing now would be premature).
+    for m, _, _ in items:
+        if m is not update.effective_message and m not in conv.pending:
+            conv.pending.append(m)
+    await run_turn(update, ctx, body, anchor=anchor_msg)
 
 
 async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2911,36 +2949,23 @@ async def _recover_conv(app: Application, key: ConvKey, ent: dict) -> None:
         prompt += ("\nThese user messages were queued behind the turn and "
                    "never delivered until now:\n"
                    + "\n".join(f"- {t}" for t in lost))
-    async with conv.lock:
+    try:
+        await say("⚡ Restarted mid-turn — continuing automatically…")
+    except Exception:
+        pass
+    try:
+        # ensure_client starts the pump; the recovery reply streams back
+        # through it, exactly like any other turn (no private receive loop
+        # that would fight the pump for the stream)
+        client = await ensure_client(conv)
+        await client.query(prompt)
+    except Exception:
+        log.exception("auto-recovery failed for %s", key)
         try:
-            await say("⚡ Restarted mid-turn — continuing automatically…")
+            await say("⚡ Auto-recovery failed — send \"continue\" to "
+                      "resume manually.")
         except Exception:
             pass
-        try:
-            client = await ensure_client(conv)
-            await client.query(prompt)
-            buf: list = []
-            async for m in client.receive_response():
-                sid2 = getattr(m, "session_id", None)
-                if sid2 and sid2 != conv.session_id:
-                    conv.session_id = sid2
-                    persist_binding(conv)
-                if isinstance(m, AssistantMessage):
-                    for b in m.content:
-                        if isinstance(b, TextBlock):
-                            buf.append(b.text)
-                if isinstance(m, ResultMessage) and m.is_error:
-                    buf.append(f"⚠️ {getattr(m, 'result', 'turn failed')}")
-            out = _tg_markdown("\n".join(buf).strip()) or "✅ (recovered)"
-            for i in range(0, len(out), 3900):
-                await say(out[i:i + 3900])
-        except Exception:
-            log.exception("auto-recovery failed for %s", key)
-            try:
-                await say("⚡ Auto-recovery failed — send \"continue\" to "
-                          "resume manually.")
-            except Exception:
-                pass
 
 
 async def _reconcile_state(app: Application) -> None:
