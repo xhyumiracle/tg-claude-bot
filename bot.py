@@ -2619,9 +2619,12 @@ async def on_unknown_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
 # modes are benign: over-merge ≈ what queue batching does anyway; over-split
 # yields smaller but self-contained batches.
 FWD_SETTLE_S = 1.2   # forwards/splits trickle in over a second or two
-TEXT_SETTLE_S = 0.0   # typed text fires instantly: steering (live-verified)
-                      # absorbs any same-gesture companion into the running
-                      # turn, so the merge window is obsolete
+TEXT_SETTLE_S = 0.25  # a typed comment sent alongside a forward must wait
+                      # long enough for that forward (~125ms behind, on its
+                      # own 1.2s timer) to join the batch. 0 raced them into
+                      # two separate turns — steering can't fix this: the
+                      # companion arrives BEFORE the turn is even running.
+                      # 0.25s is imperceptible next to multi-second turns.
 _fwd_batches: Dict[tuple, dict] = {}
 
 
