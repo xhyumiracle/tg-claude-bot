@@ -95,11 +95,15 @@ READ_TOOLS = {"Read", "Glob", "Grep", "NotebookRead"}
 WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 WEB_TOOLS = {"WebFetch", "WebSearch"}
 
-_DEFAULT_GUEST_PROMPT = f"""You are Claude, assisting in a Telegram chat with restricted access.
+GUEST_APPEND = f"""
+You are reached over Telegram, in a shared group chat with guest-level access.
 
-- You may Read/Glob/Grep under: {', '.join(str(d) for d in GUEST_READ_DIRS) or '(none configured)'}
-- You may Write/Edit ONLY under: {', '.join(str(d) for d in GUEST_WRITE_DIRS) or '(none configured)'}
-- No shell/bash access. If asked to run code, explain and reason about it instead.
+Filesystem scope:
+- Read/Glob/Grep under: {', '.join(str(d) for d in GUEST_READ_DIRS) or '(none configured)'}
+- Write/Edit under: {', '.join(str(d) for d in GUEST_WRITE_DIRS) or '(none configured)'}
+- Bash and paths outside those dirs still work, but each such call escalates to the
+  owner for Allow/Deny. Go ahead and use them when the task needs it; don't refuse
+  pre-emptively.
 
 Group-chat behavior:
 - Each incoming message is prefixed with `[<name> (<id>)]:` so you can tell who spoke.
@@ -109,11 +113,15 @@ Group-chat behavior:
 - Keep replies concise and Telegram-friendly (short code fences, no giant tables).
 """
 
-_prompt_file = os.environ.get("GUEST_SYSTEM_PROMPT_FILE", "")
-GUEST_PROMPT = (
-    Path(_prompt_file).expanduser().read_text()
-    if _prompt_file and Path(_prompt_file).expanduser().exists()
-    else _DEFAULT_GUEST_PROMPT
+# A GUEST_SYSTEM_PROMPT_FILE fully replaces the preset (advanced override).
+# Otherwise guests run the native claude_code preset + GUEST_APPEND — a guest
+# is native Claude Code with a scope note, not a stripped custom persona. The
+# real sandbox is the permission callback (make_permission_cb), not this text.
+_guest_file = os.environ.get("GUEST_SYSTEM_PROMPT_FILE", "")
+GUEST_CUSTOM_PROMPT = (
+    Path(_guest_file).expanduser().read_text()
+    if _guest_file and Path(_guest_file).expanduser().exists()
+    else None
 )
 
 OWNER_APPEND = """
@@ -654,7 +662,9 @@ def build_options(conv: Conversation) -> ClaudeAgentOptions:
         )
     return ClaudeAgentOptions(
         cli_path=SYSTEM_CLI,
-        system_prompt=GUEST_PROMPT,
+        system_prompt=(GUEST_CUSTOM_PROMPT if GUEST_CUSTOM_PROMPT
+                       else {"type": "preset", "preset": "claude_code",
+                             "append": GUEST_APPEND}),
         cwd=conv.cwd,
         add_dirs=[str(d) for d in GUEST_WRITE_DIRS],
         allowed_tools=sorted(READ_TOOLS | WRITE_TOOLS | WEB_TOOLS),
@@ -2720,7 +2730,7 @@ async def restart_watcher(app: Application) -> None:
             if not wait_notified:
                 wait_notified = True
                 try:
-                    await app.bot.send_message(
+                    m = await app.bot.send_message(
                         chat_id=OWNER_ID,
                         text=(f"⏳ Restart queued — waiting for {len(busy)} "
                               "busy conversation(s); forcing in "
@@ -2728,6 +2738,10 @@ async def restart_watcher(app: Application) -> None:
                               "turns auto-recover)."),
                         disable_notification=True,
                     )
+                    # reuse THIS message for the whole restart→online lifecycle,
+                    # so queued / restarting / online are one morphing message
+                    RESTART_NOTICE.write_text(json.dumps(
+                        {"chat_id": m.chat_id, "message_id": m.message_id}))
                 except Exception:
                     pass
             continue
@@ -2738,13 +2752,23 @@ async def restart_watcher(app: Application) -> None:
                 pass
         log.info("restart flag detected and idle; restarting service")
         try:
-            m = await app.bot.send_message(
-                chat_id=OWNER_ID, text="♻️ Restarting…",
-                disable_notification=True,
-            )
-            RESTART_NOTICE.write_text(
-                json.dumps({"chat_id": m.chat_id, "message_id": m.message_id})
-            )
+            ref = None
+            if RESTART_NOTICE.exists():  # a "⏳ Restart queued" msg to morph
+                try:
+                    ref = json.loads(RESTART_NOTICE.read_text())
+                    await app.bot.edit_message_text(
+                        chat_id=ref["chat_id"], message_id=ref["message_id"],
+                        text="♻️ Restarting…")
+                except Exception:
+                    ref = None
+            if ref is None:
+                m = await app.bot.send_message(
+                    chat_id=OWNER_ID, text="♻️ Restarting…",
+                    disable_notification=True,
+                )
+                RESTART_NOTICE.write_text(
+                    json.dumps({"chat_id": m.chat_id, "message_id": m.message_id})
+                )
         except Exception:
             log.warning("restart notice failed")
         proc = await asyncio.create_subprocess_shell(
