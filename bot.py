@@ -1223,6 +1223,109 @@ async def _consume_orphan_turn(update: Update, conv: "Conversation",
         await send_long(update, _tg_markdown(out), anchor=None)
 
 
+# ===================== continuous-consumer rewrite (WIP) =====================
+# Root fix for the off-by-one: the CLI stream is one continuous bidirectional
+# stream. Consuming it with per-turn receive_response() (stops at the first
+# ResultMessage) leaks any extra ResultMessage a steer produced, so the next
+# turn reads it one behind. Instead: ONE never-stopping consumer over
+# receive_messages(); each ResultMessage delimits a reply segment. Nothing is
+# ever left buffered. Not wired in until offline-tested.
+
+class _BotTarget:
+    """Adapts app_ref.bot into the ``update.effective_message.reply_text``
+    interface LiveStatus/send_long expect, so the pump can reuse them without
+    an Update object. Sends land in the conversation's chat/topic, unquoted."""
+
+    def __init__(self, chat_id: int, thread_id: int) -> None:
+        self.chat_id = chat_id
+        self.thread_id = thread_id
+
+    @property
+    def effective_message(self):
+        return self
+
+    async def reply_text(self, text: str, **kw):
+        kw.pop("do_quote", None)  # send_message has no do_quote
+        return await app_ref.bot.send_message(
+            chat_id=self.chat_id,
+            message_thread_id=self.thread_id or None,
+            text=text, **kw,
+        )
+
+
+async def _pump(conv: "Conversation") -> None:
+    """The single continuous consumer of conv.client's message stream. Runs
+    for the client's lifetime, never stopping at a ResultMessage, so no CLI
+    message is ever left buffered. Each ResultMessage finalizes one reply
+    segment. Reaction/anchor precision is handled separately (next step)."""
+    target = _BotTarget(conv.key[0], conv.key[1])
+    status = LiveStatus()
+    buf: list[str] = []
+    n_tools = 0
+
+    async def flush() -> None:
+        nonlocal status
+        seg = "\n".join(p for p in buf if p).strip()
+        buf.clear()
+        if seg.startswith("<pass>"):
+            seg = ""
+        await status.finalize(target, _tg_markdown(seg))
+        status = LiveStatus()
+
+    try:
+        async for m in conv.client.receive_messages():
+            sid = getattr(m, "session_id", None)
+            if sid and sid != conv.session_id:
+                conv.session_id = sid
+                persist_binding(conv)
+            if (getattr(m, "subtype", "") == "init"
+                    and isinstance(getattr(m, "data", None), dict)):
+                conv.current_model = m.data.get("model") or conv.current_model
+            if isinstance(m, AssistantMessage):
+                for block in m.content:
+                    if isinstance(block, TextBlock):
+                        buf.append(block.text)
+                    elif isinstance(block, ToolUseBlock):
+                        n_tools += 1
+                        if buf:
+                            await flush()
+                        await status.update(
+                            target,
+                            f"⏳ Working… ({n_tools})\n🔧 {_tool_brief(block)}")
+                    elif isinstance(block, ThinkingBlock):
+                        if buf:
+                            await flush()
+                        await status.update(target, "💭 Thinking…")
+            elif isinstance(m, ResultMessage):
+                if m.is_error:
+                    err = (m.result or "; ".join(
+                        str(e) for e in (m.errors or [])) or "unknown error")
+                    buf.append(f"⚠️ Turn failed: {str(err)[:500]}")
+                await flush()
+                n_tools = 0
+            elif isinstance(m, UserMessage):
+                # relay CLI local-command output (/context, /cost, ...)
+                content = getattr(m, "content", None)
+                texts = []
+                if isinstance(content, str):
+                    texts.append(content)
+                elif isinstance(content, list):
+                    for b in content:
+                        if isinstance(b, TextBlock):
+                            texts.append(b.text)
+                        elif isinstance(b, str):
+                            texts.append(b)
+                for t in texts:
+                    for out in _LOCAL_OUT_RE.findall(t):
+                        if out.strip():
+                            buf.append(out.strip())
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("pump crashed for %s", conv.key)
+# =================== end continuous-consumer rewrite (WIP) ===================
+
+
 async def run_turn(
     update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str,
     blocks: Optional[list] = None, status_text: Optional[str] = None,
