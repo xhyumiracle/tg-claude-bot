@@ -255,7 +255,7 @@ class Conversation:
     steered: list = field(default_factory=list)
     last_steer: float = 0.0
     # /login flow: {"proc","fd","expiry","busy"} while a pty-relayed
-    # `claude setup-token` awaits its auth code. Ephemeral by design — a
+    # `claude auth login` awaits its auth code. Ephemeral by design — a
     # restart mid-login just means running /login again.
     login: Optional[dict] = None
     # /esc coverage for the gaps where no client exists yet (issue #1):
@@ -1704,19 +1704,27 @@ def _persist_env(key: str, value: str) -> None:
     env_path.write_text("\n".join(lines) + "\n")
 
 
-# ---------- /login: pty-relayed `claude setup-token` ----------
-# The CLI's login is a TUI: words are painted with cursor-positioning escapes
-# (so "Paste code here" arrives as "Paste\x1b[23Gcode\x1b[28Ghere"), and long
-# strings wrap at the terminal width. Two countermeasures, both verified
-# against the real flow: match phrases on ANSI-stripped text with spaces
-# removed, and open the pty 4000 columns wide so URL and token never wrap —
-# then a raw-buffer regex stops cleanly at the next escape byte.
+# ---------- /login: pty-relayed `claude auth login` ----------
+# Login is an interactive TUI (words painted with cursor escapes, the URL
+# wrapped at the terminal width). Countermeasures verified against the real
+# flow: match phrases on ANSI-stripped, space-stripped text, and open the pty
+# 4000 columns wide so the URL never wraps. `auth login` does a full ACCOUNT
+# sign-in that rewrites ~/.claude/.credentials.json (account-scoped and
+# self-refreshing, unlike the inference-only setup-token) — nothing is printed
+# to capture, so success is simply that file changing.
 _LOGIN_ANSI_RE = re.compile(
     r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|[\r\x08]")
 _LOGIN_URL_RE = re.compile(r"https://claude\.com/[^\s\x07\x1b\"]+")
-_LOGIN_TOKEN_RE = re.compile(r"sk-ant-oat[0-9A-Za-z_-]{24,}")
 _LOGIN_ERRS = ("OAutherror", "Invalidcode", "Failedtoexchange",
                "Authenticationfailed")
+_CRED_FILE = HOME / ".claude" / ".credentials.json"
+
+
+def _cred_mtime() -> float:
+    try:
+        return _CRED_FILE.stat().st_mtime
+    except OSError:
+        return 0.0
 
 
 def _login_squash(raw: str) -> str:
@@ -1748,7 +1756,7 @@ def _login_spawn() -> tuple:
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 4000, 0, 0))
     proc = subprocess.Popen(
-        [SYSTEM_CLI or "claude", "setup-token"],
+        [SYSTEM_CLI or "claude", "auth", "login", "--claudeai"],
         stdin=slave, stdout=slave, stderr=slave,
         start_new_session=True, close_fds=True,
     )
@@ -1829,6 +1837,7 @@ async def _login_paste(update: Update, conv: "Conversation",
     st["busy"] = True
     fd = st["fd"]
     try:
+        before = _cred_mtime()
         try:
             await asyncio.to_thread(os.write, fd, (code.strip() + "\r").encode())
         except OSError:
@@ -1836,21 +1845,24 @@ async def _login_paste(update: Update, conv: "Conversation",
             await update.effective_message.reply_text(
                 "⚠️ /login process died; run /login again.")
             return
+        # success = the CLI rewrote .credentials.json (it doesn't touch that
+        # file until the code exchange succeeds — verified)
         raw = await asyncio.to_thread(
             _pty_read, fd, 45,
-            lambda s: bool(_LOGIN_TOKEN_RE.search(s))
+            lambda s: _cred_mtime() != before
             or any(e in _login_squash(s) for e in _LOGIN_ERRS))
-        tok = _LOGIN_TOKEN_RE.search(raw)
-        if tok:
-            token = tok.group(0)
+        if _cred_mtime() != before:
             await _login_cancel(conv)
-            _persist_env("CLAUDE_CODE_OAUTH_TOKEN", token)
-            os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = token
-            # never echo the token — prefix only
+            sub = ""
+            try:
+                c = json.loads(_CRED_FILE.read_text())["claudeAiOauth"]
+                if c.get("subscriptionType"):
+                    sub = f" ({c['subscriptionType']})"
+            except Exception:
+                pass
             await update.effective_message.reply_text(
-                f"✅ Logged in. Long-lived token saved to .env "
-                f"({token[:14]}…) — new turns and API calls use it "
-                "immediately.")
+                f"✅ Signed in{sub}. The CLI now holds a fresh account token it "
+                "refreshes itself — inference, /usage and /model all use it.")
             return
         if any(e in _login_squash(raw) for e in _LOGIN_ERRS):
             # CLI offers "Press Enter to retry" and mints a FRESH challenge —
@@ -2898,7 +2910,7 @@ async def post_init(app: Application) -> None:
         BotCommand("loop", "Run a prompt on a recurring interval"),
         BotCommand("schedule", "Manage scheduled cloud agents"),
         BotCommand("init", "Initialize CLAUDE.md for a codebase"),
-        BotCommand("login", "Re-authenticate the CLI (claude setup-token)"),
+        BotCommand("login", "Re-authenticate the CLI (claude auth login)"),
         BotCommand("whisper", "Show or set the voice transcription model"),
         BotCommand("new", "Same as /clear"),
         BotCommand("reset", "Same as /clear"),

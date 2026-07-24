@@ -151,7 +151,7 @@ events and statelessness.
 | `/export` | Send this session's transcript file |
 | `!command` | Bash mode — run a shell command directly in the session's cwd (owner-typed only) |
 | `/usage` | Subscription limits (5h / weekly / per-model / credits) |
-| `/login` | Re-authenticate from your phone — relays `claude setup-token`: tap the link, paste the code back |
+| `/login` | Re-authenticate from your phone — relays `claude auth login`: tap the link, paste the code back |
 | `/whisper` | Pick the voice-transcription model |
 | `/esc` (`/stop`) | Interrupt the current turn — the CLI's ESC |
 | anything else | Forwarded verbatim to the CLI: `/compact`, `/context`, `/cost`, your skills… |
@@ -183,9 +183,9 @@ turns continue automatically.
 - Session management commands are owner-gated everywhere; so is `/mode` —
   permission modes change the guardrails themselves, and `bypass permissions`
   disables the guest sandbox for that conversation.
-- `/login` relays the CLI's own `claude setup-token` flow; the resulting
-  token goes straight into `.env` and is never echoed to the chat (prefix
-  only). Owner-typed messages only, 5-minute window, `/esc` cancels.
+- `/login` relays the CLI's own `claude auth login` flow; the account
+  credentials it writes stay in the CLI's own store (`~/.claude`), never in
+  the chat. Owner-typed messages only, 5-minute window, `/esc` cancels.
 - Voice notes are transcribed locally and deleted; images follow the CLI's
   transcript retention.
 - Full threat model, verified controls, and accepted risks:
