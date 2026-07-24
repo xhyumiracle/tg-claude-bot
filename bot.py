@@ -1109,8 +1109,8 @@ def _tool_brief(block: ToolUseBlock) -> str:
     return block.name
 
 
-def _think_preview(s: str, n: int = 160) -> str:
-    """Single-line tail of the live thinking stream for the status bubble."""
+def _preview_tail(s: str, n: int = 160) -> str:
+    """Single-line tail of a live stream (the answer text) for the bubble."""
     s = " ".join(s.split())
     return ("…" + s[-n:]) if len(s) > n else s
 
@@ -1240,7 +1240,7 @@ async def _pump(conv: "Conversation") -> None:
     n_tools = 0
     head = "Working…"   # current activity label for the live ticker
     detail = ""         # optional second line (running tool / thinking tail)
-    think = ""          # accumulated live thinking text (partial-message stream)
+    txt = ""            # accumulated streamed answer text (live preview)
     spin_i = 0
 
     async def flush() -> None:
@@ -1316,20 +1316,25 @@ async def _pump(conv: "Conversation") -> None:
                                 head, detail = "Thinking…", ""
                                 await show()
                     elif isinstance(m, StreamEvent):
-                        # live partial stream: show what it's thinking/writing
-                        # right now. status.update's own throttle caps edits, so
-                        # deltas arriving many/sec cost no extra Telegram calls.
+                        # live partial stream. status.update's own throttle caps
+                        # edits, so deltas arriving many/sec cost no extra calls.
+                        # NOTE: thinking text is redacted in this setup (the
+                        # thinking_delta carries only a token estimate, no text),
+                        # so thinking shows a running token count; the answer
+                        # text itself streams and previews live.
                         ev = getattr(m, "event", None) or {}
                         if ev.get("type") == "content_block_delta":
                             d = ev.get("delta") or {}
                             dt = d.get("type")
                             if dt == "thinking_delta":
-                                think += d.get("thinking", "")
+                                est = d.get("estimated_tokens")
                                 head = "Thinking…"
-                                detail = "💭 " + _think_preview(think)
+                                detail = f"💭 ~{est} tokens" if est else ""
                                 await show()
-                            elif dt == "text_delta" and head != "Responding…":
-                                head, detail = "Responding…", ""
+                            elif dt == "text_delta":
+                                txt += d.get("text", "")
+                                head = "Responding…"
+                                detail = _preview_tail(txt)
                                 await show()
                     elif isinstance(m, ResultMessage):
                         conv.working_since = None  # turn done: stop the ticker
@@ -1340,7 +1345,7 @@ async def _pump(conv: "Conversation") -> None:
                             buf.append(f"⚠️ Turn failed: {str(err)[:500]}")
                         await flush()
                         n_tools = 0
-                        head, detail, think = "Working…", "", ""
+                        head, detail, txt = "Working…", "", ""
                         # a turn finished: clear the 👀 markers + inflight for
                         # every outstanding message (coarse — anchor next step)
                         pend = conv.pending[:]
@@ -1395,7 +1400,7 @@ async def _pump(conv: "Conversation") -> None:
                 status = LiveStatus()
                 buf.clear()
                 n_tools = 0
-                head, detail, think = "Working…", "", ""
+                head, detail, txt = "Working…", "", ""
     except asyncio.CancelledError:
         raise
     except Exception:
