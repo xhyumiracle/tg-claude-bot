@@ -1280,75 +1280,105 @@ async def _pump(conv: "Conversation") -> None:
         await status.finalize(target, _tg_markdown(seg))
         status = LiveStatus()
 
+    crashes: list[float] = []  # recent crash timestamps — anti-thrash gate
     try:
-        async for m in conv.client.receive_messages():
-            sid = getattr(m, "session_id", None)
-            if sid and sid != conv.session_id:
-                conv.session_id = sid
-                persist_binding(conv)
-            if (getattr(m, "subtype", "") == "init"
-                    and isinstance(getattr(m, "data", None), dict)):
-                conv.current_model = m.data.get("model") or conv.current_model
-            if isinstance(m, AssistantMessage):
-                for block in m.content:
-                    if isinstance(block, TextBlock):
-                        buf.append(block.text)
-                    elif isinstance(block, ToolUseBlock):
-                        n_tools += 1
-                        if buf:
-                            await flush()
-                        await status.update(
-                            target,
-                            f"⏳ Working… ({n_tools})\n🔧 {_tool_brief(block)}")
-                    elif isinstance(block, ThinkingBlock):
-                        if buf:
-                            await flush()
-                        await status.update(target, "💭 Thinking…")
-            elif isinstance(m, ResultMessage):
-                if m.is_error:
-                    err = (m.result or "; ".join(
-                        str(e) for e in (m.errors or [])) or "unknown error")
-                    buf.append(f"⚠️ Turn failed: {str(err)[:500]}")
-                await flush()
+        while conv.client is not None:
+            try:
+                async for m in conv.client.receive_messages():
+                    sid = getattr(m, "session_id", None)
+                    if sid and sid != conv.session_id:
+                        conv.session_id = sid
+                        persist_binding(conv)
+                    if (getattr(m, "subtype", "") == "init"
+                            and isinstance(getattr(m, "data", None), dict)):
+                        conv.current_model = (m.data.get("model")
+                                              or conv.current_model)
+                    if isinstance(m, AssistantMessage):
+                        for block in m.content:
+                            if isinstance(block, TextBlock):
+                                buf.append(block.text)
+                            elif isinstance(block, ToolUseBlock):
+                                n_tools += 1
+                                if buf:
+                                    await flush()
+                                await status.update(
+                                    target,
+                                    f"⏳ Working… ({n_tools})\n"
+                                    f"🔧 {_tool_brief(block)}")
+                            elif isinstance(block, ThinkingBlock):
+                                if buf:
+                                    await flush()
+                                await status.update(target, "💭 Thinking…")
+                    elif isinstance(m, ResultMessage):
+                        if m.is_error:
+                            err = (m.result or "; ".join(
+                                str(e) for e in (m.errors or []))
+                                or "unknown error")
+                            buf.append(f"⚠️ Turn failed: {str(err)[:500]}")
+                        await flush()
+                        n_tools = 0
+                        # a turn finished: clear the 👨‍💻 markers + inflight for
+                        # every outstanding message (coarse — anchor next step)
+                        pend = conv.pending[:]
+                        conv.pending.clear()
+                        for pm in pend:
+                            _inflight_del(conv, pm)
+                            try:
+                                await pm.set_reaction(None)
+                            except BaseException:
+                                pass
+                        try:
+                            await check_context_usage(target, conv)
+                        except Exception:
+                            pass
+                    elif isinstance(m, UserMessage):
+                        # relay CLI local-command output (/context, /cost, ...)
+                        content = getattr(m, "content", None)
+                        texts = []
+                        if isinstance(content, str):
+                            texts.append(content)
+                        elif isinstance(content, list):
+                            for b in content:
+                                if isinstance(b, TextBlock):
+                                    texts.append(b.text)
+                                elif isinstance(b, str):
+                                    texts.append(b)
+                        for t in texts:
+                            for out in _LOCAL_OUT_RE.findall(t):
+                                if out.strip():
+                                    buf.append(out.strip())
+                # stream ended cleanly (rare while connected) — stop consuming
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A crash while the CLI subprocess is still alive would orphan
+                # any self-triggered (task-notification) turn until the next
+                # human message. Re-enter the consumer on the SAME client so
+                # background-task completions still reach Telegram. Gate against
+                # a death loop: too many crashes in a short window → give up and
+                # fall back to lazy re-arm on the next message.
+                log.exception("pump crashed for %s", conv.key)
+                now = time.time()
+                crashes[:] = [t for t in crashes if now - t < 60.0]
+                crashes.append(now)
+                if len(crashes) >= 4:
+                    log.error("pump for %s crashed %d×/60s; giving up "
+                              "(re-arms on next message)", conv.key,
+                              len(crashes))
+                    break
+                await asyncio.sleep(min(2.0 * len(crashes), 8.0))
+                status = LiveStatus()
+                buf.clear()
                 n_tools = 0
-                # a turn finished: clear the 👨‍💻 markers + inflight for every
-                # outstanding message (coarse — anchor precision is next step)
-                pend = conv.pending[:]
-                conv.pending.clear()
-                for pm in pend:
-                    _inflight_del(conv, pm)
-                    try:
-                        await pm.set_reaction(None)
-                    except BaseException:
-                        pass
-                try:
-                    await check_context_usage(target, conv)
-                except Exception:
-                    pass
-            elif isinstance(m, UserMessage):
-                # relay CLI local-command output (/context, /cost, ...)
-                content = getattr(m, "content", None)
-                texts = []
-                if isinstance(content, str):
-                    texts.append(content)
-                elif isinstance(content, list):
-                    for b in content:
-                        if isinstance(b, TextBlock):
-                            texts.append(b.text)
-                        elif isinstance(b, str):
-                            texts.append(b)
-                for t in texts:
-                    for out in _LOCAL_OUT_RE.findall(t):
-                        if out.strip():
-                            buf.append(out.strip())
     except asyncio.CancelledError:
         raise
     except Exception:
-        log.exception("pump crashed for %s", conv.key)
+        log.exception("pump wrapper crashed for %s", conv.key)
     finally:
-        # pump ended (stream closed or crash, NOT a drop_client cancel which
-        # already reset these): force a fresh client+pump on the next message
-        # so replies never silently stop
+        # pump ended (stream closed, gave up after repeated crashes, or a
+        # drop_client cancel — which already reset these): re-arm a fresh
+        # client+pump on the next message so replies never silently stop
         if conv.pump is asyncio.current_task():
             conv.pump = None
             conv.client = None
