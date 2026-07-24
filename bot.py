@@ -1125,6 +1125,11 @@ def _preview_tail(s: str, n: int = 160) -> str:
     return ("…" + s[-n:]) if len(s) > n else s
 
 
+def _ktok(n: int) -> str:
+    """Native-style compact token count: 650 -> '650', 6840 -> '6.8k'."""
+    return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+
+
 async def _context_limit(conv: Conversation, used: int = 0) -> int:
     raw = (conv.model or conv.current_model
            or _session_model(conv.session_id) or "")
@@ -1251,8 +1256,7 @@ async def _pump(conv: "Conversation") -> None:
     head = "Working…"   # current activity label for the live ticker
     detail = ""         # optional second line (running tool / answer tail)
     txt = ""            # accumulated streamed answer text (live preview)
-    think_tokens = 0    # monotonic total thinking tokens across blocks
-    last_est = 0        # last per-block estimate, to sum increments
+    think_tokens = 0    # running total of thinking-token estimates (a sum)
     spin_i = 0
 
     async def flush() -> None:
@@ -1337,14 +1341,13 @@ async def _pump(conv: "Conversation") -> None:
                             d = ev.get("delta") or {}
                             dt = d.get("type")
                             if dt == "thinking_delta":
-                                est = d.get("estimated_tokens") or 0
-                                if est >= last_est:      # climbing in a block
-                                    think_tokens += est - last_est
-                                else:                    # reset → new block
-                                    think_tokens += est
-                                last_est = est
+                                # each thinking_delta is a per-chunk token
+                                # estimate (varies ~50-200 within one block);
+                                # the running total is their sum, matching
+                                # native. estimated, so it can only be rough.
+                                think_tokens += d.get("estimated_tokens") or 0
                                 head = "Thinking…"
-                                detail = (f"💭 ~{think_tokens} tokens"
+                                detail = (f"💭 ~{_ktok(think_tokens)} tokens"
                                           if think_tokens else "")
                             elif dt == "text_delta":
                                 txt += d.get("text", "")
@@ -1359,7 +1362,7 @@ async def _pump(conv: "Conversation") -> None:
                             buf.append(f"⚠️ Turn failed: {str(err)[:500]}")
                         await flush()
                         n_tools = 0
-                        head, detail, txt, think_tokens, last_est = "Working…", "", "", 0, 0
+                        head, detail, txt, think_tokens = "Working…", "", "", 0
                         # a turn finished: clear the 👀 markers + inflight for
                         # every outstanding message (coarse — anchor next step)
                         pend = conv.pending[:]
@@ -1414,7 +1417,7 @@ async def _pump(conv: "Conversation") -> None:
                 status = LiveStatus()
                 buf.clear()
                 n_tools = 0
-                head, detail, txt, think_tokens, last_est = "Working…", "", "", 0, 0
+                head, detail, txt, think_tokens = "Working…", "", "", 0
     except asyncio.CancelledError:
         raise
     except Exception:
