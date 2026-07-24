@@ -1041,6 +1041,7 @@ class LiveStatus:
         self.text = ""
         self.anchor_fn = anchor_fn
         self.anchor = self._UNSET  # resolved once: a Message, or None
+        self._creating = False     # a first send is in flight (flood-safe)
 
     def _resolve(self):
         if self.anchor is self._UNSET:
@@ -1057,14 +1058,23 @@ class LiveStatus:
     async def update(self, update_obj: Update, text: str) -> None:
         now = time.time()
         if self.msg is None:
+            # Only ONE first-send may be in flight. Under flood control a send
+            # can block for tens of seconds; without this guard every later
+            # call would see msg=None and send AGAIN, piling up duplicate
+            # frozen bubbles. Skip while one is creating.
+            if self._creating:
+                return
+            self._creating = True
             try:
                 self.msg = await self._send(
                     update_obj, text, disable_notification=True)
                 self.last, self.text = now, text
             except Exception:
                 pass
+            finally:
+                self._creating = False
             return
-        if now - self.last < 2.5 or text == self.text:
+        if now - self.last < 6.0 or text == self.text:
             return
         try:
             await self.msg.edit_text(text)
@@ -1239,8 +1249,10 @@ async def _pump(conv: "Conversation") -> None:
     buf: list[str] = []
     n_tools = 0
     head = "Working…"   # current activity label for the live ticker
-    detail = ""         # optional second line (running tool / thinking tail)
+    detail = ""         # optional second line (running tool / answer tail)
     txt = ""            # accumulated streamed answer text (live preview)
+    think_tokens = 0    # monotonic total thinking tokens across blocks
+    last_est = 0        # last per-block estimate, to sum increments
     spin_i = 0
 
     async def flush() -> None:
@@ -1270,16 +1282,16 @@ async def _pump(conv: "Conversation") -> None:
         await status.update(target, line + (f"\n{detail}" if detail else ""))
 
     async def _ticker() -> None:
-        # first feedback at ~3s, then a sparse 5s cadence so long turns stay
-        # light on Telegram edit limits. With partial streaming on most turns
-        # get immediate delta-driven updates anyway; this backstops the gap
-        # before the first token and bumps the elapsed counter between deltas.
+        # THE sole writer of the status bubble. CLI events only mutate state
+        # (head/detail/tokens); this task renders at a controlled cadence, so a
+        # tool-heavy or token-streaming turn can never machine-gun Telegram
+        # into flood control. First feedback at ~3s, then every 7s.
         try:
-            delay = 3.0
+            delay = 4.0   # first render at ~4s (quick turns clear before this)
             while True:
                 await asyncio.sleep(delay)
-                delay = 5.0
-                await show(min_elapsed=3.0)
+                delay = 7.0
+                await show()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1309,33 +1321,35 @@ async def _pump(conv: "Conversation") -> None:
                                     await flush()
                                 head = f"Working… ({n_tools})"
                                 detail = f"🔧 {_tool_brief(block)}"
-                                await show()
                             elif isinstance(block, ThinkingBlock):
                                 if buf:
                                     await flush()
                                 head, detail = "Thinking…", ""
-                                await show()
                     elif isinstance(m, StreamEvent):
-                        # live partial stream. status.update's own throttle caps
-                        # edits, so deltas arriving many/sec cost no extra calls.
-                        # NOTE: thinking text is redacted in this setup (the
-                        # thinking_delta carries only a token estimate, no text),
-                        # so thinking shows a running token count; the answer
-                        # text itself streams and previews live.
+                        # Live partial stream — mutate state ONLY; the ticker
+                        # renders it, so deltas arriving many/sec cost zero
+                        # Telegram calls. Thinking text is redacted here
+                        # (thinking_delta carries only a per-block token
+                        # estimate, no text), so sum the estimates into a
+                        # monotonic total; the answer text streams and previews.
                         ev = getattr(m, "event", None) or {}
                         if ev.get("type") == "content_block_delta":
                             d = ev.get("delta") or {}
                             dt = d.get("type")
                             if dt == "thinking_delta":
-                                est = d.get("estimated_tokens")
+                                est = d.get("estimated_tokens") or 0
+                                if est >= last_est:      # climbing in a block
+                                    think_tokens += est - last_est
+                                else:                    # reset → new block
+                                    think_tokens += est
+                                last_est = est
                                 head = "Thinking…"
-                                detail = f"💭 ~{est} tokens" if est else ""
-                                await show()
+                                detail = (f"💭 ~{think_tokens} tokens"
+                                          if think_tokens else "")
                             elif dt == "text_delta":
                                 txt += d.get("text", "")
                                 head = "Responding…"
                                 detail = _preview_tail(txt)
-                                await show()
                     elif isinstance(m, ResultMessage):
                         conv.working_since = None  # turn done: stop the ticker
                         if m.is_error:
@@ -1345,7 +1359,7 @@ async def _pump(conv: "Conversation") -> None:
                             buf.append(f"⚠️ Turn failed: {str(err)[:500]}")
                         await flush()
                         n_tools = 0
-                        head, detail, txt = "Working…", "", ""
+                        head, detail, txt, think_tokens, last_est = "Working…", "", "", 0, 0
                         # a turn finished: clear the 👀 markers + inflight for
                         # every outstanding message (coarse — anchor next step)
                         pend = conv.pending[:]
@@ -1400,7 +1414,7 @@ async def _pump(conv: "Conversation") -> None:
                 status = LiveStatus()
                 buf.clear()
                 n_tools = 0
-                head, detail, txt = "Working…", "", ""
+                head, detail, txt, think_tokens, last_est = "Working…", "", "", 0, 0
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -3194,8 +3208,10 @@ class FloodLimiter(BaseRateLimiter):
        `rate`/sec — so a tool-heavy turn or a big forward/queue batch can't
        machine-gun a chat into flood control in the first place.
 
-    Edits (live status), callback answers and typing are EXEMPT: they're
-    already app-throttled or must stay instant, so streaming keeps its feel.
+    editMessageText (live status) is paced too: the status ticker is the only
+    writer and self-throttles, but the shared bucket is the hard backstop that
+    keeps a long streaming turn from ever hitting flood control. Callback
+    answers, typing and reactions stay EXEMPT — they must be instant.
     """
 
     # Only NEW-message endpoints are paced. Reactions are deliberately NOT
@@ -3205,7 +3221,7 @@ class FloodLimiter(BaseRateLimiter):
     # RetryAfter instead of pre-emptive spacing.
     PACED = {"sendMessage", "sendPhoto", "sendDocument", "sendVoice",
              "sendAudio", "sendAnimation", "sendMediaGroup",
-             "forwardMessage", "copyMessage"}
+             "forwardMessage", "copyMessage", "editMessageText"}
 
     def __init__(self, cap: int = 8, rate: float = 1.0,
                  max_retries: int = 3) -> None:
