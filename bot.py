@@ -1612,12 +1612,15 @@ async def bind_session(update: Update, sid: str) -> None:
 
 
 def _oauth_token() -> str:
-    # Prefer the long-lived setup token (CLAUDE_CODE_OAUTH_TOKEN) over the
-    # rotating short-lived access token in .credentials.json.
-    if env_tok := os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
-        return env_tok
-    creds = json.loads((HOME / ".claude" / ".credentials.json").read_text())
-    return creds["claudeAiOauth"]["accessToken"]
+    # Prefer the CLI's own account-scoped token in .credentials.json, which
+    # the CLI refreshes on every turn (account scope is needed for the usage
+    # endpoint; the setup-token is inference-only). Fall back to a pinned
+    # setup-token only when there's no login at all.
+    try:
+        creds = json.loads((HOME / ".claude" / ".credentials.json").read_text())
+        return creds["claudeAiOauth"]["accessToken"]
+    except Exception:
+        return os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
 
 
 _models_cache: dict = {"ts": 0.0, "data": []}
@@ -1691,93 +1694,6 @@ def _ctx_label(n) -> str:
     if not n:
         return "?"
     return f"{n // 1_000_000}M" if n >= 1_000_000 else f"{n // 1000}k"
-
-
-async def fetch_usage() -> str:
-    import httpx
-    from datetime import datetime
-
-    token = _oauth_token()
-    async with httpx.AsyncClient(timeout=15) as cx:
-        r = await cx.get(
-            "https://api.anthropic.com/api/oauth/usage",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "anthropic-beta": "oauth-2025-04-20",
-            },
-        )
-    if r.status_code != 200:
-        return (f"Usage endpoint error {r.status_code}. "
-                "Token may need a refresh; run any turn in the terminal CLI.")
-    d = r.json()
-
-    def bar(p: float) -> str:
-        n = max(0, min(10, round((p or 0) / 10)))
-        return "█" * n + "░" * (10 - n)
-
-    def local(ts: str) -> str:
-        try:
-            return datetime.fromisoformat(ts).astimezone().strftime("%m-%d %H:%M")
-        except Exception:
-            return "?"
-
-    lines = ["📊 Subscription usage"]
-    labels = {"session": "Session (5hr)", "weekly_all": "Weekly (7 day)"}
-    for lim in d.get("limits") or []:
-        kind = lim.get("kind", "?")
-        label = labels.get(kind)
-        if label is None:
-            scope = ((lim.get("scope") or {}).get("model") or {})
-            name = scope.get("display_name") or kind
-            label = f"Weekly {name}" if lim.get("group") == "weekly" else name
-        pct = lim.get("percent") or 0
-        sev = "" if lim.get("severity") in (None, "normal") else " ⚠️"
-        lines.append(
-            f"{label}: {pct:.0f}% {bar(pct)} resets {local(lim.get('resets_at'))}{sev}"
-        )
-    if not (d.get("limits") or []):
-        fh = d.get("five_hour") or {}
-        sd = d.get("seven_day") or {}
-        lines.append(
-            f"Session (5hr): {fh.get('utilization') or 0:.0f}% "
-            f"{bar(fh.get('utilization'))} resets {local(fh.get('resets_at'))}"
-        )
-        lines.append(
-            f"Weekly (7 day): {sd.get('utilization') or 0:.0f}% "
-            f"{bar(sd.get('utilization'))} resets {local(sd.get('resets_at'))}"
-        )
-    ex = d.get("extra_usage") or {}
-    sp = d.get("spend") or {}
-    if ex.get("is_enabled") or sp.get("enabled"):
-        def money(m: dict) -> float:
-            return (m.get("amount_minor") or 0) / (10 ** (m.get("exponent") or 2))
-
-        used = money(sp.get("used") or {})
-        cap = money(sp.get("limit") or {})
-        if not cap:  # fallback to extra_usage (values in minor units too)
-            dp = ex.get("decimal_places") or 2
-            used = (ex.get("used_credits") or 0) / (10 ** dp)
-            cap = (ex.get("monthly_limit") or 0) / (10 ** dp)
-        pct = sp.get("percent") or ex.get("utilization") or 0
-        sev = "" if sp.get("severity") in (None, "normal") else " ⚠️"
-        from datetime import date
-        today = date.today()
-        nxt = date(today.year + (today.month == 12), today.month % 12 + 1, 1)
-        lines.append(
-            f"Usage credits: ${used:.2f} / ${cap:.2f}"
-            f" ({pct:.0f}%){sev} resets {nxt.strftime('%b %d')}"
-        )
-    return "\n".join(lines)
-
-
-async def cmd_usage(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
-    if not chat_allowed(update) or not is_owner(update):
-        return
-    try:
-        text = await fetch_usage()
-    except Exception as e:
-        text = f"Usage fetch failed: {e}"
-    await update.effective_message.reply_text(text)
 
 
 def _persist_env(key: str, value: str) -> None:
@@ -3359,6 +3275,13 @@ class FloodLimiter(BaseRateLimiter):
 def main() -> None:
     global app_ref
     os.umask(0o077)  # temp media/flag files must not be world-readable
+    # If the CLI is logged in (.credentials.json exists), drop any pinned
+    # CLAUDE_CODE_OAUTH_TOKEN so the CLI (and every SDK-spawned child) uses
+    # and auto-refreshes its own account-scoped token instead. A pinned
+    # inference-only setup-token makes the CLI skip that refresh, rots the
+    # account token, and 403s /usage. Kept only when there's no login.
+    if (HOME / ".claude" / ".credentials.json").exists():
+        os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
     log.info("config: target_group=%s default_resume=%s",
              TARGET_GROUP_ID, DEFAULT_RESUME or "(none)")
     app = (
@@ -3394,7 +3317,8 @@ def main() -> None:
                                    filters=~filters.FORWARDED))
     app.add_handler(CommandHandler("login", cmd_login, filters=~filters.FORWARDED))
     app.add_handler(CommandHandler("whisper", cmd_whisper, filters=~filters.FORWARDED))
-    app.add_handler(CommandHandler("usage", cmd_usage, filters=~filters.FORWARDED))
+    # /usage is NOT intercepted: it passes through to the CLI's own /usage,
+    # which renders richer output via the account token it self-refreshes.
     app.add_handler(CallbackQueryHandler(on_callback))
     # forwarded messages are quoted material, never instructions: commands in
     # them route to the text/aggregation path like any other forwarded text
