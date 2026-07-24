@@ -11,7 +11,7 @@ prompts with buttons.
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](pyproject.toml)
 [![Built on claude-agent-sdk](https://img.shields.io/badge/built%20on-claude--agent--sdk-d97757.svg)](https://github.com/anthropics/claude-agent-sdk-python)
-![Single file](https://img.shields.io/badge/single%20file-~1.6k%20lines-brightgreen.svg)
+![Single file](https://img.shields.io/badge/single%20file-~3.4k%20lines-brightgreen.svg)
 ![No database](https://img.shields.io/badge/database-none-lightgrey.svg)
 [![Security: self-audited by Fable 5](https://img.shields.io/badge/security-audited%20by%20Fable%205-8A2BE2.svg)](SECURITY_AUDIT.md)
 
@@ -29,16 +29,16 @@ terminal. The bot is a thin stateless router; the CLI owns everything.
 |---|---|
 | 🔁 **Resume any real session** | Pick up your actual terminal sessions from your phone — an inline picker over `~/.claude/projects`, with the CLI's own AI titles, cross-project, cwd auto-detected. |
 | 🎤 **Vibe-code by voice** | Voice messages just work: local faster-whisper, bilingual zh/en, editable 🎤 transcript. No audio leaves your machine. |
-| 🌊 **Streaming replies** | Watch it build live — thinking, each tool call, then text — in one `⏳ Working…` message that morphs into the reply, with an elapsed ticker. |
+| 🌊 **Streaming replies** | Watch it build live in one status message that morphs into the reply: a spinner with elapsed seconds, a live thinking-token count, each tool call, then the answer streaming in. |
 | 🔘 **Buttons instead of a TUI** | Permissions (incl. the CLI's *don't-ask-again*), plan approval, and clarifying questions as inline buttons. Answered prompts clean themselves up. |
-| ⚡ **Type while it works** | Mid-turn follow-ups steer into the running answer (👀 to confirm) — never dropped, never a second turn. |
+| ⚡ **Type while it works** | Fire off follow-ups mid-turn; each is handed straight to the CLI (👀 marks it received) and answered in order — never dropped, never misrouted onto the wrong message. |
 | 💬 **Reads like a conversation** | Replies land right under the message they answer; reply to any message to quote it in; multi-forwards and split long texts arrive as one. |
-| 🧵 **Per-topic sessions** | Every forum topic is its own conversation — switch projects by switching topics. |
+| 🧵 **Per-topic sessions** | Every forum topic is its own conversation — switch projects by switching topics, or `/project` to re-point the current one at any project you've used. |
 | ⏩ **Every command and skill, verbatim** | Unknown `/commands` go straight to the CLI — `/compact`, your skills, anything headless — output relayed back. Nothing reimplemented. |
 | 🎛 **CLI parity** | `/model`, `/effort`, `/mode`, `/permissions`, `/usage`, `!shell` — from official APIs and the CLI itself, nothing hardcoded. |
 | 🖼 **Native media** | Images ride inside the message for the model to see; other files land in a TTL-cleaned dir. |
 | ♻️ **Restart-proof** | Topics stay bound across restarts — even hard crashes: interrupted turns auto-resume, and messages you sent while it was down are replayed. |
-| 🛡 **Reliable under load** | Send as fast as you like — replies and reactions pace and retry against Telegram's limits, so nothing errors out or is lost. |
+| 🛡 **Reliable under load** | Send as fast as you like — replies, live status edits and reactions all pace and retry against Telegram's limits, so a long streaming turn never trips flood control or drops a reply. |
 | 🟠 **Context warnings** | 🟠 at 80% / 🔴 at 90% of the real context window, same source as `/context`. |
 | 🔒 **Owner/guest profiles** | Allowlisted chats only; owner full access, guests scoped to specific dirs with Allow/Deny escalation. |
 
@@ -110,7 +110,7 @@ All in `.env` (see [.env.example](.env.example)):
 | `OWNER_DEFAULT_CWD` | Default working directory for new owner sessions |
 | `RESUME_SESSION_ID` | Session to bind the owner's DM to on first contact |
 | `GUEST_READ_DIRS` / `GUEST_WRITE_DIRS` | Colon-separated dirs guests may read / write |
-| `GUEST_SYSTEM_PROMPT_FILE` | Custom system prompt for the guest profile |
+| `GUEST_SYSTEM_PROMPT_FILE` | Optional: fully replace the guest prompt (default is the native preset + a short scope note) |
 | `WHISPER_MODEL` | faster-whisper model (default `large-v3-turbo`) |
 | `TGCLAUDE_MEDIA_TTL_DAYS` | Retention for received files (default 14) |
 
@@ -142,6 +142,7 @@ events and statelessness.
 | Command | What it does |
 |---|---|
 | `/resume` | Inline session picker (titles, project, age); `/resume <id>` binds directly |
+| `/project` | Pick a project you've worked in before — starts a fresh session in its dir |
 | `/clear` (`/new`) | Start a fresh session in this chat/topic |
 | `/status` | Current binding: session, project, model, effort |
 | `/model` | Live model picker — real names and context windows from `/v1/models` |
@@ -150,7 +151,7 @@ events and statelessness.
 | `/permissions` | View and revoke the allow rules accumulated by *don't-ask-again* |
 | `/export` | Send this session's transcript file |
 | `!command` | Bash mode — run a shell command directly in the session's cwd (owner-typed only) |
-| `/usage` | Subscription limits (5h / weekly / per-model / credits) |
+| `/usage` | Subscription limits (5h / weekly / per-model), shown as progress bars |
 | `/login` | Re-authenticate from your phone — relays `claude auth login`: tap the link, paste the code back |
 | `/whisper` | Pick the voice-transcription model |
 | `/esc` (`/stop`) | Interrupt the current turn — the CLI's ESC |
@@ -176,8 +177,9 @@ turns continue automatically.
 - Allowlisted chats only; everything else is ignored.
 - All secrets live in `.env` (chmod 600) — never in the systemd unit, which is
   world-readable.
-- Owner: full permissions. Guests: scoped read/write and a custom prompt;
-  out-of-scope tool calls escalate to the owner as Allow/Deny buttons.
+- Owner: full permissions. Guests: native Claude Code scoped to specific
+  read/write dirs; out-of-scope calls (Bash, other paths) escalate to the
+  owner as Allow/Deny buttons — that escalation is the real gate, not the prompt.
 - `!` bash mode is the one deliberate shell surface: owner-typed messages
   only — forwarded text never executes, guests never reach it.
 - Session management commands are owner-gated everywhere; so is `/mode` —
