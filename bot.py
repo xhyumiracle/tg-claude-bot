@@ -311,6 +311,8 @@ def _state_save() -> None:
 
 def persist_binding(conv: "Conversation") -> None:
     entry: dict = {"session_id": conv.session_id}
+    if conv.cwd:  # persist cwd so a fresh custom-cwd session survives a restart
+        entry["cwd"] = conv.cwd
     if conv.model:  # store overrides only; defaults stay implicit
         entry["model"] = conv.model
     if conv.effort:
@@ -607,6 +609,8 @@ def get_conv(update: Update) -> Conversation:
         # cwd comes from the CLI's own session file, not from our state.
         stored = stored_binding(key)
         if stored:
+            if stored.get("cwd"):     # restored for a fresh session; a resumed
+                conv.cwd = stored["cwd"]  # session's own file cwd overrides below
             ssid = stored.get("session_id")
             meta = find_session(ssid) if ssid else None
             if meta:
@@ -1623,6 +1627,51 @@ async def bind_session(update: Update, sid: str) -> None:
     )
 
 
+@menu("cd")
+async def _menu_projects(update: Update):
+    # distinct project dirs the CLI has sessions for (no free-text paths, so a
+    # typo can't drop you into an arbitrary dir); each button carries a
+    # representative sid, resolved back to its cwd on tap
+    items, seen = [], set()
+    for s in scan_sessions():
+        cwd = s["cwd"]
+        if not cwd or cwd in seen:
+            continue
+        seen.add(cwd)
+        proj = Path(cwd).name or cwd
+        items.append([InlineKeyboardButton(
+            f"[{proj}] {cwd}"[:60], callback_data=f"cd:{s['sid']}")])
+    return "Pick a project — a fresh session starts there", items, []
+
+
+async def cmd_project(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not chat_allowed(update) or not is_owner(update):
+        return
+    if not scan_sessions(limit=1):
+        await update.effective_message.reply_text(
+            "No projects yet — start a session first (/clear here, or in the CLI).")
+        return
+    await show_menu(update, "cd")
+
+
+async def switch_project(update: Update, sid: str) -> None:
+    """A distinct-cwd pick from /project: start a FRESH session in that
+    project's dir (like bind_session, but with no session_id — a new one)."""
+    meta = find_session(sid)
+    cwd = meta["cwd"] if meta else None
+    if not cwd:
+        await update.effective_message.reply_text("Project not found.")
+        return
+    conv = get_conv(update)
+    async with conv.lock:
+        await drop_client(conv)
+        conv.cwd = cwd
+        conv.session_id = None
+        persist_binding(conv)
+    await update.effective_message.reply_text(
+        f"Project → {Path(cwd).name}\ncwd: {cwd}\nFresh session on next message.")
+
+
 def _oauth_token() -> str:
     # Prefer the CLI's own account-scoped token in .credentials.json, which
     # the CLI refreshes on every turn (account scope is needed for the usage
@@ -2438,6 +2487,9 @@ async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     elif data.startswith("rs:"):
         await q.answer()
         await bind_session(update, data[3:])
+    elif data.startswith("cd:"):
+        await q.answer()
+        await switch_project(update, data[3:])
     elif data.startswith("pg:"):
         await q.answer()
         try:
@@ -2896,6 +2948,7 @@ async def post_init(app: Application) -> None:
     await _reconcile_state(app)
     cmds = [
         BotCommand("resume", "Resume a conversation"),
+        BotCommand("project", "Switch project — fresh session in an existing project dir"),
         BotCommand("clear", "Reset the conversation (fresh session)"),
         BotCommand("status", "Show current session binding"),
         BotCommand("esc", "Interrupt the current turn (the CLI's ESC)"),
@@ -3324,6 +3377,7 @@ def main() -> None:
     app.add_handler(CommandHandler("new", cmd_reset, filters=~filters.FORWARDED))
     app.add_handler(CommandHandler("reset", cmd_reset, filters=~filters.FORWARDED))
     app.add_handler(CommandHandler("resume", cmd_resume, filters=~filters.FORWARDED))
+    app.add_handler(CommandHandler("project", cmd_project, filters=~filters.FORWARDED))
     app.add_handler(CommandHandler("sessions", cmd_resume, filters=~filters.FORWARDED))
     app.add_handler(CommandHandler("status", cmd_status, filters=~filters.FORWARDED))
     app.add_handler(CommandHandler("stop", cmd_stop, filters=~filters.FORWARDED))
