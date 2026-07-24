@@ -378,7 +378,8 @@ def _multi_kb(token: str, options: list, selected: set) -> InlineKeyboardMarkup:
 
 
 async def ask_buttons_multi(
-    conv: "Conversation", text: str, options: list, timeout: float = 3600,
+    conv: "Conversation", text: str, options: list,
+    timeout: Optional[float] = None,   # native: wait for the user, no auto-deny
     allowed_user: int = 0,
 ) -> Optional[list]:
     """Native multiSelect: toggle options, ✅ Done resolves with the indices."""
@@ -415,7 +416,8 @@ async def ask_buttons_multi(
 
 
 async def ask_buttons(
-    conv: "Conversation", text: str, options: list, timeout: float = 3600,
+    conv: "Conversation", text: str, options: list,
+    timeout: Optional[float] = None,   # native: wait for the user, no auto-deny
     allowed_user: int = 0, parse_mode: Optional[str] = None,
     ephemeral: bool = False,
 ) -> Optional[int]:
@@ -786,7 +788,7 @@ async def ask_owner_permission(conv: Conversation, tool_name: str,
         if rules:
             text += f"\n♻️ <code>{_h.escape(rules)}</code>"
         labels.insert(1, "♻️ Always allow (don't ask again)")
-    idx = await ask_buttons(conv, text, labels, timeout=180,
+    idx = await ask_buttons(conv, text, labels,
                             parse_mode="HTML", ephemeral=True)
     if idx is None:  # unanswered ≠ refused; let the model tell the user
         return "timeout"
