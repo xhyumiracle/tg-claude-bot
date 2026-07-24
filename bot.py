@@ -597,12 +597,12 @@ def get_conv(update: Update) -> Conversation:
                 key=key, profile="owner", cwd=cwd, session_id=sid
             )
         else:
-            # fallback cwd is a persistent private scratch dir, NOT $HOME:
-            # pathless Glob/Grep stay scoped to an empty dir (see PLAYGROUND_DIR)
+            # new topics start in the neutral playground (a private 0700 scratch
+            # dir), NOT a configured project — use /project to switch into one.
+            # Pathless Glob/Grep stay scoped to an empty dir (nothing to leak).
             conv = Conversation(
                 key=key, profile="guest",
-                cwd=str(GUEST_READ_DIRS[0]) if GUEST_READ_DIRS
-                else str(PLAYGROUND_DIR)
+                cwd=str(PLAYGROUND_DIR),
             )
         # Restart continuity: a topic keeps pointing at the session it was on.
         # The stored binding wins over static defaults — it is more recent.
@@ -2863,8 +2863,7 @@ async def _recover_conv(app: Application, key: ConvKey, ent: dict) -> None:
         conv = Conversation(
             key=key,
             profile="owner" if (chat_id == OWNER_ID and thread == 0) else "guest",
-            cwd=meta["cwd"] or (str(GUEST_READ_DIRS[0]) if GUEST_READ_DIRS
-                                else str(PLAYGROUND_DIR)),
+            cwd=meta["cwd"] or str(PLAYGROUND_DIR),
             session_id=sid,
         )
         conv.model = binding.get("model")
