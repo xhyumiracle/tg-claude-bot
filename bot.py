@@ -1055,7 +1055,8 @@ class LiveStatus:
         self.text = ""
         self.anchor_fn = anchor_fn
         self.anchor = self._UNSET  # resolved once: a Message, or None
-        self._creating = False     # a first send is in flight (flood-safe)
+        self._lock = asyncio.Lock()  # serialize update() vs finalize()
+        self._done = False           # finalized: a late create/edit is a no-op
 
     def _resolve(self):
         if self.anchor is self._UNSET:
@@ -1070,58 +1071,60 @@ class LiveStatus:
             text, do_quote=False, **kw)
 
     async def update(self, update_obj: Update, text: str) -> None:
-        now = time.time()
-        if self.msg is None:
-            # Only ONE first-send may be in flight. Under flood control a send
-            # can block for tens of seconds; without this guard every later
-            # call would see msg=None and send AGAIN, piling up duplicate
-            # frozen bubbles. Skip while one is creating.
-            if self._creating:
+        # The lock serializes this (the ticker's bubble create/edit) against
+        # finalize(). Without it, a create's send can still be in flight (msg
+        # is None) when finalize runs — finalize then sends the reply as a
+        # NEW message and this create lands afterward as an orphan "Working…"
+        # bubble. The lock also collapses the flood-era duplicate-bubble pile:
+        # a slow create holds the lock, so later calls edit instead of re-send.
+        async with self._lock:
+            if self._done:  # already finalized — a late create would orphan
                 return
-            self._creating = True
+            now = time.time()
+            if self.msg is None:
+                try:
+                    self.msg = await self._send(
+                        update_obj, text, disable_notification=True)
+                    self.last, self.text = now, text
+                except Exception:
+                    pass
+                return
+            if now - self.last < 6.0 or text == self.text:
+                return
             try:
-                self.msg = await self._send(
-                    update_obj, text, disable_notification=True)
+                await self.msg.edit_text(text)
                 self.last, self.text = now, text
             except Exception:
                 pass
-            finally:
-                self._creating = False
-            return
-        if now - self.last < 6.0 or text == self.text:
-            return
-        try:
-            await self.msg.edit_text(text)
-            self.last, self.text = now, text
-        except Exception:
-            pass
 
     async def finalize(self, update_obj: Update, reply: str) -> None:
-        if self.msg is None:
-            if reply:
-                await send_long(update_obj, reply, anchor=self._resolve())
-            return
-        if not reply:
+        async with self._lock:
+            self._done = True  # from here, a late ticker update() is a no-op
+            if self.msg is None:
+                if reply:
+                    await send_long(update_obj, reply, anchor=self._resolve())
+                return
+            if not reply:
+                try:
+                    await self.msg.delete()
+                except Exception:
+                    pass
+                return
+            if len(reply) <= 4000:
+                try:
+                    await self.msg.edit_text(reply, parse_mode=ParseMode.MARKDOWN)
+                    return
+                except Exception:
+                    try:
+                        await self.msg.edit_text(reply)
+                        return
+                    except Exception:
+                        pass
             try:
                 await self.msg.delete()
             except Exception:
                 pass
-            return
-        if len(reply) <= 4000:
-            try:
-                await self.msg.edit_text(reply, parse_mode=ParseMode.MARKDOWN)
-                return
-            except Exception:
-                try:
-                    await self.msg.edit_text(reply)
-                    return
-                except Exception:
-                    pass
-        try:
-            await self.msg.delete()
-        except Exception:
-            pass
-        await send_long(update_obj, reply, anchor=self._resolve())
+            await send_long(update_obj, reply, anchor=self._resolve())
 
 
 def _tool_brief(block: ToolUseBlock) -> str:
