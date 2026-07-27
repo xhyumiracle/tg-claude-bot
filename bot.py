@@ -1142,6 +1142,15 @@ def _preview_tail(s: str, n: int = 160) -> str:
     return ("…" + s[-n:]) if len(s) > n else s
 
 
+def _bar(pct: float, width: int = 10) -> str:
+    """The ONE progress-bar renderer (used by /status, /context, /usage).
+    Filled cells are █; empty cells are the hollow □ rather than the light-
+    shade ░, which on some fonts looks solid — so a near-empty bar read as
+    full. Now 0% is clearly all-hollow."""
+    n = max(0, min(width, round(pct / (100 / width))))
+    return "█" * n + "□" * (width - n)
+
+
 _USAGE_PCT_RE = re.compile(r"(\d+)% used")
 
 
@@ -1151,8 +1160,7 @@ def _usage_barify(text: str) -> str:
     left untouched. Applied as a one-shot pump transform, only for /usage."""
     def repl(m):
         pct = int(m.group(1))
-        n = max(0, min(10, round(pct / 10)))
-        return f"{pct}% {'█' * n}{'░' * (10 - n)}"
+        return f"{pct}% {_bar(pct)}"
     return _USAGE_PCT_RE.sub(repl, text)
 
 
@@ -1607,6 +1615,19 @@ async def show_menu(update: Update, key: str, page: int = 0, edit_query=None) ->
         await update.effective_message.reply_text(f"{title}:", reply_markup=kb)
 
 
+def _q_editor(q):
+    """A reply(text) that edits the tapped menu message in place — swapping
+    its text for the confirmation and dropping the buttons. The ONE 'a menu
+    choice was made' effect, shared by every selection callback so /model,
+    /effort, /mode, /whisper, /resume and /project all behave the same."""
+    async def _edit(text: str) -> None:
+        try:
+            await q.edit_message_text(text)
+        except Exception:
+            pass
+    return _edit
+
+
 @menu("ss")
 async def _menu_sessions(update: Update):
     items = []
@@ -1636,10 +1657,11 @@ async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await show_menu(update, "ss")
 
 
-async def bind_session(update: Update, sid: str) -> None:
+async def bind_session(update: Update, sid: str, reply=None) -> None:
+    reply = reply or update.effective_message.reply_text
     meta = find_session(sid)
     if meta is None:
-        await update.effective_message.reply_text(f"Session {sid} not found.")
+        await reply(f"Session {sid} not found.")
         return
     conv = get_conv(update)
     async with conv.lock:
@@ -1648,7 +1670,7 @@ async def bind_session(update: Update, sid: str) -> None:
         if meta["cwd"]:
             conv.cwd = meta["cwd"]
         persist_binding(conv)
-    await update.effective_message.reply_text(
+    await reply(
         f"Bound to {sid[:8]}… ({meta['label'] or 'no label'})\ncwd: {conv.cwd}"
     )
 
@@ -1680,13 +1702,14 @@ async def cmd_project(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await show_menu(update, "cd")
 
 
-async def switch_project(update: Update, sid: str) -> None:
+async def switch_project(update: Update, sid: str, reply=None) -> None:
     """A distinct-cwd pick from /project: start a FRESH session in that
     project's dir (like bind_session, but with no session_id — a new one)."""
+    reply = reply or update.effective_message.reply_text
     meta = find_session(sid)
     cwd = meta["cwd"] if meta else None
     if not cwd:
-        await update.effective_message.reply_text("Project not found.")
+        await reply("Project not found.")
         return
     conv = get_conv(update)
     async with conv.lock:
@@ -1694,7 +1717,7 @@ async def switch_project(update: Update, sid: str) -> None:
         conv.cwd = cwd
         conv.session_id = None
         persist_binding(conv)
-    await update.effective_message.reply_text(
+    await reply(
         f"Project → {Path(cwd).name}\ncwd: {cwd}\nFresh session on next message.")
 
 
@@ -2404,8 +2427,7 @@ async def cmd_status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     limit = await _context_limit(conv, total)
     pct = total * 100 / limit if total else 0
     icon = "🔴" if pct >= 90 else "🟠" if pct >= 80 else "🧠"
-    n = max(0, min(10, round(pct / 10)))
-    cline = (f"{icon} Context {pct:.0f}% {'█' * n}{'░' * (10 - n)} "
+    cline = (f"{icon} Context {pct:.0f}% {_bar(pct)} "
              f"({total // 1000}k / {limit // 1000}k)")
     # A session's first turn writes no usage record until it completes, so
     # context reads 0 mid-turn — show the line anyway (annotated) rather than
@@ -2524,10 +2546,10 @@ async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
                 pass
     elif data.startswith("rs:"):
         await q.answer()
-        await bind_session(update, data[3:])
+        await bind_session(update, data[3:], _q_editor(q))
     elif data.startswith("cd:"):
         await q.answer()
-        await switch_project(update, data[3:])
+        await switch_project(update, data[3:], _q_editor(q))
     elif data.startswith("pg:"):
         await q.answer()
         try:
@@ -2542,35 +2564,18 @@ async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
                 pass
     elif data.startswith("wm:"):
         await q.answer()
-        async def _edit(text: str) -> None:
-            try:
-                await q.edit_message_text(text)
-            except Exception:
-                pass
-        await set_whisper_model(_edit, data[3:])
+        await set_whisper_model(_q_editor(q), data[3:])
     elif data.startswith("md:") or data.startswith("ef:"):
         await q.answer()
         conv = get_conv(update)
-
-        async def _edit2(text: str) -> None:
-            try:
-                await q.edit_message_text(text)
-            except Exception:
-                pass
         if data.startswith("md:"):
-            await apply_model(_edit2, conv, data[3:])
+            await apply_model(_q_editor(q), conv, data[3:])
         else:
-            await apply_effort(_edit2, conv, data[3:])
+            await apply_effort(_q_editor(q), conv, data[3:])
     elif data.startswith("pm:"):
         await q.answer()
         conv = get_conv(update)
-
-        async def _edit3(text: str) -> None:
-            try:
-                await q.edit_message_text(text)
-            except Exception:
-                pass
-        await apply_perm_mode(_edit3, conv, data[3:])
+        await apply_perm_mode(_q_editor(q), conv, data[3:])
     elif data.startswith("pr:"):
         try:
             _, idx_s, sig = data.split(":", 2)
