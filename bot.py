@@ -276,6 +276,9 @@ class Conversation:
     # the pump turns that turn's is_error ResultMessage (an SDK abort diagnostic,
     # not a real failure) into a friendly "⏹ Stopped." then clears the flag.
     interrupted: bool = False
+    # a brand-new topic (created with no prior binding): on_message pops the
+    # project picker once so the owner needn't remember /project, then clears it.
+    fresh: bool = False
 
 
 conversations: Dict[ConvKey, Conversation] = {}
@@ -626,6 +629,7 @@ def get_conv(update: Update) -> Conversation:
             conv.model = stored.get("model") or conv.model
             conv.effort = stored.get("effort") or conv.effort
             conv.perm_mode = stored.get("perm_mode") or conv.perm_mode
+        conv.fresh = not stored  # no prior binding → a genuinely new topic
         conversations[key] = conv
     return conversations[key]
 
@@ -952,10 +956,11 @@ def make_permission_cb(conv: Conversation):
                 )
             if choice == "timeout":
                 return PermissionResultDeny(
-                    message=f"{tool_name}: the permission prompt went "
-                            "unanswered for 180s — a timeout, not a refusal. "
-                            "If the call is still needed, tell the user to "
-                            "watch for the next prompt and retry."
+                    message=f"{tool_name}: the permission prompt could not be "
+                            "delivered or was interrupted (e.g. a restart) — "
+                            "not a refusal and not a timeout (prompts never "
+                            "time out). If the call is still needed, retry so a "
+                            "fresh prompt is shown."
                 )
         return PermissionResultDeny(
             message=f"{tool_name} denied by scope policy (path={path!r})."
@@ -1697,6 +1702,10 @@ async def _menu_projects(update: Update):
         proj = Path(cwd).name or cwd
         items.append([InlineKeyboardButton(
             f"[{proj}] {cwd}"[:60], callback_data=f"cd:{s['sid']}")])
+    # fallback at the bottom: back to the neutral scratch dir (sids are 32+ char
+    # uuids, so "playground" can never collide with a real session id)
+    items.append([InlineKeyboardButton(
+        "playground", callback_data="cd:playground")])
     return "Pick a project — a fresh session starts there", items, []
 
 
@@ -1714,8 +1723,11 @@ async def switch_project(update: Update, sid: str, reply=None) -> None:
     """A distinct-cwd pick from /project: start a FRESH session in that
     project's dir (like bind_session, but with no session_id — a new one)."""
     reply = reply or update.effective_message.reply_text
-    meta = find_session(sid)
-    cwd = meta["cwd"] if meta else None
+    if sid == "playground":            # the menu's fallback → scratch dir
+        cwd = str(PLAYGROUND_DIR)
+    else:
+        meta = find_session(sid)
+        cwd = meta["cwd"] if meta else None
     if not cwd:
         await reply("Project not found.")
         return
@@ -2761,6 +2773,11 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # code — consume it before bash mode and the settle buffer, never let it
     # enter a turn (guests and forwards pass through untouched)
     conv = get_conv(update)
+    # brand-new topic: auto-offer the project picker once (so the owner needn't
+    # remember /project), then fall through and answer as usual — non-blocking.
+    if conv.fresh and is_owner(update) and scan_sessions(limit=1):
+        conv.fresh = False
+        await show_menu(update, "cd")
     if (conv.login and is_owner(update)
             and not getattr(msg, "forward_origin", None)):
         await _login_paste(update, conv, msg.text)
@@ -2829,17 +2846,28 @@ async def restart_watcher(app: Application) -> None:
                           for f in owned)
         except OSError:
             overdue = False
-        if (busy or _state.get("inflight")) and not overdue:
+        # a prompt awaiting the user is NOT a self-deadlock (we're blocked on a
+        # human, not on ourselves), so it holds the restart even past the grace
+        # deadline — forcing through it is exactly the "⌛️ expired + stuck" bug.
+        # Native waits forever for a permission answer; so do we. Tapping
+        # Allow/Deny clears the prompt and releases the deploy; the deadline
+        # still forces through busy *turns*, which auto-recover losslessly.
+        awaiting_user = bool(_state.get("prompts"))
+        if awaiting_user or ((busy or _state.get("inflight")) and not overdue):
             if not wait_notified:
                 wait_notified = True
                 try:
+                    if awaiting_user:
+                        note = ("⏳ Restart queued — waiting for an unanswered "
+                                "prompt. Tap Allow/Deny to release it (I won't "
+                                "expire it out from under you).")
+                    else:
+                        note = (f"⏳ Restart queued — waiting for {len(busy)} "
+                                "busy conversation(s); forcing in "
+                                f"≤{RESTART_GRACE_S // 60} min (interrupted "
+                                "turns auto-recover).")
                     m = await app.bot.send_message(
-                        chat_id=OWNER_ID,
-                        text=(f"⏳ Restart queued — waiting for {len(busy)} "
-                              "busy conversation(s); forcing in "
-                              f"≤{RESTART_GRACE_S // 60} min (interrupted "
-                              "turns auto-recover)."),
-                        disable_notification=True,
+                        chat_id=OWNER_ID, text=note, disable_notification=True,
                     )
                     # reuse THIS message for the whole restart→online lifecycle,
                     # so queued / restarting / online are one morphing message
