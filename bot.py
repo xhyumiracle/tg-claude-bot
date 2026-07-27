@@ -2394,13 +2394,18 @@ async def cmd_status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         mline += f" · effort: {conv.effort}"
     lines.append(mline)
     total = await asyncio.to_thread(_session_context_tokens, conv.session_id)
-    if total:
-        limit = await _context_limit(conv, total)
-        pct = total * 100 / limit
-        icon = "🔴" if pct >= 90 else "🟠" if pct >= 80 else "🧠"
-        n = max(0, min(10, round(pct / 10)))
-        lines.append(f"{icon} Context {pct:.0f}% {'█' * n}{'░' * (10 - n)} "
-                     f"({total // 1000}k / {limit // 1000}k)")
+    limit = await _context_limit(conv, total)
+    pct = total * 100 / limit if total else 0
+    icon = "🔴" if pct >= 90 else "🟠" if pct >= 80 else "🧠"
+    n = max(0, min(10, round(pct / 10)))
+    cline = (f"{icon} Context {pct:.0f}% {'█' * n}{'░' * (10 - n)} "
+             f"({total // 1000}k / {limit // 1000}k)")
+    # A session's first turn writes no usage record until it completes, so
+    # context reads 0 mid-turn — show the line anyway (annotated) rather than
+    # hiding it, so /status always carries a context reading.
+    if not total and conv.pending:
+        cline += " · first turn in progress"
+    lines.append(cline)
     if conv.pending:
         lines.append(f"⏳ {len(conv.pending)} message(s) being worked on")
     await update.effective_message.reply_text("\n".join(lines))
