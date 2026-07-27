@@ -2248,13 +2248,15 @@ async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text("Session file not found.")
 
 
-# The CLI's shift+tab cycle, labels verbatim from the binary's own
-# indicator table (symbol + label + the bypass dialog's term).
+# The CLI's four shift+tab modes. Native shows these as a cycling status
+# line ("accept edits on"); a Telegram menu instead needs a single-select
+# list, so labels are mode NAMES (native symbols kept) and the title carries
+# the current mode plus a one-line gloss of what each does.
 PERM_MODES = [
     ("default", "default"),
-    ("acceptEdits", "⏵⏵ accept edits on"),
-    ("plan", "⏸ plan mode on"),
-    ("bypassPermissions", "⏵⏵ auto mode on (bypass permissions)"),
+    ("acceptEdits", "⏵⏵ accept edits"),
+    ("plan", "⏸ plan"),
+    ("bypassPermissions", "⏵⏵ bypass (no guardrails)"),
 ]
 PERM_MODE_LABEL = dict(PERM_MODES)
 
@@ -2263,13 +2265,18 @@ PERM_MODE_LABEL = dict(PERM_MODES)
 async def _menu_perm_mode(update: Update):
     conv = get_conv(update)
     active = conv.perm_mode or "default"
+    # ● = current, ○ = the others — radio dots make it read as pick-one.
     items = [[InlineKeyboardButton(
-        f"{'✓ ' if m == active else ''}{label}",
+        f"{'● ' if m == active else '○ '}{label}",
         callback_data=f"pm:{m}",
     )] for m, label in PERM_MODES]
-    title = ("Permission mode — the CLI's shift+tab cycle, per conversation.\n"
-             "⚠️ bypass permissions removes every guardrail here, including "
-             "the guest sandbox.")
+    title = (
+        f"Permission mode · pick one (now: {PERM_MODE_LABEL[active]})\n"
+        "• default — ask before each action\n"
+        "• accept edits — auto-approve file edits, still ask for the rest\n"
+        "• plan — read-only, plan before doing anything\n"
+        "• bypass — skip every prompt ⚠️ drops all guardrails, incl. the "
+        "guest sandbox")
     return title, items, []
 
 
