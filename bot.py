@@ -272,6 +272,10 @@ class Conversation:
     # /esc coverage for a running `!cmd` shell (issue #1): the bash command
     # is killable via bash_proc.
     bash_proc: Optional[object] = None
+    # /esc set this right before interrupt() when a turn is actually running;
+    # the pump turns that turn's is_error ResultMessage (an SDK abort diagnostic,
+    # not a real failure) into a friendly "⏹ Stopped." then clears the flag.
+    interrupted: bool = False
 
 
 conversations: Dict[ConvKey, Conversation] = {}
@@ -1395,10 +1399,14 @@ async def _pump(conv: "Conversation") -> None:
                     elif isinstance(m, ResultMessage):
                         conv.working_since = None  # turn done: stop the ticker
                         if m.is_error:
-                            err = (m.result or "; ".join(
-                                str(e) for e in (m.errors or []))
-                                or "unknown error")
-                            buf.append(f"⚠️ Turn failed: {str(err)[:500]}")
+                            if conv.interrupted:  # user pressed stop, not a bug
+                                buf.append("⏹ Stopped.")
+                            else:
+                                err = (m.result or "; ".join(
+                                    str(e) for e in (m.errors or []))
+                                    or "unknown error")
+                                buf.append(f"⚠️ Turn failed: {str(err)[:500]}")
+                        conv.interrupted = False  # one-shot: consumed this turn
                         await flush()
                         n_tools = 0
                         head, detail, txt, think_tokens = "Working…", "", "", 0
@@ -2384,9 +2392,12 @@ async def cmd_stop(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     # interrupt is a no-op if the CLI is idle, so just send it whenever a
     # client exists (the pump model has no turn-lock to gate on)
     try:
+        if conv.working_since is not None:  # a turn is live: its abort is ours
+            conv.interrupted = True
         await conv.client.interrupt()
         await update.effective_message.reply_text("⏹ Interrupt sent.")
     except Exception as e:
+        conv.interrupted = False
         await update.effective_message.reply_text(f"Interrupt failed: {e}")
 
 
