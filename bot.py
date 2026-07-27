@@ -2265,9 +2265,9 @@ PERM_MODE_LABEL = dict(PERM_MODES)
 async def _menu_perm_mode(update: Update):
     conv = get_conv(update)
     active = conv.perm_mode or "default"
-    # ● = current, ○ = the others — radio dots make it read as pick-one.
+    # ✓ marks the active choice — same convention as /model, /effort, /whisper.
     items = [[InlineKeyboardButton(
-        f"{'● ' if m == active else '○ '}{label}",
+        f"{'✓ ' if m == active else ''}{label}",
         callback_data=f"pm:{m}",
     )] for m, label in PERM_MODES]
     title = (
