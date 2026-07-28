@@ -2795,6 +2795,25 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _fwd_add(update, ctx)
 
 
+async def on_topic_created(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """A forum topic was just created — pop the project picker BEFORE the owner
+    types anything, so the choice happens up front (no first-message-in-
+    playground awkwardness). This is a no-text service message, which the TEXT
+    handler never sees; that's why the picker otherwise only appeared on the
+    first message. Whether Telegram delivers this event to bots is not
+    guaranteed, so the first-message path in on_message stays as the fallback —
+    conv.fresh, cleared here, dedups the two so the menu never doubles up."""
+    if not chat_allowed(update) or not is_owner(update):
+        return
+    conv = get_conv(update)
+    if conv.fresh and scan_sessions(limit=1):
+        conv.fresh = False
+        try:
+            await show_menu(update, "cd")
+        except Exception:
+            log.exception("topic-created picker failed")
+
+
 async def notify_owner(app: Application, text: str) -> None:
     try:
         await app.bot.send_message(
@@ -3486,6 +3505,8 @@ def main() -> None:
     app.add_handler(MessageHandler(
         filters.Document.ALL & ~filters.Document.IMAGE, on_document
     ))
+    app.add_handler(MessageHandler(
+        filters.StatusUpdate.FORUM_TOPIC_CREATED, on_topic_created))
     app.add_handler(MessageHandler(
         filters.TEXT & (~filters.COMMAND | filters.FORWARDED), on_message))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
