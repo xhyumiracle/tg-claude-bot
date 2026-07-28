@@ -18,7 +18,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
-from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+from claude_agent_sdk import (
+    ClaudeAgentOptions, ClaudeSDKClient, create_sdk_mcp_server, tool)
 from claude_agent_sdk.types import (
     AssistantMessage,
     PermissionResultAllow,
@@ -106,6 +107,8 @@ You are reached over Telegram, in a group chat.
   work but escalate to the owner for Allow/Deny — use them when a task needs it;
   don't refuse pre-emptively.
 - Keep replies concise and Telegram-friendly (short code fences, no giant tables).
+- To hand the user a file (PDF, image, archive, ...), call the send_file tool with an
+  absolute path; it uploads to this chat. Don't call the Telegram API directly.
 """
 
 # A GUEST_SYSTEM_PROMPT_FILE fully replaces the preset (advanced override).
@@ -123,8 +126,9 @@ OWNER_APPEND = """
 You are reached over Telegram, in a chat with the owner of this machine.
 When a session is resumed, its full history is your context.
 Telegram etiquette: keep replies concise, prefer plain text or minimal Markdown, no giant
-tables or long code fences. For large outputs (files, PDFs), write them to disk and reply
-with the path, or send them via the bot API if asked.
+tables or long code fences. To hand the user a file (PDF, image, archive, .docx/.xlsx, log),
+call the send_file tool with an absolute path — it uploads to THIS chat for you. Don't
+construct a chat_id or call the Telegram API yourself; that can't know which topic you're in.
 """
 
 # Owner-only bot-side shell commands (data-driven; extend by adding entries).
@@ -655,6 +659,75 @@ async def drop_client(conv: Conversation) -> None:
 SYSTEM_CLI = shutil.which("claude")
 
 
+# ---------- file delivery (native tool) ----------
+# The agent hands a file to the user by CALLING send_file(path=...) — a real
+# tool, not a text convention. Routing is bot-side: the tool closes over `conv`
+# so it always uploads to the right chat/topic, and the agent never needs a
+# chat_id, a thread_id, or the bot token. This replaces the old "call the
+# Telegram API yourself" note, which broke once topics existed (the agent had no
+# way to know the current topic's coordinates).
+TG_SEND_TOOL = "mcp__tgclaude__send_file"  # our runtime-identity prefix, collision-proof
+SEND_MAX_BYTES = 50 * 1000 * 1000  # Telegram bot sendDocument limit (decimal MB)
+
+
+async def _send_file(args: dict, conv: "Conversation") -> dict:
+    def err(msg: str) -> dict:
+        return {"content": [{"type": "text", "text": f"send_file: {msg}"}],
+                "is_error": True}
+    raw = (args.get("path") or "").strip()
+    if not raw:
+        return err("'path' is required (absolute path to the file).")
+    p = Path(os.path.expanduser(raw))
+    try:
+        p = p.resolve()
+    except Exception:
+        pass
+    if not p.is_file():
+        return err(f"no file at {raw!r}.")
+    # guests may only send from the same sandbox they can already read/write —
+    # the owner (full-trust) can send anything.
+    if conv.profile != "owner":
+        roots = [*GUEST_READ_DIRS, *GUEST_WRITE_DIRS, Path(conv.cwd)]
+        if not any(is_under(str(p), r) for r in roots):
+            return err(f"{p} is outside the allowed dirs; denied.")
+    try:
+        size = p.stat().st_size
+    except OSError:
+        size = 0
+    if size > SEND_MAX_BYTES:
+        return err(f"{p.name} is {size / 1e6:.1f} MB, over Telegram's 50 MB bot "
+                   "limit — split it or share another way.")
+    if app_ref is None:
+        return err("bot not ready.")
+    chat_id, thread = conv.key
+    try:
+        with p.open("rb") as fh:
+            await app_ref.bot.send_document(
+                chat_id=chat_id, message_thread_id=thread or None,
+                document=fh, filename=p.name)
+    except Exception as e:
+        return err(f"upload failed: {e}")
+    return {"content": [{"type": "text",
+                         "text": f"Sent {p.name} ({size / 1e6:.1f} MB) to the "
+                                 "user in this chat."}]}
+
+
+def _tg_mcp_server(conv: "Conversation"):
+    @tool(
+        "send_file",
+        "Send a file from disk to the user in THIS Telegram chat, as a real "
+        "downloadable attachment. Pass an absolute path in `path`. Use this for "
+        "deliverables (PDFs, images, archives, .docx/.xlsx, logs) instead of "
+        "pasting large content — routing to the correct chat/topic is handled "
+        "for you, so never construct a chat_id or call the Telegram API "
+        "yourself.",
+        {"path": str},
+    )
+    async def send_file(args):
+        return await _send_file(args, conv)
+    return create_sdk_mcp_server("tgclaude", tools=[send_file])
+
+
 def build_options(conv: Conversation) -> ClaudeAgentOptions:
     if conv.profile == "owner":
         return ClaudeAgentOptions(
@@ -672,6 +745,7 @@ def build_options(conv: Conversation) -> ClaudeAgentOptions:
             effort=conv.effort,
             include_partial_messages=True,  # live thinking/text stream for status
             setting_sources=["user", "project"],
+            mcp_servers={"tgclaude": _tg_mcp_server(conv)},  # send_file
         )
     return ClaudeAgentOptions(
         cli_path=SYSTEM_CLI,
@@ -680,7 +754,8 @@ def build_options(conv: Conversation) -> ClaudeAgentOptions:
                              "append": GUEST_APPEND}),
         cwd=conv.cwd,
         add_dirs=[str(d) for d in GUEST_WRITE_DIRS],
-        allowed_tools=sorted(READ_TOOLS | WRITE_TOOLS | WEB_TOOLS),
+        allowed_tools=sorted(READ_TOOLS | WRITE_TOOLS | WEB_TOOLS) + [TG_SEND_TOOL],
+        mcp_servers={"tgclaude": _tg_mcp_server(conv)},  # send_file (scope-checked)
         can_use_tool=make_permission_cb(conv),
         permission_mode=conv.perm_mode or "default",
         resume=conv.session_id,
@@ -937,6 +1012,8 @@ def make_permission_cb(conv: Conversation):
     async def _can_use_tool(tool_name: str, tool_input: dict, ctx: ToolPermissionContext):
         if tool_name == "AskUserQuestion":
             return await handle_ask_user_question(conv, tool_input)
+        if tool_name == TG_SEND_TOOL:  # our own tool; scope enforced in _send_file
+            return PermissionResultAllow(updated_input=tool_input)
         if tool_name in WEB_TOOLS:
             return PermissionResultAllow(updated_input=tool_input)
         path = extract_path(tool_input)
