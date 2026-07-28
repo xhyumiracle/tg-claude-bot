@@ -248,6 +248,9 @@ class Conversation:
     session_id: Optional[str] = None
     client: Optional[ClaudeSDKClient] = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # serializes lazy client creation ONLY — a dedicated lock (not `lock`) so it
+    # can never deadlock against a `lock` holder that also needs a client.
+    client_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     last_user_id: int = 0
     model: Optional[str] = None
     effort: Optional[str] = None
@@ -687,14 +690,23 @@ def build_options(conv: Conversation) -> ClaudeAgentOptions:
 
 
 async def ensure_client(conv: Conversation) -> ClaudeSDKClient:
-    if conv.client is None:
-        client = ClaudeSDKClient(options=build_options(conv))
-        await client.connect()
-        conv.client = client
-        # one continuous consumer for this client's whole life
-        conv.pump = asyncio.create_task(_pump(conv))
-        log.info("connected %s profile=%s resume=%s cwd=%s",
-                 conv.key, conv.profile, conv.session_id, conv.cwd)
+    # Lazy init straddles an await (connect), so a plain `if None` check-then-set
+    # is a race: under concurrent_updates(True), two messages that skip the
+    # settle buffer (e.g. two voice notes fired back-to-back) can BOTH see
+    # client is None and each spin up a client + pump on the SAME cwd — two live
+    # agents editing the same files, each seeing the other's writes like a
+    # stranger. Double-checked locking makes only the first caller build it.
+    if conv.client is not None:
+        return conv.client
+    async with conv.client_lock:
+        if conv.client is None:
+            client = ClaudeSDKClient(options=build_options(conv))
+            await client.connect()
+            conv.client = client
+            # one continuous consumer for this client's whole life
+            conv.pump = asyncio.create_task(_pump(conv))
+            log.info("connected %s profile=%s resume=%s cwd=%s",
+                     conv.key, conv.profile, conv.session_id, conv.cwd)
     return conv.client
 
 
