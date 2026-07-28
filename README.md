@@ -36,7 +36,7 @@ terminal. The bot is a thin stateless router; the CLI owns everything.
 | 🧵 **Per-topic sessions** | Every forum topic is its own conversation — switch projects by switching topics, or `/project` to re-point the current one at any project you've used. |
 | ⏩ **Every command and skill, verbatim** | Unknown `/commands` go straight to the CLI — `/compact`, your skills, anything headless — output relayed back. Nothing reimplemented. |
 | 🎛 **CLI parity** | `/model`, `/effort`, `/mode`, `/permissions`, `/usage`, `!shell` — from official APIs and the CLI itself, nothing hardcoded. |
-| 🖼 **Native media** | Images ride inside the message for the model to see; other files land in a TTL-cleaned dir. |
+| 🖼 **Native media** | Images ride inside the message for the model to see; other files land in a TTL-cleaned dir. Sending files back is just as native — the agent calls a `send_file` tool and the bot uploads it to the current topic, so it never has to guess a chat or thread id. |
 | ♻️ **Restart-proof** | Topics stay bound across restarts — even hard crashes: interrupted turns auto-resume, and messages you sent while it was down are replayed. |
 | 🛡 **Reliable under load** | Send as fast as you like — replies, live status edits and reactions all pace and retry against Telegram's limits, so a long streaming turn never trips flood control or drops a reply. |
 | 🟠 **Context warnings** | 🟠 at 80% / 🔴 at 90% of the real context window, same source as `/context`. |
