@@ -172,6 +172,11 @@ pointer file (`~/.tgclaude/`) — which topic resumes which session, plus what
 was mid-flight. Kill the bot — or the power — and topics rebind, interrupted
 turns continue automatically.
 
+Sessions started over Telegram are tagged `entrypoint: sdk-py` (they're created
+through the Agent SDK), so the interactive `claude` resume picker — which lists
+only `cli`/`claude-vscode` sessions — won't show them. The files are normal and
+resumable; open one in a terminal by id: `claude --resume <session-id>`.
+
 ## 🔒 Security model
 
 - Allowlisted chats only; everything else is ignored.
