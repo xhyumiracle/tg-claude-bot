@@ -1744,7 +1744,7 @@ async def _pump(conv: "Conversation") -> None:
                 break
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as e:
                 # A crash while the CLI subprocess is still alive would orphan
                 # any self-triggered (task-notification) turn until the next
                 # human message. Re-enter the consumer on the SAME client so
@@ -1755,10 +1755,40 @@ async def _pump(conv: "Conversation") -> None:
                 now = time.time()
                 crashes[:] = [t for t in crashes if now - t < 60.0]
                 crashes.append(now)
-                if len(crashes) >= 4:
-                    log.error("pump for %s crashed %d×/60s; giving up "
-                              "(re-arms on next message)", conv.key,
-                              len(crashes))
+                # An oversized single message re-crashes on every retry (the same
+                # message is re-read), so don't burn the 4-strike budget — abort
+                # now with a clear reason. Otherwise give up only after repeated
+                # crashes. Either way TELL the user, don't hang on "Working…".
+                oversized = "maximum buffer size" in str(e)
+                if oversized or len(crashes) >= 4:
+                    if oversized:
+                        note = ("⚠️ This turn produced a single result too large "
+                                f"to read (over {MAX_BUFFER_SIZE // (1024 * 1024)}"
+                                " MB) and was dropped. Narrow it: read fewer "
+                                "lines, or don't dump large files / big base64 "
+                                "blobs.")
+                    else:
+                        log.error("pump for %s crashed %d×/60s; giving up "
+                                  "(re-arms on next message)", conv.key,
+                                  len(crashes))
+                        note = ("⚠️ This turn hit repeated errors and was "
+                                "dropped. Send a message to continue.")
+                    conv.working_since = None  # stop the 'Working…' ticker
+                    pend = conv.pending[:]
+                    conv.pending.clear()
+                    for pm in pend:  # clear the 👀 markers + inflight
+                        _inflight_del(conv, pm)
+                        try:
+                            await pm.set_reaction(None)
+                        except BaseException:
+                            pass
+                    try:  # morph the working bubble into the notice
+                        await status.finalize(target, note)
+                    except Exception:
+                        try:
+                            await target.reply_text(note)
+                        except Exception:
+                            pass
                     break
                 await asyncio.sleep(min(2.0 * len(crashes), 8.0))
                 status = LiveStatus()
