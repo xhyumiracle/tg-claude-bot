@@ -588,9 +588,13 @@ async def ask_buttons_multi(
     pending_multi[token] = (fut, msg, allowed_user, options, selected)
     _state.setdefault("prompts", {})[token] = [msg.chat_id, msg.message_id]
     _state_save()
+    resolved = False
     try:
-        return await asyncio.wait_for(fut, timeout=timeout)
+        result = await asyncio.wait_for(fut, timeout=timeout)
+        resolved = True
+        return result
     except asyncio.TimeoutError:
+        resolved = True
         try:
             first = (msg.text or "").split("\n", 1)[0]
             await msg.edit_text(f"{first}\n⌛️ expired")
@@ -601,6 +605,30 @@ async def ask_buttons_multi(
         pending_multi.pop(token, None)
         if _state.get("prompts", {}).pop(token, None) is not None:
             _state_save()
+        if not resolved:  # turn died before you answered — no zombie button
+            _mark_stranded(msg)
+
+
+def _mark_stranded(msg) -> None:
+    """The turn holding this prompt died (client dropped / errored) before you
+    answered — drop the now-dead buttons and say so, instead of leaving a zombie
+    that only reveals '⌛️ expired' when tapped. Fire-and-forget: the caller may
+    be unwinding a cancellation, so we must not await here."""
+    if msg is None:
+        return
+
+    async def _edit():
+        try:
+            first = (msg.text or "").split("\n", 1)[0]
+            await msg.edit_text(
+                f"{first}\n⚠️ this turn ended before you answered — resend if "
+                "still needed.")
+        except Exception:
+            pass
+    try:
+        asyncio.ensure_future(_edit())
+    except Exception:
+        pass
 
 
 async def ask_buttons(
@@ -646,9 +674,13 @@ async def ask_buttons(
     # boot reconcile rewrites it to "expired" instead of leaving zombie buttons
     _state.setdefault("prompts", {})[token] = [msg.chat_id, msg.message_id]
     _state_save()
+    resolved = False
     try:
-        return await asyncio.wait_for(fut, timeout=timeout)
+        idx = await asyncio.wait_for(fut, timeout=timeout)
+        resolved = True
+        return idx
     except asyncio.TimeoutError:
+        resolved = True
         try:  # collapse, mirroring the CLI prompt scrolling into history
             first = ((msg.text if msg else "") or "").split("\n", 1)[0]
             await msg.edit_text(f"{first}\n⌛️ expired")
@@ -659,6 +691,8 @@ async def ask_buttons(
         pending_btns.pop(token, None)
         if _state.get("prompts", {}).pop(token, None) is not None:
             _state_save()
+        if not resolved:  # turn died before you answered — no zombie button
+            _mark_stranded(msg)
 
 
 # ---------- session discovery ----------
@@ -2602,7 +2636,12 @@ async def apply_perm_mode(reply, conv: Conversation, mode: str) -> None:
             await reply(f"{label} (live, this conversation).")
             return
         except Exception:
-            await drop_client(conv)  # rebuilt with the mode on next message
+            # A turn may be mid-flight waiting on a permission prompt; dropping
+            # the client would kill it and strand that prompt (you tap a mode and
+            # the prompt below dies). Only rebuild when idle — a live turn keeps
+            # its prompt, and the new mode applies from the next turn.
+            if conv.working_since is None:
+                await drop_client(conv)
     await reply(f"{label} (applies from the next message).")
 
 
