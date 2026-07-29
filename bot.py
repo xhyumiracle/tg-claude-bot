@@ -394,6 +394,16 @@ async def transcribe(path: str) -> str:
         segments, _info = _get_whisper().transcribe(
             path,
             vad_filter=True,
+            # Anti-hallucination: after your speech ends, trailing silence/noise
+            # makes Whisper invent text, and by default each segment is
+            # conditioned on the previous one — so one hallucination snowballs
+            # into a paragraph of garbage (the "starts fine, degrades into
+            # gibberish" you saw). Turn conditioning OFF so segments are judged
+            # independently, and skip silent gaps that trigger hallucination
+            # (needs word timestamps to locate them).
+            condition_on_previous_text=False,
+            hallucination_silence_threshold=2.0,
+            word_timestamps=True,
             initial_prompt="以下是简体中文普通话，可能夹杂英文。",
         )
         return "".join(s.text for s in segments).strip()
