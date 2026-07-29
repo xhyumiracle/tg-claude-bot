@@ -928,6 +928,13 @@ def _tg_mcp_server(conv: "Conversation"):
     return create_sdk_mcp_server("tgclaude", tools=[send_file])
 
 
+# The SDK buffers one CLI-stdout JSON message at a time; its default cap is 1 MiB
+# and a single big tool result (a large file read, a base64 image, verbose Bash
+# output) blows past it → "JSON message exceeded maximum buffer size" kills the
+# pump's reader and the turn hangs with no reply. Give it generous headroom.
+MAX_BUFFER_SIZE = 32 * 1024 * 1024  # 32 MiB
+
+
 def build_options(conv: Conversation) -> ClaudeAgentOptions:
     if conv.profile == "owner":
         return ClaudeAgentOptions(
@@ -946,6 +953,7 @@ def build_options(conv: Conversation) -> ClaudeAgentOptions:
             include_partial_messages=True,  # live thinking/text stream for status
             setting_sources=["user", "project"],
             mcp_servers={"tgclaude": _tg_mcp_server(conv)},  # send_file
+            max_buffer_size=MAX_BUFFER_SIZE,
         )
     return ClaudeAgentOptions(
         cli_path=SYSTEM_CLI,
@@ -961,6 +969,7 @@ def build_options(conv: Conversation) -> ClaudeAgentOptions:
         resume=conv.session_id,
         include_partial_messages=True,  # live thinking/text stream for status
         setting_sources=["user", "project"],
+        max_buffer_size=MAX_BUFFER_SIZE,
     )
 
 
@@ -2946,7 +2955,8 @@ async def run_usage_standalone(update: Update) -> None:
     except Exception:
         notice = None
     client = ClaudeSDKClient(options=ClaudeAgentOptions(
-        cli_path=SYSTEM_CLI, cwd=str(PLAYGROUND_DIR), permission_mode="default"))
+        cli_path=SYSTEM_CLI, cwd=str(PLAYGROUND_DIR), permission_mode="default",
+        max_buffer_size=MAX_BUFFER_SIZE))
     sid, body = None, ""
     try:
         await client.connect()
