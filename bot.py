@@ -428,9 +428,6 @@ class Conversation:
     # input-side clock for the live "working…" ticker: when this turn's input
     # was handed to the CLI; the pump clears it on the turn's ResultMessage.
     working_since: Optional[float] = None
-    # one-shot transform the pump applies to this turn's reply text then clears
-    # (e.g. /usage sets it to render 'N% used' limits as /status-style bars)
-    reply_transform: Optional[object] = None
     # /login flow: {"proc","fd","expiry","busy"} while a pty-relayed
     # `claude auth login` awaits its auth code. Ephemeral by design — a
     # restart mid-login just means running /login again.
@@ -1558,11 +1555,6 @@ async def _pump(conv: "Conversation") -> None:
         buf.clear()
         if seg.startswith("<pass>"):
             seg = ""
-        if seg and conv.reply_transform:
-            try:
-                seg = conv.reply_transform(seg)
-            except Exception:
-                pass
         await status.finalize(target, seg)  # raw md; finalize renders to HTML
         status = LiveStatus()
 
@@ -1665,7 +1657,6 @@ async def _pump(conv: "Conversation") -> None:
                         await flush()
                         n_tools = 0
                         head, detail, txt, think_tokens = "Working…", "", "", 0
-                        conv.reply_transform = None  # one-shot: consumed
                         # a turn finished: clear the 👀 markers + inflight for
                         # every outstanding message (coarse — anchor next step)
                         pend = conv.pending[:]
@@ -2879,6 +2870,79 @@ async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         await q.answer()
 
 
+async def run_usage_standalone(update: Update) -> None:
+    """Run /usage on a throwaway one-shot CLI so it never queues behind the
+    topic's in-flight turn (a shared session runs one turn at a time). /usage is
+    account-level and read-only, so a fresh session works; we delete its
+    transcript afterward to leave no litter and keep no persistent process.
+    Zero token cost — /usage is a local command, not a model turn."""
+    msg = update.effective_message
+    try:
+        notice = await msg.reply_text("⏳ /usage…", disable_notification=True)
+    except Exception:
+        notice = None
+    client = ClaudeSDKClient(options=ClaudeAgentOptions(
+        cli_path=SYSTEM_CLI, cwd=str(PLAYGROUND_DIR), permission_mode="default"))
+    sid, body = None, ""
+    try:
+        await client.connect()
+        await client.query("/usage")
+
+        async def _collect():
+            nonlocal sid, body
+            async for m in client.receive_messages():
+                s = getattr(m, "session_id", None)
+                if s:
+                    sid = s
+                if isinstance(m, UserMessage):
+                    content = getattr(m, "content", None)
+                    texts = []
+                    if isinstance(content, str):
+                        texts.append(content)
+                    elif isinstance(content, list):
+                        for b in content:
+                            if isinstance(b, TextBlock):
+                                texts.append(b.text)
+                            elif isinstance(b, str):
+                                texts.append(b)
+                    for t in texts:
+                        for out in _LOCAL_OUT_RE.findall(t):
+                            if out.strip():
+                                body += out.strip() + "\n"
+                if isinstance(m, ResultMessage):
+                    break
+        await asyncio.wait_for(_collect(), timeout=60)
+    except Exception as e:
+        log.exception("standalone /usage failed")
+        body = body or f"/usage failed: {e}"
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        if sid:  # remove the throwaway transcript — no session-store litter
+            for f in PROJECTS_ROOT.glob(f"*/{sid}.jsonl"):
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+    text = _usage_barify(body.strip()) if body.strip() else "(no /usage output)"
+    rendered = _tg_html(text)
+    try:
+        if notice is not None:
+            await notice.edit_text(rendered, parse_mode=ParseMode.HTML)
+        else:
+            await msg.reply_text(rendered, parse_mode=ParseMode.HTML)
+    except Exception:
+        try:
+            if notice is not None:
+                await notice.edit_text(text)
+            else:
+                await msg.reply_text(text)
+        except Exception:
+            pass
+
+
 async def on_unknown_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Any /command the bot doesn't own is passed through to the CLI session."""
     if not chat_allowed(update):
@@ -2907,8 +2971,9 @@ async def on_unknown_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
             await msg.reply_text(body)
         return
     log.info("passthrough %s from %s", text.split()[0], update.effective_user.id)
-    if cmd == "usage":  # prettify the native /usage: 'N% used' limits -> bars
-        get_conv(update).reply_transform = _usage_barify
+    if cmd == "usage":  # throwaway one-shot CLI: never queues behind a turn
+        await run_usage_standalone(update)
+        return
     await run_turn(update, ctx, text,
                    status_text=f"⏳ {text.split()[0]} running…")
 
