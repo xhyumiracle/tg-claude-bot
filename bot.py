@@ -2461,7 +2461,12 @@ async def apply_model(reply, conv: Conversation, m: str) -> None:
 
 
 async def apply_effort(reply, conv: Conversation, e: str) -> None:
-    conv.effort = e
+    e = (e or "").strip().lower()
+    if e not in ("default", *EFFORT_CHOICES):
+        await reply(f"Unknown effort: {e}\nPick from: default, "
+                    + ", ".join(EFFORT_CHOICES))
+        return
+    conv.effort = None if e == "default" else e  # 'default' clears the override
     await drop_client(conv)
     await reply(
         f"Effort set to {e}; applies from the next message "
@@ -2721,10 +2726,15 @@ async def cmd_effort(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 @menu("ef")
 async def _menu_effort(update: Update):
     conv = get_conv(update)
+    active = conv.effort or "default"
+    # 'default' is a first-class, markable choice — otherwise nothing carries the
+    # ✓ when no override is set. Same ✓ convention as /model, /mode, /whisper.
     items = [[InlineKeyboardButton(
-        f"{'✓ ' if e == conv.effort else ''}{e}", callback_data=f"ef:{e}",
-    )] for e in EFFORT_CHOICES]
-    return f"Effort: {conv.effort or '(default)'}\nPick one", items, []
+        f"{'✓ ' if c == active else ''}{c}", callback_data=f"ef:{c}",
+    )] for c in ("default", *EFFORT_CHOICES)]
+    return (f"Effort · pick one (now: {active})\n"
+            "default = the model's own effort (its concrete level isn't exposed "
+            "by the API)", items, [])
 
 
 async def cmd_stop(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
