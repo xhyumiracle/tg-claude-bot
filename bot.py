@@ -2553,6 +2553,18 @@ PERM_MODES = [
     ("bypassPermissions", "⏵⏵ bypass (no guardrails)"),
 ]
 PERM_MODE_LABEL = dict(PERM_MODES)
+# Accept what a human would type — the friendly words on the buttons, not just
+# the CLI's camelCase keys — so `/mode bypass` works like tapping the button.
+# Keys are lowercased; button callbacks send the canonical value, which also
+# resolves here (e.g. "bypasspermissions" -> "bypassPermissions").
+_PERM_ALIASES = {
+    "default": "default", "normal": "default", "ask": "default",
+    "acceptedits": "acceptEdits", "accept": "acceptEdits",
+    "accept-edits": "acceptEdits", "edits": "acceptEdits",
+    "plan": "plan",
+    "bypasspermissions": "bypassPermissions", "bypass": "bypassPermissions",
+    "yolo": "bypassPermissions",
+}
 
 
 @menu("pm")
@@ -2575,9 +2587,12 @@ async def _menu_perm_mode(update: Update):
 
 
 async def apply_perm_mode(reply, conv: Conversation, mode: str) -> None:
-    if mode not in {m for m, _ in PERM_MODES}:
-        await reply(f"Unknown mode: {mode}")
+    canon = _PERM_ALIASES.get((mode or "").strip().lower())
+    if canon is None:
+        await reply(f"Unknown mode: {mode}\nTry: default, acceptEdits (accept), "
+                    "plan, or bypass.")
         return
+    mode = canon
     conv.perm_mode = None if mode == "default" else mode
     persist_binding(conv)
     label = PERM_MODE_LABEL.get(mode, mode)
