@@ -5,6 +5,7 @@ description = "Single-file Telegram bridge to the Claude Code CLI: sessions, voi
 requires-python = ">=3.11"
 dependencies = [
     "claude-agent-sdk>=0.1.61",
+    "markdown-it-py>=4.2.0",
     "python-dotenv>=1.2.2",
     "python-telegram-bot>=22.7",
 ]

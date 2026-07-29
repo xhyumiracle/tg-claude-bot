@@ -169,46 +169,205 @@ _LOCAL_OUT_RE = re.compile(
 )
 
 
-def _tg_markdown(text: str) -> str:
-    """Telegram renders neither markdown tables nor #/** markup. Applied to
-    every outgoing segment: table blocks become fenced aligned monospace,
-    headings and ** become Telegram bold; existing fences are left alone."""
-    out: list = []
-    table: list = []
-    in_fence = False
+import html as _html
+from markdown_it import MarkdownIt as _MarkdownIt
+from markdown_it.tree import SyntaxTreeNode as _SyntaxTreeNode
 
-    def flush_table() -> None:
-        if not table:
-            return
-        ncols = max(len(r) for r in table)
-        widths = [max((len(r[i]) for r in table if i < len(r)), default=0)
-                  for i in range(ncols)]
-        out.append("```")
-        for r in table:
-            out.append("  ".join(
-                c.ljust(widths[i]) for i, c in enumerate(r)).rstrip())
-        out.append("```")
-        table.clear()
+# Replies are Markdown by convention (that's what the model writes and what the
+# CLI renders), so we DON'T sniff per-message: parse EVERY reply as CommonMark
+# with a real parser and emit Telegram's HTML subset, escaping everything else.
+# Deterministic — no more fragile v1-Markdown parse that broke on a lone '*' and
+# silently dumped the whole reply as plain text.
+_MD = _MarkdownIt("commonmark", {"breaks": False, "linkify": False})
+try:
+    _MD.enable("strikethrough")  # ~~text~~ isn't in bare CommonMark
+except Exception:
+    pass
 
-    for line in text.splitlines():
-        s = line.strip()
+
+def _esc(s: str) -> str:
+    # Telegram HTML needs only & < > escaped in text; leaving quotes alone
+    # avoids &#x27;/&quot; noise in ordinary prose.
+    return _html.escape(s or "", quote=False)
+
+
+def _esc_attr(s: str) -> str:
+    return _html.escape(s or "", quote=True)
+
+
+def _tables_to_pre(text: str) -> str:
+    """Telegram has no tables: turn a run of `| a | b |` lines into an aligned
+    fenced block BEFORE parsing, so the parser renders it as <pre>."""
+    lines = text.split("\n")
+    out, i, in_fence = [], 0, False
+    while i < len(lines):
+        raw = lines[i]
+        s = raw.strip()
         if s.startswith("```"):
-            flush_table()
             in_fence = not in_fence
-            out.append(line)
+            out.append(raw)
+            i += 1
             continue
-        if not in_fence:
-            if s.startswith("|") and s.endswith("|") and len(s) > 1:
-                if not re.fullmatch(r"\|[\s:|-]+\|", s):
-                    table.append([c.strip() for c in s.strip("|").split("|")])
-                continue
-            flush_table()
-            if s.startswith("#"):
-                line = re.sub(r"^\s*#+\s*(.*?)\s*$", r"*\1*", line)
-            line = re.sub(r"\*\*(.+?)\*\*", r"*\1*", line)
-        out.append(line)
-    flush_table()
+        if (not in_fence) and s.startswith("|") and s.endswith("|") and len(s) > 1:
+            block = []
+            while i < len(lines):
+                ss = lines[i].strip()
+                if ss.startswith("|") and ss.endswith("|") and len(ss) > 1:
+                    if not re.fullmatch(r"\|[\s:|\-]+\|", ss):
+                        block.append([c.strip() for c in ss.strip("|").split("|")])
+                    i += 1
+                else:
+                    break
+            if block:
+                ncols = max(len(r) for r in block)
+                w = [max((len(r[c]) for r in block if c < len(r)), default=0)
+                     for c in range(ncols)]
+                aligned = "\n".join(
+                    "  ".join((r[c] if c < len(r) else "").ljust(w[c])
+                              for c in range(ncols)).rstrip()
+                    for r in block)
+                out.append("```\n" + aligned + "\n```")
+            continue
+        out.append(raw)
+        i += 1
     return "\n".join(out)
+
+
+def _md_inline(n) -> str:
+    t = n.type
+    if t == "text":
+        return _esc(n.content)
+    if t in ("softbreak", "hardbreak"):
+        return "\n"  # keep the model's line breaks (chat, not prose reflow)
+    if t == "code_inline":
+        return f"<code>{_esc(n.content)}</code>"
+    if t == "strong":
+        return f"<b>{_md_ichildren(n)}</b>"
+    if t == "em":
+        return f"<i>{_md_ichildren(n)}</i>"
+    if t == "s":
+        return f"<s>{_md_ichildren(n)}</s>"
+    if t == "link":
+        href = n.attrs.get("href", "") if hasattr(n, "attrs") else ""
+        inner = _md_ichildren(n) or _esc(str(href))
+        return f'<a href="{_esc_attr(str(href))}">{inner}</a>'
+    if t == "image":
+        return _md_ichildren(n) or _esc(n.content or "")  # text can't embed images
+    if t == "html_inline":
+        return _esc(n.content)  # show raw HTML literally, never trust it
+    if t == "inline":
+        return _md_ichildren(n)
+    return _md_ichildren(n) or _esc(getattr(n, "content", "") or "")
+
+
+def _md_ichildren(n) -> str:
+    return "".join(_md_inline(c) for c in n.children)
+
+
+def _md_list(n, depth: int) -> str:
+    ordered = n.type == "ordered_list"
+    start = 1
+    if ordered and hasattr(n, "attrs"):
+        try:
+            start = int(n.attrs.get("start", 1))
+        except Exception:
+            start = 1
+    lines, idx, indent = [], start, "  " * depth
+    for item in n.children:
+        marker = f"{idx}. " if ordered else "• "
+        parts, sub = [], []
+        for child in item.children:
+            if child.type in ("bullet_list", "ordered_list"):
+                sub.append(_md_list(child, depth + 1))
+            elif child.type == "paragraph":
+                parts.append(_md_ichildren(child))
+            else:
+                parts.append(_md_block(child))
+        text = "\n".join(p for p in parts if p).replace(
+            "\n", "\n" + indent + "  ")
+        lines.append(f"{indent}{marker}{text}")
+        lines.extend(s for s in sub if s)
+        idx += 1
+    return "\n".join(lines)
+
+
+def _md_block(n) -> str:
+    t = n.type
+    if t == "paragraph":
+        return _md_ichildren(n)
+    if t == "heading":
+        return f"<b>{_md_ichildren(n)}</b>"
+    if t in ("fence", "code_block"):
+        info = (getattr(n, "info", "") or "").strip().split()
+        lang = info[0] if info else ""
+        code = _esc(n.content.rstrip("\n"))
+        if lang:
+            return f'<pre><code class="language-{_esc_attr(lang)}">{code}</code></pre>'
+        return f"<pre>{code}</pre>"
+    if t == "blockquote":
+        inner = "\n\n".join(
+            b for b in (_md_block(c) for c in n.children) if b.strip())
+        return f"<blockquote>{inner}</blockquote>"
+    if t in ("bullet_list", "ordered_list"):
+        return _md_list(n, 0)
+    if t == "hr":
+        return "──────────"
+    if t == "html_block":
+        return _esc(n.content.rstrip("\n"))
+    return _md_ichildren(n)
+
+
+def _tg_html(text: str) -> str:
+    """Render Markdown to Telegram's HTML subset. Never raises: on any parser
+    hiccup it returns the escaped source, so the reply path can't break."""
+    if not text or not text.strip():
+        return ""
+    try:
+        root = _SyntaxTreeNode(_MD.parse(_tables_to_pre(text)))
+        out = "\n\n".join(
+            p for p in (_md_block(c) for c in root.children) if p.strip())
+        return re.sub(r"\n{3,}", "\n\n", out).strip()
+    except Exception:
+        log.debug("md render failed; sending escaped plain", exc_info=True)
+        return _esc(text)
+
+
+def _chunk_md(text: str, limit: int = 3500) -> list:
+    """Split Markdown into <=limit-char pieces at blank-line boundaries, keeping
+    fenced code blocks whole so each piece renders to self-contained HTML (a
+    split never lands inside a tag)."""
+    lines, blocks, cur, in_fence = text.split("\n"), [], [], False
+    for ln in lines:
+        s = ln.strip()
+        if s.startswith("```"):
+            in_fence = not in_fence
+            cur.append(ln)
+            continue
+        if s == "" and not in_fence:
+            if cur:
+                blocks.append("\n".join(cur))
+                cur = []
+        else:
+            cur.append(ln)
+    if cur:
+        blocks.append("\n".join(cur))
+    chunks, buf = [], ""
+    for b in blocks:
+        if len(b) > limit:
+            if buf:
+                chunks.append(buf)
+                buf = ""
+            for i in range(0, len(b), limit):
+                chunks.append(b[i:i + limit])
+            continue
+        if buf and len(buf) + 2 + len(b) > limit:
+            chunks.append(buf)
+            buf = b
+        else:
+            buf = (buf + "\n\n" + b) if buf else b
+    if buf:
+        chunks.append(buf)
+    return chunks or [text]
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "large-v3-turbo")
@@ -1118,19 +1277,20 @@ def format_incoming(update: Update) -> str:
 
 async def send_long(update: Update, text: str, anchor=None) -> None:
     """anchor is a Message to quote, or None to send unquoted (do_quote=
-    False) into the same chat/thread."""
-    limit = 4000
-    chunks = [text[i: i + limit] for i in range(0, len(text), limit)] or [text]
-    for chunk in chunks:
+    False) into the same chat/thread. `text` is Markdown; each chunk is
+    rendered to Telegram HTML independently (chunking keeps fences whole so a
+    split never lands inside a tag), falling back to plain on any send error."""
+    for chunk in _chunk_md(text):
+        rendered = _tg_html(chunk)
         if anchor is not None:
             try:
-                await anchor.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
+                await anchor.reply_text(rendered, parse_mode=ParseMode.HTML)
             except Exception:
                 await anchor.reply_text(chunk)
         else:
             try:
                 await update.effective_message.reply_text(
-                    chunk, parse_mode=ParseMode.MARKDOWN, do_quote=False)
+                    rendered, parse_mode=ParseMode.HTML, do_quote=False)
             except Exception:
                 await update.effective_message.reply_text(
                     chunk, do_quote=False)
@@ -1208,13 +1368,14 @@ class LiveStatus:
                 except Exception:
                     pass
                 return
-            if len(reply) <= 4000:
+            rendered = _tg_html(reply)
+            if len(reply) <= 4000 and len(rendered) <= 4096:
                 try:
-                    await self.msg.edit_text(reply, parse_mode=ParseMode.MARKDOWN)
+                    await self.msg.edit_text(rendered, parse_mode=ParseMode.HTML)
                     return
                 except Exception:
                     try:
-                        await self.msg.edit_text(reply)
+                        await self.msg.edit_text(reply)  # plain-markdown fallback
                         return
                     except Exception:
                         pass
@@ -1402,7 +1563,7 @@ async def _pump(conv: "Conversation") -> None:
                 seg = conv.reply_transform(seg)
             except Exception:
                 pass
-        await status.finalize(target, _tg_markdown(seg))
+        await status.finalize(target, seg)  # raw md; finalize renders to HTML
         status = LiveStatus()
 
     async def show(min_elapsed: float = 0.0) -> None:
