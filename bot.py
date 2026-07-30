@@ -3008,7 +3008,15 @@ async def run_usage_standalone(update: Update) -> None:
                 s = getattr(m, "session_id", None)
                 if s:
                     sid = s
-                if isinstance(m, UserMessage):
+                # In a fresh one-shot session /usage comes back as an
+                # AssistantMessage TextBlock (and ResultMessage.result), NOT the
+                # UserMessage <local-command-stdout> the main pump sees — collect
+                # all three shapes so we never come up empty.
+                if isinstance(m, AssistantMessage):
+                    for b in getattr(m, "content", None) or []:
+                        if isinstance(b, TextBlock):
+                            body += b.text
+                elif isinstance(m, UserMessage):
                     content = getattr(m, "content", None)
                     texts = []
                     if isinstance(content, str):
@@ -3021,9 +3029,12 @@ async def run_usage_standalone(update: Update) -> None:
                                 texts.append(b)
                     for t in texts:
                         for out in _LOCAL_OUT_RE.findall(t):
-                            if out.strip():
-                                body += out.strip() + "\n"
+                            body += out
                 if isinstance(m, ResultMessage):
+                    if not body.strip():  # last resort: the final result text
+                        r = getattr(m, "result", None)
+                        if isinstance(r, str):
+                            body = r
                     break
         await asyncio.wait_for(_collect(), timeout=60)
     except Exception as e:
