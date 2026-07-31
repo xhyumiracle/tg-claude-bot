@@ -424,6 +424,10 @@ class Conversation:
     # serializes lazy client creation ONLY — a dedicated lock (not `lock`) so it
     # can never deadlock against a `lock` holder that also needs a client.
     client_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # bypass can't be set live (the CLI refuses mid-session escalation); if it's
+    # picked while a turn is running, defer the client rebuild until the pump is
+    # idle so it actually takes effect on the next turn.
+    mode_rebuild_pending: bool = False
     last_user_id: int = 0
     model: Optional[str] = None
     effort: Optional[str] = None
@@ -974,6 +978,12 @@ def build_options(conv: Conversation) -> ClaudeAgentOptions:
 
 
 async def ensure_client(conv: Conversation) -> ClaudeSDKClient:
+    # A deferred permission-mode rebuild (bypass picked mid-turn) lands here once
+    # the blocking turn is done: drop the stale-mode client so the build below
+    # picks up conv.perm_mode.
+    if conv.mode_rebuild_pending and conv.working_since is None:
+        conv.mode_rebuild_pending = False
+        await drop_client(conv)
     # Lazy init straddles an await (connect), so a plain `if None` check-then-set
     # is a race: under concurrent_updates(True), two messages that skip the
     # settle buffer (e.g. two voice notes fired back-to-back) can BOTH see
@@ -2677,16 +2687,25 @@ async def apply_perm_mode(reply, conv: Conversation, mode: str) -> None:
     if conv.client is not None:
         try:
             await conv.client.set_permission_mode(mode)
+            conv.mode_rebuild_pending = False
             await reply(f"{label} (live, this conversation).")
             return
         except Exception:
-            # A turn may be mid-flight waiting on a permission prompt; dropping
-            # the client would kill it and strand that prompt (you tap a mode and
-            # the prompt below dies). Only rebuild when idle — a live turn keeps
-            # its prompt, and the new mode applies from the next turn.
+            # default/acceptEdits/plan switch live; bypassPermissions can't — the
+            # CLI refuses to escalate mid-session (the session wasn't launched
+            # with --dangerously-skip-permissions), a safety guardrail, so it
+            # needs a fresh client. Rebuild now if idle; if a turn is running
+            # (maybe waiting on a prompt) defer so we don't kill it —
+            # ensure_client does the rebuild once idle.
             if conv.working_since is None:
                 await drop_client(conv)
-    await reply(f"{label} (applies from the next message).")
+            else:
+                conv.mode_rebuild_pending = True
+    if mode == "bypassPermissions":
+        await reply(f"{label}\n(can't switch on mid-session for safety; applies "
+                    "from your next message)")
+    else:
+        await reply(f"{label} (applies from the next message).")
 
 
 async def cmd_mode(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
