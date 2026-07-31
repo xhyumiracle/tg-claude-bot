@@ -389,6 +389,21 @@ def _get_whisper():
     return _whisper_model
 
 
+# Whisper trained heavily on Chinese YouTube, so on trailing silence/unclear
+# audio it hallucinates video-outro boilerplate — most infamously
+# "请不吝点赞 订阅 转发 打赏支持明镜与点点栏目", plus subtitle credits and
+# like/subscribe/donate pitches. It's always tacked onto the tail; none of it
+# occurs in a real voice note here. This matches a distinctive outro HEAD then
+# everything after it — anchored so a real segment that merely mentions a word
+# isn't nuked, only the outro tail is.
+_WHISPER_OUTRO_RE = re.compile(
+    r"[。.!！?？,，、\s]*"
+    r"(请不吝|点赞\s*[、,]?\s*订阅|明镜|点点栏目|字幕\s*(志愿者|by|组|制作)|"
+    r"(谢谢|感谢)(大家)?(的)?\s*(观看|收看))"
+    r".*$"
+)
+
+
 async def transcribe(path: str) -> str:
     def _run() -> str:
         segments, _info = _get_whisper().transcribe(
@@ -406,7 +421,13 @@ async def transcribe(path: str) -> str:
             word_timestamps=True,
             initial_prompt="以下是简体中文普通话，可能夹杂英文。",
         )
-        return "".join(s.text for s in segments).strip()
+        # drop segments that ARE an outro (start with an outro head), then peel a
+        # trailing outro fused onto the last real segment.
+        text = "".join(
+            s.text for s in segments
+            if not _WHISPER_OUTRO_RE.match(s.text.strip())).strip()
+        text = _WHISPER_OUTRO_RE.sub("", text).strip()
+        return text
     return await asyncio.to_thread(_run)
 
 
