@@ -415,28 +415,24 @@ async def transcribe(path: str) -> str:
     def _run() -> str:
         segments, _info = _get_whisper().transcribe(
             path,
-            vad_filter=True,
-            # Anti-hallucination WITHOUT truncation: condition_on_previous_text
-            # OFF stops one hallucinated segment from snowballing into a
-            # paragraph of garbage (segments judged independently). We do NOT set
-            # hallucination_silence_threshold — it "skips silent periods" but in
-            # practice DROPS real speech after a natural >2s pause (a 1-min note
-            # came back as its first few seconds). The outro blocklist below
-            # catches the known trailing hallucinations instead.
+            # vad_filter is OFF on purpose. Silero VAD was misclassifying whole
+            # clips as non-speech and returning ZERO segments, so a real 13.7s
+            # message transcribed to '' ("听不清，转写为空"). Proven on the actual
+            # audio: vad on -> 0 chars, vad off -> full correct transcript.
+            # Losing silence-trimming is fine — condition_on_previous_text=False
+            # plus the outro blocklist keep hallucinations down without ever
+            # dropping real speech.
+            vad_filter=False,
             condition_on_previous_text=False,
             initial_prompt="以下是简体中文普通话，可能夹杂英文。",
         )
         seg_list = list(segments)
-        raw = "".join(s.text for s in seg_list)
         # drop segments that ARE an outro (start with an outro head), then peel a
         # trailing outro fused onto the last real segment.
         text = "".join(
             s.text for s in seg_list
             if not _WHISPER_OUTRO_RE.match(s.text.strip())).strip()
         text = _WHISPER_OUTRO_RE.sub("", text).strip()
-        log.info("VOICEDBG segs=%d asr_dur=%.1fs raw=%dch final=%dch raw=%r",
-                 len(seg_list), getattr(_info, "duration", 0.0) or 0.0,
-                 len(raw), len(text), raw[:200])
         return text
     return await asyncio.to_thread(_run)
 
@@ -3633,14 +3629,6 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         f = await ctx.bot.get_file(media.file_id)
         await f.download_to_drive(custom_path=str(tmp))
-        try:  # VOICEDBG (temp): keep the audio for offline truncation diagnosis
-            _keep = Path("/tmp/tgvoice-keep")
-            _keep.mkdir(exist_ok=True)
-            shutil.copy(str(tmp), str(_keep / tmp.name))
-            log.info("VOICEDBG in=%s tg_dur=%ss bytes=%d", tmp.name,
-                     getattr(media, "duration", None), tmp.stat().st_size)
-        except Exception:
-            log.exception("VOICEDBG save failed")
         text = await transcribe(str(tmp))
     except Exception as e:
         log.exception("voice transcription failed")
