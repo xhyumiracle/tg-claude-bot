@@ -398,8 +398,15 @@ def _get_whisper():
 # isn't nuked, only the outro tail is.
 _WHISPER_OUTRO_RE = re.compile(
     r"[。.!！?？,，、\s]*"
-    r"(请不吝|点赞\s*[、,]?\s*订阅|明镜|点点栏目|字幕\s*(志愿者|by|组|制作)|"
-    r"(谢谢|感谢)(大家)?(的)?\s*(观看|收看))"
+    r"("
+    r"请不吝"                                  # 请不吝点赞…
+    r"|点赞[\s、,]*(订阅|转发|关注)"            # 点赞 订阅 转发…
+    r"|明镜|点点栏目|优优独播剧场|新经文化传播"   # named channels/studios
+    r"|字幕\s*(由|志愿者|组|制作|by)"           # subtitle credits (Amara etc.)
+    r"|(谢谢|感谢)\s*(大家)?\s*(的)?\s*(观看|收看)"
+    r"|下(集|期)\s*(再见|预告)"
+    r"|关注\s*(我的)?\s*(频道|公众号)"
+    r")"
     r".*$"
 )
 
