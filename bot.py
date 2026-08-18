@@ -1535,7 +1535,15 @@ async def _context_limit(conv: Conversation, used: int = 0) -> int:
 
 
 def _session_context_tokens(sid: Optional[str]) -> int:
-    """Current context size = usage of the LAST assistant API call in the transcript."""
+    """Current context size = usage of the LAST assistant API call in the transcript.
+
+    Exception: a `/compact` writes a `type:"system"` record carrying
+    `compactMetadata.postTokens` (the compacted size) but NO usage record, and
+    the big pre-compact usage still sits further back. If that boundary is more
+    recent than any usage record (i.e. no real turn has run since the compact),
+    the live context IS `postTokens` — otherwise we'd report the stale ~full
+    pre-compact number and fire a bogus context warning right after compacting.
+    """
     if not sid:
         return 0
     for f in PROJECTS_ROOT.glob(f"*/{sid}.jsonl"):
@@ -1549,6 +1557,16 @@ def _session_context_tokens(sid: Optional[str]) -> int:
         except OSError:
             return 0
         for line in reversed(tail.splitlines()):
+            if '"compactMetadata"' in line:
+                try:
+                    o = json.loads(line)
+                    if o.get("type") == "system":
+                        post = (o.get("compactMetadata") or {}).get("postTokens")
+                        if post:
+                            return post
+                except Exception:
+                    pass
+                continue
             if '"usage"' not in line:
                 continue
             try:
