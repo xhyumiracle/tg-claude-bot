@@ -36,6 +36,11 @@ except ImportError:
     class ThinkingBlock:  # sentinel, never matches
         pass
 try:
+    from claude_agent_sdk.types import SystemMessage
+except ImportError:
+    class SystemMessage:  # sentinel, never matches
+        pass
+try:
     from claude_agent_sdk.types import StreamEvent
 except ImportError:
     class StreamEvent:  # sentinel, never matches
@@ -1786,14 +1791,29 @@ async def _pump(conv: "Conversation") -> None:
                             await check_context_usage(target, conv)
                         except Exception:
                             pass
-                        # /compact finished (its ResultMessage): replay anything
-                        # the input barrier held while the CLI was compacting.
+                        # backstop: if a ResultMessage arrives while the barrier
+                        # is still armed (no compact_boundary was surfaced),
+                        # release here rather than wait out the timeout.
                         if conv.compacting_since is not None:
                             try:
                                 await _release_compact_hold(conv)
                             except Exception:
                                 log.exception("compact-hold release for %s",
                                               conv.key)
+                    elif (isinstance(m, SystemMessage)
+                          and getattr(m, "subtype", "") == "compact_boundary"):
+                        # the CLI's structured compaction-done signal (carries
+                        # compactMetadata.postTokens). This is THE release point
+                        # for the /compact input barrier — deterministic, no
+                        # prose-matching, and it arrives before the "Compacted"
+                        # stdout. The ResultMessage path + timeout stay only as
+                        # backstops for an SDK that doesn't surface this event.
+                        if conv.compacting_since is not None:
+                            try:
+                                await _release_compact_hold(conv)
+                            except Exception:
+                                log.exception("compact-hold release(boundary) "
+                                              "%s", conv.key)
                     elif isinstance(m, UserMessage):
                         # relay CLI local-command output (/context, /cost, ...)
                         content = getattr(m, "content", None)
@@ -1810,17 +1830,6 @@ async def _pump(conv: "Conversation") -> None:
                             for out in _LOCAL_OUT_RE.findall(t):
                                 if out.strip():
                                     buf.append(out.strip())
-                        # the "Compacted" stdout is the tightest compaction-done
-                        # signal (it prints after the summary is written), so
-                        # release the input barrier here — usually before the
-                        # /compact ResultMessage even arrives.
-                        if (conv.compacting_since is not None
-                                and any("Compacted" in t for t in texts)):
-                            try:
-                                await _release_compact_hold(conv)
-                            except Exception:
-                                log.exception("compact-hold release(out) %s",
-                                              conv.key)
                 # stream ended cleanly (rare while connected) — stop consuming
                 break
             except asyncio.CancelledError:
@@ -1892,11 +1901,12 @@ async def _pump(conv: "Conversation") -> None:
 # ===================== end continuous-consumer stream pump ===================
 
 
-COMPACT_HOLD_TIMEOUT = 30.0  # s: emergency ceiling on the /compact input barrier
-                             # (see run_turn). A missed compaction-done signal
-                             # then delays a held message rather than stranding
-                             # it — the CLI is virtually always ready well inside
-                             # this window (compaction emits its stdout + result).
+COMPACT_HOLD_TIMEOUT = 30.0  # s: paranoia ceiling on the /compact input barrier
+                             # (see run_turn). The primary release is the CLI's
+                             # structured `compact_boundary` event; this only
+                             # matters if that (and the ResultMessage backstop)
+                             # never arrive, and then delays a held message
+                             # rather than stranding it.
 
 
 async def _release_compact_hold(conv: "Conversation") -> None:
@@ -1904,8 +1914,8 @@ async def _release_compact_hold(conv: "Conversation") -> None:
     Held inputs were never written to the CLI (mid-compaction stdin is dropped),
     so fire them now. Each is already inflight-persisted and 👀-marked; the pump
     clears them on the replayed turn's ResultMessage. Idempotent: clearing
-    `compacting_since` first makes a second caller (result vs. stdout signal)
-    a no-op."""
+    `compacting_since` first makes a second caller (compact_boundary vs. the
+    ResultMessage backstop) a no-op."""
     conv.compacting_since = None
     held, conv.compact_hold = conv.compact_hold[:], []
     if not held:
