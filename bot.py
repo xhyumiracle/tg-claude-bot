@@ -483,6 +483,13 @@ class Conversation:
     # a brand-new topic (created with no prior binding): on_message pops the
     # project picker once so the owner needn't remember /project, then clears it.
     fresh: bool = False
+    # /compact input barrier: armed (to a timestamp) right after a /compact is
+    # fired, cleared when the pump sees compaction finish. While armed, run_turn
+    # holds outgoing queries in `compact_hold` [(text, blocks, msg), ...] because
+    # the CLI silently drops stdin written mid-compaction; the pump replays them
+    # on the compaction-done signal (see _release_compact_hold).
+    compacting_since: Optional[float] = None
+    compact_hold: list = field(default_factory=list)
 
 
 conversations: Dict[ConvKey, Conversation] = {}
@@ -1779,6 +1786,14 @@ async def _pump(conv: "Conversation") -> None:
                             await check_context_usage(target, conv)
                         except Exception:
                             pass
+                        # /compact finished (its ResultMessage): replay anything
+                        # the input barrier held while the CLI was compacting.
+                        if conv.compacting_since is not None:
+                            try:
+                                await _release_compact_hold(conv)
+                            except Exception:
+                                log.exception("compact-hold release for %s",
+                                              conv.key)
                     elif isinstance(m, UserMessage):
                         # relay CLI local-command output (/context, /cost, ...)
                         content = getattr(m, "content", None)
@@ -1795,6 +1810,17 @@ async def _pump(conv: "Conversation") -> None:
                             for out in _LOCAL_OUT_RE.findall(t):
                                 if out.strip():
                                     buf.append(out.strip())
+                        # the "Compacted" stdout is the tightest compaction-done
+                        # signal (it prints after the summary is written), so
+                        # release the input barrier here — usually before the
+                        # /compact ResultMessage even arrives.
+                        if (conv.compacting_since is not None
+                                and any("Compacted" in t for t in texts)):
+                            try:
+                                await _release_compact_hold(conv)
+                            except Exception:
+                                log.exception("compact-hold release(out) %s",
+                                              conv.key)
                 # stream ended cleanly (rare while connected) — stop consuming
                 break
             except asyncio.CancelledError:
@@ -1866,6 +1892,51 @@ async def _pump(conv: "Conversation") -> None:
 # ===================== end continuous-consumer stream pump ===================
 
 
+COMPACT_HOLD_TIMEOUT = 30.0  # s: emergency ceiling on the /compact input barrier
+                             # (see run_turn). A missed compaction-done signal
+                             # then delays a held message rather than stranding
+                             # it — the CLI is virtually always ready well inside
+                             # this window (compaction emits its stdout + result).
+
+
+async def _release_compact_hold(conv: "Conversation") -> None:
+    """Replay messages the /compact barrier held, now that compaction is done.
+    Held inputs were never written to the CLI (mid-compaction stdin is dropped),
+    so fire them now. Each is already inflight-persisted and 👀-marked; the pump
+    clears them on the replayed turn's ResultMessage. Idempotent: clearing
+    `compacting_since` first makes a second caller (result vs. stdout signal)
+    a no-op."""
+    conv.compacting_since = None
+    held, conv.compact_hold = conv.compact_hold[:], []
+    if not held:
+        return
+    try:
+        client = await ensure_client(conv)
+    except Exception:
+        log.exception("compact-hold replay: no client for %s", conv.key)
+        return
+    for text, blocks, msg in held:
+        if msg not in conv.pending:
+            conv.pending.append(msg)
+        try:
+            if blocks:
+                content = list(blocks) + [{"type": "text", "text": text}]
+
+                async def _gen(content=content):
+                    yield {"type": "user",
+                           "message": {"role": "user", "content": content},
+                           "parent_tool_use_id": None}
+                await client.query(_gen())
+            else:
+                await client.query(text)
+            if conv.working_since is None:
+                conv.working_since = time.time()
+            log.info("compact-hold: replayed %r for %s", (text or "")[:60],
+                     conv.key)
+        except Exception:
+            log.exception("compact-hold replay failed for %s", conv.key)
+
+
 async def run_turn(
     update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str,
     blocks: Optional[list] = None, status_text: Optional[str] = None,
@@ -1883,6 +1954,30 @@ async def run_turn(
     conv.last_user_id = uid
     msg = update.effective_message
     if sender_id is None:
+        # /compact input barrier: the CLI silently drops any stdin written while
+        # it is compacting (the session is mid-reset), so a message sent right
+        # after /compact never runs — its turn simply never happens. Hold it
+        # OUT of `pending` (so the /compact ResultMessage's coarse pending-clear
+        # can't strip its 👀 before it has run) and let the pump replay it once
+        # compaction finishes. A stale barrier times out here, so a held message
+        # is only ever delayed, never stranded.
+        if conv.compacting_since is not None:
+            if time.time() - conv.compacting_since <= COMPACT_HOLD_TIMEOUT:
+                _inflight_add(conv, msg,
+                              queued_text=(text or "").strip() or "[media]")
+                try:
+                    await msg.set_reaction("👀")
+                except Exception:
+                    pass
+                conv.compact_hold.append((text, blocks, msg))
+                log.info("compact-hold: buffered %r for %s",
+                         (text or "")[:60], conv.key)
+                return
+            # stale: the compaction-done signal was missed. Drop the barrier and
+            # flush whatever it held before firing this message.
+            conv.compacting_since = None
+            if conv.compact_hold:
+                asyncio.create_task(_release_compact_hold(conv))
         # persist first (recovery), then the 👀 marker the pump clears when
         # this input's turn produces a ResultMessage
         _inflight_add(conv, msg, queued_text=(text or "").strip() or "[media]")
@@ -3165,6 +3260,12 @@ async def on_unknown_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         return
     await run_turn(update, ctx, text,
                    status_text=f"⏳ {text.split()[0]} running…")
+    if cmd == "compact":
+        # arm the input barrier AFTER firing /compact (so the command itself is
+        # never held): any message racing in behind it is now buffered until the
+        # pump sees compaction finish, instead of being dropped by the CLI while
+        # it resets the session. See run_turn / _release_compact_hold.
+        get_conv(update).compacting_since = time.time()
 
 
 # ---------- forward-batch aggregation ----------
