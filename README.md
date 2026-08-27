@@ -106,7 +106,7 @@ All in `.env` (see [.env.example](.env.example)):
 | `TG_BOT_TOKEN` | Bot token from @BotFather *(required)* |
 | `OWNER_USER_ID` | Your numeric Telegram id — full access *(required)* |
 | `GUEST_USER_IDS` | Extra user ids, served with the restricted guest profile |
-| `TARGET_GROUP_ID` | A group to serve (guest profile; topics = separate sessions) |
+| `TARGET_GROUP_ID` | Group(s) to serve (guest profile; topics = separate sessions). Space/comma-separated for multiple, e.g. `-1001111 -1002222` |
 | `OWNER_DEFAULT_CWD` | Default working directory for new owner sessions |
 | `RESUME_SESSION_ID` | Session to bind the owner's DM to on first contact |
 | `GUEST_READ_DIRS` / `GUEST_WRITE_DIRS` | Colon-separated dirs guests may read / write |

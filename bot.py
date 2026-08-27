@@ -81,7 +81,13 @@ OWNER_ID = int(os.environ["OWNER_USER_ID"])
 GUEST_USER_IDS = {
     int(x) for x in os.environ.get("GUEST_USER_IDS", "").replace(",", " ").split()
 }
-TARGET_GROUP_ID = int(os.environ.get("TARGET_GROUP_ID", "0"))
+# Space/comma-separated list of allowed group ids. Reads TARGET_GROUP_ID
+# (back-compat, may itself hold several) and TARGET_GROUP_IDS, merged.
+TARGET_GROUP_IDS = {
+    int(x)
+    for key in ("TARGET_GROUP_ID", "TARGET_GROUP_IDS")
+    for x in os.environ.get(key, "").replace(",", " ").split()
+}
 DEFAULT_RESUME = os.environ.get("RESUME_SESSION_ID", "")
 
 HOME = Path.home()
@@ -1324,7 +1330,7 @@ def chat_allowed(update: Update) -> bool:
     if chat.type == "private":
         user = update.effective_user
         return user is not None and (user.id == OWNER_ID or user.id in GUEST_USER_IDS)
-    return chat.id == TARGET_GROUP_ID
+    return chat.id in TARGET_GROUP_IDS
 
 
 def is_owner(update: Update) -> bool:
@@ -3696,8 +3702,9 @@ async def post_init(app: Application) -> None:
     try:
         await app.bot.set_my_commands(cmds, scope=BotCommandScopeDefault())
         # clear any previously-set per-chat scopes so default applies everywhere
-        for scope in (BotCommandScopeChat(chat_id=OWNER_ID),
-                      BotCommandScopeChat(chat_id=TARGET_GROUP_ID)):
+        scopes = [BotCommandScopeChat(chat_id=OWNER_ID)]
+        scopes += [BotCommandScopeChat(chat_id=gid) for gid in TARGET_GROUP_IDS]
+        for scope in scopes:
             try:
                 await app.bot.delete_my_commands(scope=scope)
             except Exception:
@@ -4072,8 +4079,8 @@ def main() -> None:
     # account token, and 403s /usage. Kept only when there's no login.
     if (HOME / ".claude" / ".credentials.json").exists():
         os.environ.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
-    log.info("config: target_group=%s default_resume=%s",
-             TARGET_GROUP_ID, DEFAULT_RESUME or "(none)")
+    log.info("config: target_groups=%s default_resume=%s",
+             sorted(TARGET_GROUP_IDS) or "(none)", DEFAULT_RESUME or "(none)")
     app = (
         Application.builder()
         .token(TG_TOKEN)
