@@ -40,7 +40,7 @@ terminal. The bot is a thin stateless router; the CLI owns everything.
 | ♻️ **Restart-proof** | Topics stay bound across restarts — even hard crashes: interrupted turns auto-resume, and messages you sent while it was down are replayed. |
 | 🛡 **Reliable under load** | Send as fast as you like — replies, live status edits and reactions all pace and retry against Telegram's limits, so a long streaming turn never trips flood control or drops a reply. |
 | 🟠 **Context warnings** | 🟠 at 80% / 🔴 at 90% of the real context window, same source as `/context`. |
-| 🔒 **Owner/guest profiles** | Allowlisted chats only; owner full access, guests scoped to specific dirs with Allow/Deny escalation. |
+| 🔒 **Owner/guest profiles** | Allowlisted chats only (your DMs plus one or more groups); owner full access, guests scoped to specific dirs with Allow/Deny escalation. |
 
 ## 🚀 Quick start
 

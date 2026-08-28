@@ -3670,6 +3670,7 @@ async def post_init(app: Application) -> None:
     """Register command menus so typing '/' shows hints (scoped per chat)."""
     await _reconcile_state(app)
     cmds = [
+        BotCommand("start", "Show help / getting started"),
         BotCommand("resume", "Resume a conversation"),
         BotCommand("project", "Switch project — fresh session in an existing project dir"),
         BotCommand("clear", "Reset the conversation (fresh session)"),
