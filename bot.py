@@ -542,6 +542,11 @@ def _state_save() -> None:
 
 
 def persist_binding(conv: "Conversation") -> None:
+    # A saved binding means the topic is now explicitly directed, so it is no
+    # longer "fresh" (fresh == no stored binding; see get_conv). Clearing it
+    # here stops the project picker from re-firing on the first message after an
+    # explicit /resume or /project, which bind but used to leave fresh=True.
+    conv.fresh = False
     entry: dict = {"session_id": conv.session_id}
     if conv.cwd:  # persist cwd so a fresh custom-cwd session survives a restart
         entry["cwd"] = conv.cwd
