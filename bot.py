@@ -471,6 +471,7 @@ class Conversation:
     effort: Optional[str] = None
     perm_mode: Optional[str] = None  # native CLI permission mode override
     current_model: Optional[str] = None
+    current_perm_mode: Optional[str] = None  # what init last reported
     ctx_warned: int = 0
     # continuous-consumer model: `pump` is the single task draining the CLI
     # stream for this conv's whole client lifetime; `pending` holds messages
@@ -1184,6 +1185,16 @@ async def handle_exit_plan(conv: Conversation, tool_input: dict):
         ["✅ Approve plan", "❌ Keep planning"],
     )
     if idx == 0:
+        # Approving a plan takes the CLI out of plan mode for good (verified:
+        # edits go through on this turn AND the next). Follow it, or the stale
+        # "plan" override gets re-applied on the next client rebuild and dumps
+        # the user back into planning after they approved. It lands in default,
+        # not acceptEdits - edits still ask.
+        if conv.perm_mode == "plan":
+            conv.perm_mode = None
+            conv.current_perm_mode = "default"
+            if not conv.fresh:
+                persist_binding(conv)
         return PermissionResultAllow(updated_input=tool_input)
     return PermissionResultDeny(
         message="User wants to keep planning (or did not respond); "
@@ -1736,6 +1747,8 @@ async def _pump(conv: "Conversation") -> None:
                             and isinstance(getattr(m, "data", None), dict)):
                         conv.current_model = (m.data.get("model")
                                               or conv.current_model)
+                        conv.current_perm_mode = (m.data.get("permissionMode")
+                                                  or conv.current_perm_mode)
                     if isinstance(m, AssistantMessage):
                         for block in m.content:
                             if isinstance(block, TextBlock):
@@ -2314,8 +2327,11 @@ async def fetch_models() -> list:
 #                           back, the session is untouched.
 #   model_fallback          turn-scoped; the primary is retried next turn.
 #   model_consent_fallback  a consent prompt produced the swap.
+#   model_refusal_no_fallback  the model refused and NOTHING retried - the turn
+#                           just produces nothing, which looks like a bug from
+#                           the chat side unless we say what happened.
 _MODEL_SWITCH_SUBS = ("model_refusal_fallback", "model_fallback",
-                      "model_consent_fallback")
+                      "model_consent_fallback", "model_refusal_no_fallback")
 
 
 def _wire(d: dict, name: str):
@@ -2331,6 +2347,15 @@ async def _notify_model_switch(target, conv: "Conversation", m) -> None:
     sub = getattr(m, "subtype", "")
     was = _norm_model(_wire(d, "original_model")) or "?"
     now = _norm_model(_wire(d, "fallback_model")) or "?"
+    if sub == "model_refusal_no_fallback":  # refused, nothing took over
+        why = _wire(d, "api_refusal_category")
+        await target.effective_message.reply_text(
+            f"⚠️ {was} refused this message"
+            + (f" [{why}]" if why else "")
+            + " and no fallback model ran — the turn produced nothing.\n"
+              "(/model to switch, or rephrase)",
+            disable_notification=True)
+        return
     scope = _wire(d, "scope") or ("session" if sub != "model_fallback"
                                   else "turn")
     if scope == "local":  # a subagent/side-question only; session unchanged
@@ -2917,7 +2942,8 @@ async def apply_perm_mode(reply, conv: Conversation, mode: str) -> None:
         return
     mode = canon
     conv.perm_mode = None if mode == "default" else mode
-    persist_binding(conv)
+    if not conv.fresh:  # same reasoning as apply_model
+        persist_binding(conv)
     label = PERM_MODE_LABEL.get(mode, mode)
     if conv.client is not None:
         try:
@@ -3058,9 +3084,17 @@ async def cmd_status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         mline += f" ⚠️ (fell back from {want}; re-pick /model)"
     elif conv.model:
         mline += " (override)"
-    if conv.effort:
-        mline += f" · effort: {conv.effort}"
+    if conv.effort:  # no readback channel exists for effort - init omits it,
+        mline += f" · effort: {conv.effort}"  # so this is the requested value
     lines.append(mline)
+    want_pm = conv.perm_mode or "default"
+    act_pm = conv.current_perm_mode or (want_pm if conv.client is None else None)
+    pline = f"🔐 {PERM_MODE_LABEL.get(act_pm or want_pm, act_pm or want_pm)}"
+    if act_pm and act_pm != want_pm:
+        pline += f" ⚠️ (you set {want_pm})"
+    if conv.mode_rebuild_pending:
+        pline += " · pending: applies on the next message"
+    lines.append(pline)
     total = await asyncio.to_thread(_session_context_tokens, conv.session_id)
     limit = await _context_limit(conv, total)
     pct = total * 100 / limit if total else 0
