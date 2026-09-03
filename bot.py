@@ -382,6 +382,9 @@ def _chunk_md(text: str, limit: int = 3500) -> list:
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "large-v3-turbo")
+# Sanity ceiling only (1h). Long recordings are transcribed, not rejected: a
+# re-record costs the user far more than the CPU minutes cost us.
+VOICE_MAX_SEC = int(os.environ.get("TGCLAUDE_VOICE_MAX_SEC", "3600"))
 _whisper_model = None
 
 
@@ -422,9 +425,22 @@ _WHISPER_OUTRO_RE = re.compile(
 )
 
 
-async def transcribe(path: str) -> str:
+# One whisper job at a time. The model is CPU-int8 on 4 cores and already
+# saturates them (measured: 8 threads is SLOWER than 4), so two concurrent long
+# transcriptions just make both crawl.
+_ASR_SEM = asyncio.Semaphore(1)
+
+# Measured on this box with large-v3-turbo/int8: ~0.35x realtime. Used only to
+# tell the user what they are in for; the real clock comes from progress.
+ASR_REALTIME_FACTOR = 0.4
+
+
+async def transcribe(path: str, progress=None) -> str:
+    """progress: optional async fn(done_s, total_s) called while decoding."""
+    state = {"pos": 0.0, "total": 0.0}
+
     def _run() -> str:
-        segments, _info = _get_whisper().transcribe(
+        segments, info = _get_whisper().transcribe(
             path,
             # vad_filter is OFF on purpose. Silero VAD was misclassifying whole
             # clips as non-speech and returning ZERO segments, so a real 13.7s
@@ -437,7 +453,11 @@ async def transcribe(path: str) -> str:
             condition_on_previous_text=False,
             initial_prompt="以下是简体中文普通话，可能夹杂英文。",
         )
-        seg_list = list(segments)
+        state["total"] = getattr(info, "duration", 0.0) or 0.0
+        seg_list = []
+        for seg in segments:            # a generator: this is where the work
+            seg_list.append(seg)        # happens, so it is where progress lives
+            state["pos"] = seg.end
         # drop segments that ARE an outro (start with an outro head), then peel a
         # trailing outro fused onto the last real segment.
         text = "".join(
@@ -445,7 +465,20 @@ async def transcribe(path: str) -> str:
             if not _WHISPER_OUTRO_RE.match(s.text.strip())).strip()
         text = _WHISPER_OUTRO_RE.sub("", text).strip()
         return text
-    return await asyncio.to_thread(_run)
+
+    async def _ticker() -> None:
+        while True:
+            await asyncio.sleep(20)
+            if state["total"]:
+                await progress(state["pos"], state["total"])
+
+    async with _ASR_SEM:
+        tick = asyncio.create_task(_ticker()) if progress else None
+        try:
+            return await asyncio.to_thread(_run)
+        finally:
+            if tick is not None:
+                tick.cancel()
 
 
 ConvKey = Tuple[int, int]
@@ -3886,11 +3919,27 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     media = msg.voice or msg.audio
     if media is None:
         return
-    if media.duration and media.duration > 600:
-        await msg.reply_text("Voice message too long (>10 min).")
+    # Whisper itself has no length limit - it decodes in 30s windows - so the
+    # old hard reject at 10 min threw away recordings for no technical reason.
+    # (Speeding the audio up does NOT help: cost tracks decoded TOKENS, not
+    # seconds. Measured 1.5x atempo on a 50s clip: 18.6s vs 16.7s, i.e. slower,
+    # and the text came back scrambled.) Keep only a sanity ceiling.
+    secs = media.duration or 0
+    if secs > VOICE_MAX_SEC:
+        await msg.reply_text(
+            f"That's {secs // 60} min of audio; the ceiling is "
+            f"{VOICE_MAX_SEC // 60} min (TGCLAUDE_VOICE_MAX_SEC). "
+            "Nothing was lost — send it in parts, or raise the ceiling."
+        )
         return
-    placeholder = ("🎙 Preparing speech model… (first use may download it)"
-                   if _whisper_model is None else "🎤 Transcribing…")
+    if _whisper_model is None:
+        placeholder = "🎙 Preparing speech model… (first use may download it)"
+    elif secs > 120:  # long enough that silence would read as a hang
+        placeholder = (f"🎤 Transcribing {secs // 60}m{secs % 60:02d}s"
+                       f" — roughly {max(1, round(secs * ASR_REALTIME_FACTOR / 60))}"
+                       f" min, progress below.")
+    else:
+        placeholder = "🎤 Transcribing…"
     try:
         notice = await msg.reply_text(placeholder, disable_notification=True)
     except Exception:
@@ -3909,7 +3958,22 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         f = await ctx.bot.get_file(media.file_id)
         await f.download_to_drive(custom_path=str(tmp))
-        text = await transcribe(str(tmp))
+        async def on_progress(done: float, total: float) -> None:
+            # edit-only, and silent on failure: show() would fall back to a NEW
+            # message, i.e. a fresh notification every 20s for a long recording
+            if notice is None:
+                return
+            pct = min(99, int(done * 100 / total)) if total else 0
+            left = max(0, (total - done)) * ASR_REALTIME_FACTOR
+            try:
+                await notice.edit_text(
+                    f"🎤 Transcribing… {pct}% {_bar(pct)}"
+                    f"  (~{max(1, round(left / 60))} min left)")
+            except Exception:
+                pass
+
+        text = await transcribe(str(tmp), progress=on_progress if secs > 120
+                                else None)
     except Exception as e:
         log.exception("voice transcription failed")
         await show(f"Transcription failed: {e}")
