@@ -511,6 +511,9 @@ class Conversation:
     # this conv; whoever brings it to zero fires the whole batch.
     voice_active: int = 0
     voice_pending: list = field(default_factory=list)
+    # Set when an approved plan took the CLI out of plan mode. Kept separate
+    # from perm_mode so the user's own setting is never silently rewritten.
+    plan_exited: bool = False
     ctx_warned: int = 0
     # continuous-consumer model: `pump` is the single task draining the CLI
     # stream for this conv's whole client lifetime; `pending` holds messages
@@ -1045,7 +1048,7 @@ def build_options(conv: Conversation) -> ClaudeAgentOptions:
             },
             cwd=conv.cwd,
             resume=conv.session_id,
-            permission_mode=conv.perm_mode or "default",
+            permission_mode=effective_perm_mode(conv),
             can_use_tool=make_owner_cb(conv),
             model=conv.model,
             effort=conv.effort,
@@ -1064,7 +1067,7 @@ def build_options(conv: Conversation) -> ClaudeAgentOptions:
         allowed_tools=sorted(READ_TOOLS | WRITE_TOOLS | WEB_TOOLS) + [TG_SEND_TOOL],
         mcp_servers={"tgclaude": _tg_mcp_server(conv)},  # send_file (scope-checked)
         can_use_tool=make_permission_cb(conv),
-        permission_mode=conv.perm_mode or "default",
+        permission_mode=effective_perm_mode(conv),
         resume=conv.session_id,
         include_partial_messages=True,  # live thinking/text stream for status
         setting_sources=["user", "project"],
@@ -1230,15 +1233,13 @@ async def handle_exit_plan(conv: Conversation, tool_input: dict):
     )
     if idx == 0:
         # Approving a plan takes the CLI out of plan mode for good (verified:
-        # edits go through on this turn AND the next). Follow it, or the stale
-        # "plan" override gets re-applied on the next client rebuild and dumps
-        # the user back into planning after they approved. It lands in default,
-        # not acceptEdits - edits still ask.
+        # edits land on this turn AND the next). Record that, but do NOT
+        # rewrite conv.perm_mode - that is the user's standing choice for this
+        # topic and ours to read, not to edit. plan_exited keeps the next
+        # client from re-imposing plan mode on a plan they already approved.
         if conv.perm_mode == "plan":
-            conv.perm_mode = None
+            conv.plan_exited = True
             conv.current_perm_mode = "default"
-            if not conv.fresh:
-                persist_binding(conv)
         return PermissionResultAllow(updated_input=tool_input)
     return PermissionResultDeny(
         message="User wants to keep planning (or did not respond); "
@@ -2148,6 +2149,7 @@ async def cmd_reset(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     async with conv.lock:
         await drop_client(conv)
         conv.session_id = None
+        conv.plan_exited = False
         persist_binding(conv)
     await update.effective_message.reply_text("Fresh session on next message.")
 
@@ -2417,6 +2419,14 @@ async def _notify_model_switch(target, conv: "Conversation", m) -> None:
         line += f" [{why}]"
     await target.effective_message.reply_text(
         f"{line}\n({note})", disable_notification=True)
+
+
+def effective_perm_mode(conv: "Conversation") -> str:
+    """The mode a new client should start in: the user's setting, unless this
+    session has already left plan mode by approving a plan."""
+    if conv.perm_mode == "plan" and conv.plan_exited:
+        return "default"
+    return conv.perm_mode or "default"
 
 
 def _norm_model(mid: Optional[str]) -> str:
@@ -2999,6 +3009,7 @@ async def apply_perm_mode(reply, conv: Conversation, mode: str) -> None:
         return
     mode = canon
     conv.perm_mode = None if mode == "default" else mode
+    conv.plan_exited = False  # an explicit choice overrides the session's drift
     if not conv.fresh:  # same reasoning as apply_model
         persist_binding(conv)
     label = PERM_MODE_LABEL.get(mode, mode)
@@ -3152,7 +3163,9 @@ async def cmd_status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     want_pm = conv.perm_mode or "default"
     act_pm = conv.current_perm_mode or (want_pm if conv.client is None else None)
     pline = f"🔐 {PERM_MODE_LABEL.get(act_pm or want_pm, act_pm or want_pm)}"
-    if act_pm and act_pm != want_pm:
+    if conv.perm_mode == "plan" and conv.plan_exited:
+        pline += " · plan approved — your ⏸ plan setting resumes on /clear"
+    elif act_pm and act_pm != want_pm:
         pline += f" ⚠️ (you set {want_pm})"
     if conv.mode_rebuild_pending:
         pline += " · pending: applies on the next message"
