@@ -906,6 +906,11 @@ async def drop_client(conv: Conversation) -> None:
         except Exception:
             log.exception("disconnect error for %s", conv.key)
         conv.client = None
+    # current_* is "what the live client reports". Without a client there is
+    # nothing to report, and a stale value would be read back as the effective
+    # setting - /status falls back to the transcript / the override instead.
+    conv.current_model = None
+    conv.current_perm_mode = None
 
 
 # Prefer the system CLI over the SDK's bundled one: sessions created in the
@@ -2721,9 +2726,14 @@ async def apply_model(reply, conv: Conversation, m: str) -> None:
         try:
             await conv.client.set_model(conv.model)
         except Exception as e:
-            await reply(f"set_model failed: {e}")
+            # the override is set but the live client never took it: schedule
+            # the rebuild, or it would quietly keep answering as the old model
+            conv.mode_rebuild_pending = True
+            await reply(f"set_model failed: {e}\nApplying on the next message "
+                        "instead (session resumes, context preserved).")
             return
-        await reply(f"Model set to {m} (live).")
+        conv.current_model = conv.model  # else /status reads the pre-switch
+        await reply(f"Model set to {m} (live).")  # transcript and cries wolf
     else:
         await reply(f"Model set to {m}; applies on next message.")
 
@@ -2737,9 +2747,17 @@ async def apply_effort(reply, conv: Conversation, e: str) -> None:
     conv.effort = None if e == "default" else e  # 'default' clears the override
     if not conv.fresh:  # same reasoning as apply_model
         persist_binding(conv)
-    await drop_client(conv)
+    # Effort only lands at client creation, so it needs a rebuild - but dropping
+    # the client mid-turn cancels the pump and kills that turn. Defer like
+    # apply_perm_mode does; ensure_client rebuilds once the turn is done.
+    if conv.working_since is None:
+        await drop_client(conv)
+        when = "from the next message"
+    else:
+        conv.mode_rebuild_pending = True
+        when = "after this turn finishes"
     await reply(
-        f"Effort set to {e}; applies from the next message "
+        f"Effort set to {e}; applies {when} "
         "(session resumes, context preserved)."
     )
 
@@ -2948,6 +2966,7 @@ async def apply_perm_mode(reply, conv: Conversation, mode: str) -> None:
     if conv.client is not None:
         try:
             await conv.client.set_permission_mode(mode)
+            conv.current_perm_mode = mode  # the switch took: don't warn on it
             conv.mode_rebuild_pending = False
             await reply(f"{label} (live, this conversation).")
             return
@@ -3077,7 +3096,11 @@ async def cmd_status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     # trips (scope:"session", it never switches back) - showing the override
     # alone once hid a two-day Fable -> Opus 4.8 fallback.
     want = _norm_model(conv.model)
-    actual = _norm_model(_session_model(conv.session_id) or conv.current_model)
+    # current_model first: it is maintained by init, by a successful live
+    # /model, and by the fallback events, so it is never behind. The transcript
+    # is the fallback for when no client is live (after a restart, say) - which
+    # is exactly the case that has to keep warning.
+    actual = _norm_model(conv.current_model or _session_model(conv.session_id))
     model = actual or want
     mline = f"🤖 {model or 'default model'}"
     if want and actual and actual != want:
