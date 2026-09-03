@@ -505,6 +505,11 @@ class Conversation:
     perm_mode: Optional[str] = None  # native CLI permission mode override
     current_model: Optional[str] = None
     current_perm_mode: Optional[str] = None  # what init last reported
+    # A burst of voice notes is ONE thought, so it must reach the model as one
+    # message. `voice_active` counts notes still downloading/transcribing for
+    # this conv; whoever brings it to zero fires the whole batch.
+    voice_active: int = 0
+    voice_pending: list = field(default_factory=list)
     ctx_warned: int = 0
     # continuous-consumer model: `pump` is the single task draining the CLI
     # stream for this conv's whole client lifetime; `pending` holds messages
@@ -3954,6 +3959,10 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 pass
         await msg.reply_text(text_, disable_notification=True)
 
+    conv = get_conv(update)
+    conv.voice_active += 1
+    text = ""
+    failed = False
     tmp = Path(f"/tmp/tgvoice-{uuid.uuid4().hex}.oga")
     try:
         f = await ctx.bot.get_file(media.file_id)
@@ -3976,23 +3985,48 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                                 else None)
     except Exception as e:
         log.exception("voice transcription failed")
+        failed = True
         await show(f"Transcription failed: {e}")
-        return
     finally:
         tmp.unlink(missing_ok=True)
-    if not text:
-        await show("(听不清，转写为空)")
-        return
+        # Decrement here so a FAILED note still releases the batch: whoever
+        # sees the count reach zero flushes, success or not. Otherwise a note
+        # that blew up leaves its neighbour's transcript held forever.
+        conv.voice_active = max(0, conv.voice_active - 1)
+
     user = update.effective_user
     name = user.full_name if user else "unknown"
     uid = user.id if user else 0
-    log.info("voice %s user=%s -> %r", conv_key_of(update), uid, text[:120])
-    await show(f"🎤 {text}")
-    await run_turn(
-        update, ctx,
-        f"[{name} ({uid})] (voice): {forward_context(msg)}"
-        f"{reply_context(msg)}{text}"
-    )
+    if text:
+        log.info("voice %s user=%s -> %r", conv_key_of(update), uid, text[:120])
+        # Splitting one long thought across several notes must not reach the
+        # model as several messages: hold the transcript while another note is
+        # still being transcribed. No artificial settle delay - the window IS
+        # the other note's transcription, so a lone note fires immediately.
+        conv.voice_pending.append(
+            (uid, name, msg.message_id,
+             f"{forward_context(msg)}{reply_context(msg)}", text))
+        await show(f"🎤 {text}" + ("\n\n⏳ held — sending together with your "
+                                  "other note" if conv.voice_active else ""))
+    elif not failed:
+        await show("(听不清，转写为空)")
+    if conv.voice_active:      # someone else is still going; they will flush
+        return
+    await _flush_voice_batch(conv, update, ctx)
+
+
+async def _flush_voice_batch(conv, update, ctx) -> None:
+    """Send every held transcript, ordered by ARRIVAL (message id) rather than
+    by whichever transcription happened to finish first - the fast note is
+    often the second one. One turn per speaker: merging a burst is the point,
+    merging two people is not."""
+    batch, conv.voice_pending = conv.voice_pending, []
+    batch.sort(key=lambda r: r[2])
+    for uid in dict.fromkeys(r[0] for r in batch):        # first-seen order
+        mine = [r for r in batch if r[0] == uid]
+        name, prefix = mine[0][1], mine[0][3]
+        await run_turn(update, ctx, f"[{name} ({uid})] (voice): {prefix}"
+                       + "\n\n".join(r[4] for r in mine))
 
 
 MEDIA_TTL_DAYS = float(
