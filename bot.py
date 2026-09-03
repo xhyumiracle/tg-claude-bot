@@ -1825,6 +1825,20 @@ async def _pump(conv: "Conversation") -> None:
                             except Exception:
                                 log.exception("compact-hold release(boundary) "
                                               "%s", conv.key)
+                    elif (isinstance(m, SystemMessage)
+                          and getattr(m, "subtype", "") in _MODEL_SWITCH_SUBS):
+                        # The CLI can move a session onto a different model on
+                        # its own (Fable safeguards flagging a message, a dead
+                        # primary, a consent swap) and, for the refusal case,
+                        # KEEP it there. It emits a system event for that and we
+                        # used to drop it, so the switch was invisible: /status
+                        # kept showing the requested override while another
+                        # model answered for two days. Relay it.
+                        try:
+                            await _notify_model_switch(target, conv, m)
+                        except Exception:
+                            log.exception("model-switch notice for %s",
+                                          conv.key)
                     elif isinstance(m, UserMessage):
                         # relay CLI local-command output (/context, /cost, ...)
                         content = getattr(m, "content", None)
@@ -2290,6 +2304,52 @@ async def fetch_models() -> list:
     return data
 
 
+# System subtypes that mean "something other than your chosen model answered".
+# Wire shape is snake_case (the camelCase spelling only exists in the transcript
+# records, so read both); the semantics differ per subtype and getting them
+# wrong turns this notice into a new lie:
+#   model_refusal_fallback  scope "session" (or absent, older CLIs) -> the
+#                           session model is swapped and STAYS swapped;
+#                           scope "local" -> only a subagent/side-question fell
+#                           back, the session is untouched.
+#   model_fallback          turn-scoped; the primary is retried next turn.
+#   model_consent_fallback  a consent prompt produced the swap.
+_MODEL_SWITCH_SUBS = ("model_refusal_fallback", "model_fallback",
+                      "model_consent_fallback")
+
+
+def _wire(d: dict, name: str):
+    """Read a field that is snake_case on the wire, camelCase in transcripts."""
+    if name in d:
+        return d[name]
+    head, *rest = name.split("_")
+    return d.get(head + "".join(w.capitalize() for w in rest))
+
+
+async def _notify_model_switch(target, conv: "Conversation", m) -> None:
+    d = getattr(m, "data", None) or {}
+    sub = getattr(m, "subtype", "")
+    was = _norm_model(_wire(d, "original_model")) or "?"
+    now = _norm_model(_wire(d, "fallback_model")) or "?"
+    scope = _wire(d, "scope") or ("session" if sub != "model_fallback"
+                                  else "turn")
+    if scope == "local":  # a subagent/side-question only; session unchanged
+        note = "that subagent/side-question only — session model unchanged"
+    elif scope == "session":
+        conv.current_model = _wire(d, "fallback_model") or conv.current_model
+        note = ("session-wide and sticky — re-pick /model to go back"
+                if _wire(d, "direction") != "revert" else "session-wide")
+    else:
+        note = "this turn only — your model is retried on the next one"
+    why = _wire(d, "api_refusal_category")
+    verb = "reverted" if _wire(d, "direction") == "revert" else "switched"
+    line = f"⚠️ Model {verb}: {was} → {now}"
+    if why:
+        line += f" [{why}]"
+    await target.effective_message.reply_text(
+        f"{line}\n({note})", disable_notification=True)
+
+
 def _norm_model(mid: Optional[str]) -> str:
     """claude-fable-5[1m] and claude-fable-5 are the same model."""
     return re.sub(r"\[[^\]]*\]$", "", mid or "")
@@ -2309,7 +2369,13 @@ def _session_model(sid: Optional[str]) -> Optional[str]:
                 tail = fh.read().decode("utf-8", errors="ignore")
         except OSError:
             return None
-        hits = re.findall(r'"model"\s*:\s*"([^"]+)"', tail)
+        # Anchored on the record shape ("message":{"model":...}) so that prose
+        # merely MENTIONING a model id (this bot's own chat about models ends up
+        # in the transcript) can't be mistaken for the model that answered.
+        hits = re.findall(r'"message"\s*:\s*\{\s*"model"\s*:\s*"([^"]+)"',
+                          tail)
+        if not hits:  # older/other record shapes
+            hits = re.findall(r'"model"\s*:\s*"([^"]+)"', tail)
         hits = [h for h in hits if h.startswith("claude")]
         return hits[-1] if hits else None
     return None
@@ -2620,6 +2686,12 @@ async def refresh_effort_choices(app: Application) -> None:
 
 async def apply_model(reply, conv: Conversation, m: str) -> None:
     conv.model = None if m == "default" else m
+    # Persist it: a memory-only override silently died on every restart and the
+    # session quietly reverted to the account default. Not on a still-fresh
+    # topic though - writing a binding there would suppress the project picker
+    # (see get_conv); its first turn persists the override anyway.
+    if not conv.fresh:
+        persist_binding(conv)
     if conv.client is not None:
         try:
             await conv.client.set_model(conv.model)
@@ -2638,6 +2710,8 @@ async def apply_effort(reply, conv: Conversation, e: str) -> None:
                     + ", ".join(EFFORT_CHOICES))
         return
     conv.effort = None if e == "default" else e  # 'default' clears the override
+    if not conv.fresh:  # same reasoning as apply_model
+        persist_binding(conv)
     await drop_client(conv)
     await reply(
         f"Effort set to {e}; applies from the next message "
@@ -2972,10 +3046,17 @@ async def cmd_status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         lines.append("📄 (new session on next message)")
     lines.append(f"📁 {conv.cwd}")
-    model = _norm_model(conv.model or conv.current_model
-                        or _session_model(conv.session_id))
+    # Report what actually answered, not what we asked for. The CLI reroutes a
+    # whole session to another model when a safety classifier or a usage limit
+    # trips (scope:"session", it never switches back) - showing the override
+    # alone once hid a two-day Fable -> Opus 4.8 fallback.
+    want = _norm_model(conv.model)
+    actual = _norm_model(_session_model(conv.session_id) or conv.current_model)
+    model = actual or want
     mline = f"🤖 {model or 'default model'}"
-    if conv.model:
+    if want and actual and actual != want:
+        mline += f" ⚠️ (fell back from {want}; re-pick /model)"
+    elif conv.model:
         mline += " (override)"
     if conv.effort:
         mline += f" · effort: {conv.effort}"
