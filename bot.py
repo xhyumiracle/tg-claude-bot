@@ -385,6 +385,7 @@ WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "large-v3-turbo")
 # Sanity ceiling only (1h). Long recordings are transcribed, not rejected: a
 # re-record costs the user far more than the CPU minutes cost us.
 VOICE_MAX_SEC = int(os.environ.get("TGCLAUDE_VOICE_MAX_SEC", "3600"))
+TG_TEXT_LIMIT = 4096  # Telegram's hard per-message cap
 _whisper_model = None
 
 
@@ -3929,6 +3930,16 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # (Speeding the audio up does NOT help: cost tracks decoded TOKENS, not
     # seconds. Measured 1.5x atempo on a 50s clip: 18.6s vs 16.7s, i.e. slower,
     # and the text came back scrambled.) Keep only a sanity ceiling.
+    # The Bot API refuses to serve a file over 20 MB, with an error that reads
+    # like a transcription failure. A voice note stays well under that even at
+    # an hour (opus ~16-32 kbps), but an attached mp3/m4a easily does not.
+    if (media.file_size or 0) > 20_000_000:
+        await msg.reply_text(
+            f"That file is {media.file_size / 1_000_000:.0f} MB; Telegram only "
+            "lets bots download up to 20 MB. Voice notes are fine at any "
+            "length — it's attached audio files that hit this."
+        )
+        return
     secs = media.duration or 0
     if secs > VOICE_MAX_SEC:
         await msg.reply_text(
@@ -3951,13 +3962,25 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         notice = None
 
     async def show(text_: str) -> None:
+        # The echo must never kill the turn. A long transcript blows past
+        # Telegram's 4096-char message limit, and the send here used to be
+        # unguarded: it raised straight out of on_voice, losing the recording
+        # it had just spent minutes transcribing. Trim the echo (the full text
+        # still goes to the model) and swallow whatever Telegram says.
+        if len(text_) > TG_TEXT_LIMIT:
+            n = len(text_)
+            text_ = (text_[:TG_TEXT_LIMIT - 120]
+                     + f"\n\n…(echo trimmed — all {n} chars went to the model)")
         if notice is not None:
             try:
                 await notice.edit_text(text_)
                 return
             except Exception:
                 pass
-        await msg.reply_text(text_, disable_notification=True)
+        try:
+            await msg.reply_text(text_, disable_notification=True)
+        except Exception:
+            log.exception("voice echo failed for %s", conv_key_of(update))
 
     conv = get_conv(update)
     conv.voice_active += 1
