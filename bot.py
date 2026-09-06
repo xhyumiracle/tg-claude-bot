@@ -89,6 +89,19 @@ TARGET_GROUP_IDS = {
     for x in os.environ.get(key, "").replace(",", " ").split()
 }
 DEFAULT_RESUME = os.environ.get("RESUME_SESSION_ID", "")
+# Groups whose topics count as the owner's own workspace, i.e. the same full
+# trust as the owner's DM. Defaults to every allowed group: TARGET_GROUP_IDS is
+# already an allowlist the owner maintains by hand, and treating your own
+# project topics as visiting strangers is what forced bypass mode everywhere.
+# Set TGCLAUDE_TRUSTED_GROUP_IDS to a narrower list (or "none") to sandbox the
+# rest - that is the setting to reach for once a group has people in it who
+# should not get an unsandboxed shell.
+_trusted_env = os.environ.get("TGCLAUDE_TRUSTED_GROUP_IDS")
+TRUSTED_GROUP_IDS = (
+    set() if (_trusted_env or "").strip().lower() in ("none", "0")
+    else {int(x) for x in _trusted_env.replace(",", " ").split()} if _trusted_env
+    else set(TARGET_GROUP_IDS)
+)
 
 HOME = Path.home()
 OWNER_DEFAULT_CWD = os.environ.get("OWNER_DEFAULT_CWD", str(HOME))
@@ -386,6 +399,12 @@ WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "large-v3-turbo")
 # re-record costs the user far more than the CPU minutes cost us.
 VOICE_MAX_SEC = int(os.environ.get("TGCLAUDE_VOICE_MAX_SEC", "3600"))
 TG_TEXT_LIMIT = 4096  # Telegram's hard per-message cap
+# Permission mode for a topic that has never picked one. Kept OUT of the stored
+# binding (bindings hold overrides only), so changing it here moves every topic
+# that never chose, and never rewrites one that did. Picking "default" from
+# /mode is an explicit choice and still means the CLI's ask-for-everything.
+DEFAULT_PERM_MODE = os.environ.get("TGCLAUDE_DEFAULT_PERM_MODE",
+                                   "bypassPermissions")
 _whisper_model = None
 
 
@@ -894,6 +913,34 @@ def conv_key_of(update: Update) -> ConvKey:
     return (update.effective_chat.id, thread)
 
 
+def profile_for(chat_id: int, thread: int) -> str:
+    """The trust profile for a topic. It is keyed on the ROOM, not the speaker,
+    because one client serves a whole topic and a room can have several people
+    in it - a per-message profile would let a guest ride a client that was
+    built for the owner. "owner" = full tools, no path scoping; "guest" = a
+    read/write/web allowlist confined to GUEST_*_DIRS, anything else asks."""
+    if chat_id == OWNER_ID and thread == 0:
+        return "owner"
+    return "owner" if chat_id in TRUSTED_GROUP_IDS else "guest"
+
+
+def apply_binding(conv: "Conversation", stored: dict) -> None:
+    """Restore a topic's stored settings onto a conv. ONE function, called from
+    both the normal path and the crash-recovery path, because recovery used to
+    hand-restore its own subset: it forgot perm_mode, so every unclean restart
+    silently dropped every recovered topic back to asking for everything."""
+    if stored.get("cwd"):         # restored for a fresh session; a resumed
+        conv.cwd = stored["cwd"]  # session's own file cwd overrides below
+    ssid = stored.get("session_id")
+    meta = find_session(ssid) if ssid else None
+    if meta:
+        conv.session_id = ssid
+        conv.cwd = meta["cwd"] or conv.cwd
+    conv.model = stored.get("model") or conv.model
+    conv.effort = stored.get("effort") or conv.effort
+    conv.perm_mode = stored.get("perm_mode") or conv.perm_mode
+
+
 def get_conv(update: Update) -> Conversation:
     key = conv_key_of(update)
     if key not in conversations:
@@ -915,7 +962,7 @@ def get_conv(update: Update) -> Conversation:
             # dir), NOT a configured project — use /project to switch into one.
             # Pathless Glob/Grep stay scoped to an empty dir (nothing to leak).
             conv = Conversation(
-                key=key, profile="guest",
+                key=key, profile=profile_for(*key),
                 cwd=str(PLAYGROUND_DIR),
             )
         # Restart continuity: a topic keeps pointing at the session it was on.
@@ -923,16 +970,7 @@ def get_conv(update: Update) -> Conversation:
         # cwd comes from the CLI's own session file, not from our state.
         stored = stored_binding(key)
         if stored:
-            if stored.get("cwd"):     # restored for a fresh session; a resumed
-                conv.cwd = stored["cwd"]  # session's own file cwd overrides below
-            ssid = stored.get("session_id")
-            meta = find_session(ssid) if ssid else None
-            if meta:
-                conv.session_id = ssid
-                conv.cwd = meta["cwd"] or conv.cwd
-            conv.model = stored.get("model") or conv.model
-            conv.effort = stored.get("effort") or conv.effort
-            conv.perm_mode = stored.get("perm_mode") or conv.perm_mode
+            apply_binding(conv, stored)
         conv.fresh = not stored  # no prior binding → a genuinely new topic
         conversations[key] = conv
     return conversations[key]
@@ -2426,7 +2464,7 @@ def effective_perm_mode(conv: "Conversation") -> str:
     session has already left plan mode by approving a plan."""
     if conv.perm_mode == "plan" and conv.plan_exited:
         return "default"
-    return conv.perm_mode or "default"
+    return conv.perm_mode or DEFAULT_PERM_MODE
 
 
 def _norm_model(mid: Optional[str]) -> str:
@@ -2985,7 +3023,7 @@ _PERM_ALIASES = {
 @menu("pm")
 async def _menu_perm_mode(update: Update):
     conv = get_conv(update)
-    active = conv.perm_mode or "default"
+    active = effective_perm_mode(conv)  # ✓ on what is in force, chosen or not
     # ✓ marks the active choice — same convention as /model, /effort, /whisper.
     items = [[InlineKeyboardButton(
         f"{'✓ ' if m == active else ''}{label}",
@@ -3008,7 +3046,10 @@ async def apply_perm_mode(reply, conv: Conversation, mode: str) -> None:
                     "plan, or bypass.")
         return
     mode = canon
-    conv.perm_mode = None if mode == "default" else mode
+    # Store "default" literally rather than as None: None now means "never
+    # chose" and resolves to DEFAULT_PERM_MODE, so clearing to None would hand
+    # back bypass to someone who just explicitly asked to be asked.
+    conv.perm_mode = mode
     conv.plan_exited = False  # an explicit choice overrides the session's drift
     if not conv.fresh:  # same reasoning as apply_model
         persist_binding(conv)
@@ -3160,7 +3201,7 @@ async def cmd_status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     if conv.effort:  # no readback channel exists for effort - init omits it,
         mline += f" · effort: {conv.effort}"  # so this is the requested value
     lines.append(mline)
-    want_pm = conv.perm_mode or "default"
+    want_pm = effective_perm_mode(conv)
     act_pm = conv.current_perm_mode or (want_pm if conv.client is None else None)
     pline = f"🔐 {PERM_MODE_LABEL.get(act_pm or want_pm, act_pm or want_pm)}"
     if conv.perm_mode == "plan" and conv.plan_exited:
@@ -3781,13 +3822,17 @@ async def _recover_conv(app: Application, key: ConvKey, ent: dict) -> None:
     if conv is None:
         conv = Conversation(
             key=key,
-            profile="owner" if (chat_id == OWNER_ID and thread == 0) else "guest",
+            profile=profile_for(chat_id, thread),
             cwd=meta["cwd"] or str(PLAYGROUND_DIR),
             session_id=sid,
         )
-        conv.model = binding.get("model")
-        conv.effort = binding.get("effort")
+        apply_binding(conv, binding)   # model, effort AND perm_mode
         conversations[key] = conv
+    # Recovery has no incoming message to attribute, so last_user_id stayed 0
+    # and the guest bridge's "escalate to the owner" branch could never fire:
+    # an out-of-scope tool was flat-denied with no button to approve it. The
+    # only person who can answer that prompt is the owner, so ask them.
+    conv.last_user_id = conv.last_user_id or OWNER_ID
     prompt = ("[bridge] The bot process restarted mid-turn. The transcript "
               "above is complete up to the interruption; completed tool "
               "calls are recorded there. Continue the work exactly where it "
