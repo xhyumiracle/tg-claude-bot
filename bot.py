@@ -533,6 +533,10 @@ class Conversation:
     # Set when an approved plan took the CLI out of plan mode. Kept separate
     # from perm_mode so the user's own setting is never silently rewritten.
     plan_exited: bool = False
+    # Deadline the agent set itself via ScheduleWakeup (/loop), and the prompt
+    # to send if the CLI's own timer does not deliver it.
+    wake_at: Optional[float] = None
+    wake_prompt: Optional[str] = None
     ctx_warned: int = 0
     # continuous-consumer model: `pump` is the single task draining the CLI
     # stream for this conv's whole client lifetime; `pending` holds messages
@@ -1837,6 +1841,8 @@ async def _pump(conv: "Conversation") -> None:
                             if isinstance(block, TextBlock):
                                 buf.append(block.text)
                             elif isinstance(block, ToolUseBlock):
+                                if block.name == "ScheduleWakeup":
+                                    _note_wakeup(conv, block.input or {})
                                 n_tools += 1
                                 if buf:
                                     await flush()
@@ -2111,6 +2117,9 @@ async def run_turn(
                 asyncio.create_task(_release_compact_hold(conv))
         # persist first (recovery), then the 👀 marker the pump clears when
         # this input's turn produces a ResultMessage
+        # the user is driving now; a self-scheduled continuation would only
+        # collide with whatever they just asked for
+        conv.wake_at = conv.wake_prompt = None
         _inflight_add(conv, msg, queued_text=(text or "").strip() or "[media]")
         conv.pending.append(msg)
         try:
@@ -3691,6 +3700,50 @@ def _own_file(p: Path) -> bool:
         return False
 
 
+# The CLI schedules /loop wakeups inside its own process. That works in a
+# short-lived client (verified three ways: fresh, resumed, and with this bot's
+# exact options) but has been observed NOT firing in the long-lived sessions
+# this bot keeps - 4 scheduled, 0 fired, with no turn in the transcript and no
+# error anywhere. A loop that silently stops looks exactly like an agent that
+# gave up, so do not depend on that timer: record the deadline the agent set
+# for itself and, if nothing has happened well past it, send the prompt.
+WAKEUP_GRACE_S = 120.0
+
+
+def _note_wakeup(conv: "Conversation", inp: dict) -> None:
+    if inp.get("stop"):
+        conv.wake_at = conv.wake_prompt = None
+        return
+    delay, prompt = inp.get("delaySeconds"), inp.get("prompt")
+    if not delay or not prompt:
+        return
+    conv.wake_at = time.time() + min(max(float(delay), 60.0), 3600.0)
+    conv.wake_prompt = prompt
+
+
+async def wakeup_watcher(app: Application) -> None:
+    """Backstop for the CLI's own loop timer. Fires the agent's own prompt, so
+    a wakeup that arrives late is indistinguishable from one that worked; a
+    wakeup that arrives on time re-arms conv.wake_at and this never runs."""
+    while True:
+        await asyncio.sleep(20)
+        now = time.time()
+        for conv in list(conversations.values()):
+            if not conv.wake_at or now < conv.wake_at + WAKEUP_GRACE_S:
+                continue
+            if conv.working_since is not None or conv.pending:
+                continue        # a turn is already running: nothing to revive
+            prompt, conv.wake_prompt = conv.wake_prompt, None
+            conv.wake_at = None
+            try:
+                client = await ensure_client(conv)
+                await client.query(prompt)
+                conv.working_since = time.time()
+                log.info("wakeup watchdog fired for %s", conv.key)
+            except Exception:
+                log.exception("wakeup watchdog failed for %s", conv.key)
+
+
 async def restart_watcher(app: Application) -> None:
     """Graceful deploy: restart only when no conversation is mid-turn.
     Drain is an optimization — the durable-state reconcile at startup is the
@@ -3954,6 +4007,7 @@ async def post_init(app: Application) -> None:
     except Exception:
         log.exception("failed to register command menu")
     app.create_task(restart_watcher(app))
+    app.create_task(wakeup_watcher(app))
     app.create_task(refresh_effort_choices(app))
     # transform the pre-restart notice in place; only send a new message on cold boot
     edited = False
