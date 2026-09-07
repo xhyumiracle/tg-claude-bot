@@ -445,6 +445,38 @@ _WHISPER_OUTRO_RE = re.compile(
 )
 
 
+# Whisper only sees `initial_prompt` inside its FIRST 30s window: with
+# condition_on_previous_text=False, faster-whisper sets prompt_reset_since past
+# the initial prompt after every window (transcribe.py:1383), so from window two
+# on it decodes with no prompt at all — and for Chinese that means it stops
+# emitting punctuation. That is exactly what long voice notes looked like: a
+# punctuated opening, then a seven-minute wall of unbroken text. `hotwords` is
+# the one knob re-injected into EVERY window's prompt (transcribe.py:1542), so
+# it keeps the punctuation prior alive to the end. Measured on a 94s clip:
+# 6 -> 49 marks, hanzi output character-for-character identical.
+# Phrase it as a DESCRIPTION of the transcript, never as a sample sentence: a
+# sample ("你觉得呢？") leaked into the output verbatim, dropped a real sentence
+# and sent the tail into a hallucination loop.
+_ASR_HOTWORDS = ("以下是简体中文普通话的转写，可能夹杂英文，"
+                 "需要包含逗号、句号、问号等标点符号。")
+_SENT_END = "。！？!?…"
+
+
+def _join_segments(segs) -> str:
+    """Whisper's segment boundaries are the speaker's breath groups, so start a
+    new paragraph at each one — but only where the previous segment actually
+    closed a sentence, so a mid-sentence split stays on one line."""
+    out: List[str] = []
+    for s in segs:
+        t = s.text.strip()
+        if not t:
+            continue
+        if out and out[-1][-1] in _SENT_END:
+            out.append("\n")
+        out.append(t)
+    return "".join(out)
+
+
 # One whisper job at a time. The model is CPU-int8 on 4 cores and already
 # saturates them (measured: 8 threads is SLOWER than 4), so two concurrent long
 # transcriptions just make both crawl.
@@ -472,6 +504,7 @@ async def transcribe(path: str, progress=None) -> str:
             vad_filter=False,
             condition_on_previous_text=False,
             initial_prompt="以下是简体中文普通话，可能夹杂英文。",
+            hotwords=_ASR_HOTWORDS,
         )
         state["total"] = getattr(info, "duration", 0.0) or 0.0
         seg_list = []
@@ -480,11 +513,15 @@ async def transcribe(path: str, progress=None) -> str:
             state["pos"] = seg.end
         # drop segments that ARE an outro (start with an outro head), then peel a
         # trailing outro fused onto the last real segment.
-        text = "".join(
-            s.text for s in seg_list
-            if not _WHISPER_OUTRO_RE.match(s.text.strip())).strip()
-        text = _WHISPER_OUTRO_RE.sub("", text).strip()
-        return text
+        text = _join_segments(
+            s for s in seg_list
+            if not _WHISPER_OUTRO_RE.match(s.text.strip()))
+        # the outro is always fused onto the tail, so peel it off the last
+        # paragraph only — the regex ends in `.*$`, which no longer spans the
+        # paragraph breaks we now insert.
+        paras = text.split("\n")
+        paras[-1] = _WHISPER_OUTRO_RE.sub("", paras[-1])
+        return "\n".join(p for p in paras if p.strip()).strip()
 
     async def _ticker() -> None:
         while True:
