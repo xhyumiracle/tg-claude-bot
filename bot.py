@@ -16,7 +16,7 @@ import hashlib
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from claude_agent_sdk import (
     ClaudeAgentOptions, ClaudeSDKClient, create_sdk_mcp_server, tool)
@@ -457,6 +457,52 @@ _WHISPER_OUTRO_RE = re.compile(
 # Phrase it as a DESCRIPTION of the transcript, never as a sample sentence: a
 # sample ("你觉得呢？") leaked into the output verbatim, dropped a real sentence
 # and sent the tail into a hallucination loop.
+# Language ID runs on `tiny`, not on the transcription model: one probe with
+# large-v3-turbo costs 5.3s, tiny costs 0.25s, and across every clip tested the
+# two agreed on every single window. That price difference is what makes it
+# affordable to look at the WHOLE recording instead of just the first 30s.
+_ASR_LANG_MODEL = os.environ.get("TGCLAUDE_ASR_LANG_MODEL", "tiny")
+_ASR_LANG_MAX_PROBES = 20   # ~10 min of audio at full resolution; beyond that,
+                            # spread the probes out rather than add cost
+_lang_model = None
+
+
+def _get_lang_model():
+    global _lang_model
+    if _lang_model is None:
+        from faster_whisper import WhisperModel
+        _lang_model = WhisperModel(_ASR_LANG_MODEL, device="cpu",
+                                   compute_type="int8")
+    return _lang_model
+
+
+def _detect_language(audio) -> str:
+    """The dominant language of the WHOLE recording, by probability-weighted
+    vote over its 30s windows.
+
+    Judging by the first window alone gets "quick update, then let me switch to
+    Chinese" exactly backwards: a 43s English preamble in front of six minutes of
+    Chinese was called English, which costs the Chinese body every one of its
+    punctuation marks. Voting over the whole clip calls it Chinese, and the
+    English head survives anyway — whisper only drops the minority language
+    *within* a window, never a window it owns outright.
+    """
+    step = 16000 * 30
+    starts = list(range(0, max(len(audio), 1), step))
+    if len(starts) > _ASR_LANG_MAX_PROBES:
+        starts = [starts[i * (len(starts) - 1) // (_ASR_LANG_MAX_PROBES - 1)]
+                  for i in range(_ASR_LANG_MAX_PROBES)]
+    model = _get_lang_model()
+    votes: Dict[str, float] = {}
+    for s in starts:
+        chunk = audio[s:s + step]
+        if len(chunk) < 16000 * 2:      # a scrap at the tail decides nothing
+            continue
+        lang, prob, _ = model.detect_language(audio=chunk)
+        votes[lang] = votes.get(lang, 0.0) + prob
+    return max(votes, key=votes.get)
+
+
 _ASR_ZH_PROMPT = "以下是简体中文普通话，可能夹杂英文。"
 _ASR_ZH_HOTWORDS = ("以下是简体中文普通话的转写，可能夹杂英文，"
                     "需要包含逗号、句号、问号等标点符号。")
@@ -470,10 +516,13 @@ _ASR_ZH_HOTWORDS = ("以下是简体中文普通话的转写，可能夹杂英�
 # what it got before this change.
 _ASR_PROMPTS = {"zh": {"initial_prompt": _ASR_ZH_PROMPT,
                        "hotwords": _ASR_ZH_HOTWORDS}}
-_SENT_END = "。！？!?…"
-# Below this a paragraph break just leaves an orphan one-liner ("我调研过几个替代
-# 方案。" on a line of its own), which reads like subtitles rather than prose.
-_PARA_MIN = 60
+_SENT_END = "。！？!?.…"
+# A paragraph has to cover this much speech before a break is allowed, otherwise
+# a short sentence ends up alone on a line and the whole thing reads like
+# subtitles. Measured in SECONDS rather than characters so it means the same
+# thing in Chinese and in English — 60 characters is a full Chinese sentence but
+# only about ten English words.
+_PARA_MIN_S = 25.0
 
 
 def _join_segments(segs) -> str:
@@ -487,13 +536,16 @@ def _join_segments(segs) -> str:
     """
     out: List[str] = []
     line = ""
+    start = 0.0
     for s in segs:
         if not s.text.strip():
             continue
-        if (line and line.rstrip()[-1] in _SENT_END
-                and len(line.strip()) >= _PARA_MIN):
+        if not line:
+            line, start = s.text.lstrip(), s.start
+        elif (line.rstrip()[-1] in _SENT_END
+                and s.start - start >= _PARA_MIN_S):
             out.append(line.strip())
-            line = s.text.lstrip()
+            line, start = s.text.lstrip(), s.start
         else:
             line += s.text
     if line.strip():
@@ -519,15 +571,21 @@ async def transcribe(path: str, progress=None) -> str:
         from faster_whisper.audio import decode_audio
 
         model = _get_whisper()
-        # Decode once and detect up front so the prompt can be chosen by
-        # language; passing `language=` then skips whisper's own detection pass,
-        # so this costs one encoder run and saves another.
+        # Decode once and settle the language up front so the prompt can be
+        # chosen to match it; passing `language=` then skips whisper's own
+        # detection pass, which pays for most of the sampling above.
         audio = decode_audio(path, sampling_rate=16000)
         try:
-            lang, _prob, _all = model.detect_language(audio=audio)
+            lang = _detect_language(audio)
         except Exception:
-            log.exception("language detection failed; assuming zh")
-            lang = "zh"
+            # tiny missing or undownloadable: fall back to what this code did
+            # before, which is the main model's read of the first window.
+            log.exception("language sampling failed; using first-window detect")
+            try:
+                lang, _p, _a = model.detect_language(audio=audio[:16000 * 30])
+            except Exception:
+                log.exception("language detection failed; assuming zh")
+                lang = "zh"
         segments, info = model.transcribe(
             audio,
             language=lang,
