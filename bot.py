@@ -457,24 +457,48 @@ _WHISPER_OUTRO_RE = re.compile(
 # Phrase it as a DESCRIPTION of the transcript, never as a sample sentence: a
 # sample ("你觉得呢？") leaked into the output verbatim, dropped a real sentence
 # and sent the tail into a hallucination loop.
-_ASR_HOTWORDS = ("以下是简体中文普通话的转写，可能夹杂英文，"
-                 "需要包含逗号、句号、问号等标点符号。")
+_ASR_ZH_PROMPT = "以下是简体中文普通话，可能夹杂英文。"
+_ASR_ZH_HOTWORDS = ("以下是简体中文普通话的转写，可能夹杂英文，"
+                    "需要包含逗号、句号、问号等标点符号。")
+# Keyed on the language whisper detects, because the prompt is NOT language
+# neutral: feeding the Chinese one to English audio makes the model flip
+# language at the window-two boundary and start paraphrasing in Chinese
+# ("I lean toward the second one. It hurts, but it solves the problem" came back
+# as "我看起来的第二个问题。它封了,但它其实解决了这个问题的问题。") — measured
+# 46 stray hanzi and a quarter of the words gone. Whisper punctuates English
+# natively, so every other language gets no prompt at all, which is also exactly
+# what it got before this change.
+_ASR_PROMPTS = {"zh": {"initial_prompt": _ASR_ZH_PROMPT,
+                       "hotwords": _ASR_ZH_HOTWORDS}}
 _SENT_END = "。！？!?…"
+# Below this a paragraph break just leaves an orphan one-liner ("我调研过几个替代
+# 方案。" on a line of its own), which reads like subtitles rather than prose.
+_PARA_MIN = 60
 
 
 def _join_segments(segs) -> str:
     """Whisper's segment boundaries are the speaker's breath groups, so start a
     new paragraph at each one — but only where the previous segment actually
-    closed a sentence, so a mid-sentence split stays on one line."""
+    closed a sentence and the paragraph has some body to it.
+
+    Segment text is concatenated RAW, never stripped: whisper carries the
+    inter-word space as a leading space on the next segment, so stripping it
+    welds English words together across the seam ("users definitely noticeit").
+    """
     out: List[str] = []
+    line = ""
     for s in segs:
-        t = s.text.strip()
-        if not t:
+        if not s.text.strip():
             continue
-        if out and out[-1][-1] in _SENT_END:
-            out.append("\n")
-        out.append(t)
-    return "".join(out)
+        if (line and line.rstrip()[-1] in _SENT_END
+                and len(line.strip()) >= _PARA_MIN):
+            out.append(line.strip())
+            line = s.text.lstrip()
+        else:
+            line += s.text
+    if line.strip():
+        out.append(line.strip())
+    return "\n".join(out)
 
 
 # One whisper job at a time. The model is CPU-int8 on 4 cores and already
@@ -492,8 +516,22 @@ async def transcribe(path: str, progress=None) -> str:
     state = {"pos": 0.0, "total": 0.0}
 
     def _run() -> str:
-        segments, info = _get_whisper().transcribe(
-            path,
+        from faster_whisper.audio import decode_audio
+
+        model = _get_whisper()
+        # Decode once and detect up front so the prompt can be chosen by
+        # language; passing `language=` then skips whisper's own detection pass,
+        # so this costs one encoder run and saves another.
+        audio = decode_audio(path, sampling_rate=16000)
+        try:
+            lang, _prob, _all = model.detect_language(audio=audio)
+        except Exception:
+            log.exception("language detection failed; assuming zh")
+            lang = "zh"
+        segments, info = model.transcribe(
+            audio,
+            language=lang,
+            **_ASR_PROMPTS.get(lang, {}),
             # vad_filter is OFF on purpose. Silero VAD was misclassifying whole
             # clips as non-speech and returning ZERO segments, so a real 13.7s
             # message transcribed to '' ("听不清，转写为空"). Proven on the actual
@@ -503,8 +541,6 @@ async def transcribe(path: str, progress=None) -> str:
             # dropping real speech.
             vad_filter=False,
             condition_on_previous_text=False,
-            initial_prompt="以下是简体中文普通话，可能夹杂英文。",
-            hotwords=_ASR_HOTWORDS,
         )
         state["total"] = getattr(info, "duration", 0.0) or 0.0
         seg_list = []
