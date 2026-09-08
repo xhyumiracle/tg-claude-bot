@@ -804,6 +804,14 @@ class Conversation:
     # to send if the CLI's own timer does not deliver it.
     wake_at: Optional[float] = None
     wake_prompt: Optional[str] = None
+    # Background work the agent armed inside the CURRENT CLI process — monitors,
+    # background shells, background subagents. All of it dies with the process,
+    # so dropping the client (a restart, /model, /effort, /mode, /resume,
+    # /project, /reset) silently kills every watcher the agent was counting on.
+    # `bg_armed` is what is live; drop_client moves it to `bg_lost`, and the
+    # next turn tells the agent so it can re-arm instead of waiting forever.
+    bg_armed: list = field(default_factory=list)   # (time, label)
+    bg_lost: list = field(default_factory=list)    # labels
     ctx_warned: int = 0
     # continuous-consumer model: `pump` is the single task draining the CLI
     # stream for this conv's whole client lifetime; `pending` holds messages
@@ -1262,6 +1270,13 @@ async def drop_client(conv: Conversation) -> None:
     # setting - /status falls back to the transcript / the override instead.
     conv.current_model = None
     conv.current_perm_mode = None
+    # Anything the agent armed lived inside that process. Keep only what was
+    # armed recently enough to plausibly still have been running, so a monitor
+    # that finished an hour ago is not re-reported as lost.
+    cutoff = time.time() - BG_STALE_S
+    conv.bg_lost += [lab for t, lab in conv.bg_armed if t >= cutoff]
+    del conv.bg_lost[:-20]
+    conv.bg_armed.clear()
 
 
 # Prefer the system CLI over the SDK's bundled one: sessions created in the
@@ -2110,6 +2125,7 @@ async def _pump(conv: "Conversation") -> None:
                             elif isinstance(block, ToolUseBlock):
                                 if block.name == "ScheduleWakeup":
                                     _note_wakeup(conv, block.input or {})
+                                _note_background(conv, block)
                                 n_tools += 1
                                 if buf:
                                     await flush()
@@ -2401,6 +2417,13 @@ async def run_turn(
         pass
     try:
         client = await ensure_client(conv)
+        if conv.bg_lost:
+            lost, conv.bg_lost = conv.bg_lost, []
+            text = ("[system] The CLI process was restarted, which killed "
+                    + str(len(lost)) + " background watcher(s) you had armed: "
+                    + "; ".join(lost)
+                    + ". They will never report back. Re-arm any that still "
+                      "matter before continuing.\n\n" + text)
         if blocks:
             content = list(blocks) + [{"type": "text", "text": text}]
 
@@ -3975,6 +3998,9 @@ def _own_file(p: Path) -> bool:
 # gave up, so do not depend on that timer: record the deadline the agent set
 # for itself and, if nothing has happened well past it, send the prompt.
 WAKEUP_GRACE_S = 120.0
+# How long an armed watcher stays worth reporting as lost when the client is
+# dropped. Past this it has most likely already fired and been dealt with.
+BG_STALE_S = float(os.environ.get("TGCLAUDE_BG_STALE_S", "3600"))
 
 
 def _note_wakeup(conv: "Conversation", inp: dict) -> None:
@@ -3986,6 +4012,22 @@ def _note_wakeup(conv: "Conversation", inp: dict) -> None:
         return
     conv.wake_at = time.time() + min(max(float(delay), 60.0), 3600.0)
     conv.wake_prompt = prompt
+
+
+def _note_background(conv: "Conversation", block) -> None:
+    """Remember watchers armed inside this CLI process, so a restart can say
+    what it killed instead of leaving the agent waiting on a dead monitor."""
+    inp = block.input or {}
+    if block.name == "Monitor":
+        label = f"monitor: {inp.get('description') or 'watch'}"
+    elif block.name == "Bash" and inp.get("run_in_background"):
+        label = f"background shell: {(inp.get('description') or inp.get('command') or '')[:60]}"
+    elif block.name == "Agent" and inp.get("run_in_background", True):
+        label = f"background agent: {(inp.get('description') or '')[:60]}"
+    else:
+        return
+    conv.bg_armed.append((time.time(), label))
+    del conv.bg_armed[:-20]
 
 
 async def wakeup_watcher(app: Application) -> None:
