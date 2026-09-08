@@ -804,6 +804,10 @@ class Conversation:
     # to send if the CLI's own timer does not deliver it.
     wake_at: Optional[float] = None
     wake_prompt: Optional[str] = None
+    wake_delay: float = 0.0          # as asked for, before clamping
+    # When the CLI last started a turn WE did not send. That is what its own
+    # wakeup looks like from here, so it is the signal that the timer worked.
+    last_spontaneous: float = 0.0
     # Background work the agent armed inside the CURRENT CLI process — monitors,
     # background shells, background subagents. All of it dies with the process,
     # so dropping the client (a restart, /model, /effort, /mode, /resume,
@@ -1275,6 +1279,10 @@ async def drop_client(conv: Conversation) -> None:
     # that finished an hour ago is not re-reported as lost.
     cutoff = time.time() - BG_STALE_S
     conv.bg_lost += [lab for t, lab in conv.bg_armed if t >= cutoff]
+    if conv.wake_at and conv.wake_at > time.time():
+        conv.bg_lost.append(
+            f"scheduled wakeup in {int(conv.wake_at - time.time())}s")
+        conv.wake_at = conv.wake_prompt = None
     del conv.bg_lost[:-20]
     conv.bg_armed.clear()
 
@@ -2119,6 +2127,10 @@ async def _pump(conv: "Conversation") -> None:
                         conv.current_perm_mode = (m.data.get("permissionMode")
                                                   or conv.current_perm_mode)
                     if isinstance(m, AssistantMessage):
+                        if conv.working_since is None:
+                            # a turn nobody here started: the CLI woke itself,
+                            # for a cron/wakeup or a background task report
+                            conv.last_spontaneous = time.time()
                         for block in m.content:
                             if isinstance(block, TextBlock):
                                 buf.append(block.text)
@@ -4010,7 +4022,21 @@ def _own_file(p: Path) -> bool:
 # error anywhere. A loop that silently stops looks exactly like an agent that
 # gave up, so do not depend on that timer: record the deadline the agent set
 # for itself and, if nothing has happened well past it, send the prompt.
-WAKEUP_GRACE_S = 120.0
+# How long past the deadline to wait before concluding the CLI's own timer is
+# not coming. Not a guess: CronCreate documents the scheduler's own jitter
+# budget as "up to 10% of their period late (max 15 min)", and ScheduleWakeup is
+# a one-shot cron on that same scheduler (the CLI calls them "session-scoped
+# cron tasks (CronCreate, ScheduleWakeup, /loop)"). So allow exactly that
+# budget, with a floor because the shortest delay it accepts is 60s and it was
+# measured 57s late on one of those.
+WAKEUP_GRACE_MIN_S = 60.0
+WAKEUP_GRACE_MAX_S = 900.0
+WAKEUP_GRACE_FRAC = 0.10
+
+
+def wakeup_grace(delay_s: float) -> float:
+    return min(max(delay_s * WAKEUP_GRACE_FRAC, WAKEUP_GRACE_MIN_S),
+               WAKEUP_GRACE_MAX_S)
 # How long an armed watcher stays worth reporting as lost when the client is
 # dropped. Past this it has most likely already fired and been dealt with.
 BG_STALE_S = float(os.environ.get("TGCLAUDE_BG_STALE_S", "3600"))
@@ -4023,8 +4049,10 @@ def _note_wakeup(conv: "Conversation", inp: dict) -> None:
     delay, prompt = inp.get("delaySeconds"), inp.get("prompt")
     if not delay or not prompt:
         return
+    conv.wake_delay = float(delay)
     conv.wake_at = time.time() + min(max(float(delay), 60.0), 3600.0)
     conv.wake_prompt = prompt
+    log.info("wakeup armed for %s in %.0fs", conv.key, conv.wake_at - time.time())
 
 
 def _note_background(conv: "Conversation", block) -> None:
@@ -4044,26 +4072,56 @@ def _note_background(conv: "Conversation", block) -> None:
 
 
 async def wakeup_watcher(app: Application) -> None:
-    """Backstop for the CLI's own loop timer. Fires the agent's own prompt, so
-    a wakeup that arrives late is indistinguishable from one that worked; a
-    wakeup that arrives on time re-arms conv.wake_at and this never runs."""
+    """A stand-in for the CLI's own one-shot cron, matching its semantics.
+
+    ScheduleWakeup is not its own mechanism: the CLI describes these as
+    "session-scoped cron tasks (CronCreate, ScheduleWakeup, /loop)", i.e. a
+    one-shot cron that enqueues `prompt` at the deadline. Measured behaviour of
+    that scheduler, which this copies rather than invents:
+
+      * the delay is clamped to [60s, 3600s]  (done in _note_wakeup)
+      * a deadline that falls mid-turn is DEFERRED, not dropped — verified: due
+        at +70s during a turn that ran to +181.7s, delivered at +183.4s
+      * `stop: true` cancels it            (done in _note_wakeup)
+
+    What it does not do reliably is fire at all in a long-lived session. In one
+    real session every deadline of 720s or more passed with the session idle and
+    nothing whatsoever happening, while 60s deadlines and every short probe
+    fired. So this fires the agent's own prompt itself once the deadline plus
+    the scheduler's own documented jitter budget has passed.
+
+    It only does that if the CLI has not already done it. A wakeup delivered by
+    the CLI arrives as a turn nobody here sent, which the pump records as
+    conv.last_spontaneous — so that, not a guess about timing, is what decides
+    whether the backstop is needed.
+    """
     while True:
         await asyncio.sleep(20)
         now = time.time()
         for conv in list(conversations.values()):
-            if not conv.wake_at or now < conv.wake_at + WAKEUP_GRACE_S:
+            if not conv.wake_at:
+                continue
+            # the CLI delivered it after all: stand down
+            if conv.last_spontaneous >= conv.wake_at - 5:
+                log.info("wakeup delivered by the CLI for %s; backstop stood down",
+                         conv.key)
+                conv.wake_at = conv.wake_prompt = None
+                continue
+            if now < conv.wake_at + wakeup_grace(conv.wake_delay):
                 continue
             if conv.working_since is not None or conv.pending:
-                continue        # a turn is already running: nothing to revive
+                continue        # mid-turn: defer, exactly as the scheduler does
             prompt, conv.wake_prompt = conv.wake_prompt, None
+            late = now - conv.wake_at
             conv.wake_at = None
             try:
                 client = await ensure_client(conv)
                 await client.query(prompt)
                 conv.working_since = time.time()
-                log.info("wakeup watchdog fired for %s", conv.key)
+                log.info("wakeup backstop fired for %s (%.0fs past deadline)",
+                         conv.key, late)
             except Exception:
-                log.exception("wakeup watchdog failed for %s", conv.key)
+                log.exception("wakeup backstop failed for %s", conv.key)
 
 
 async def restart_watcher(app: Application) -> None:
