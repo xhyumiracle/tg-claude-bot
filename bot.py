@@ -4023,20 +4023,27 @@ def _own_file(p: Path) -> bool:
 # gave up, so do not depend on that timer: record the deadline the agent set
 # for itself and, if nothing has happened well past it, send the prompt.
 # How long past the deadline to wait before concluding the CLI's own timer is
-# not coming. Not a guess: CronCreate documents the scheduler's own jitter
-# budget as "up to 10% of their period late (max 15 min)", and ScheduleWakeup is
-# a one-shot cron on that same scheduler (the CLI calls them "session-scoped
-# cron tasks (CronCreate, ScheduleWakeup, /loop)"). So allow exactly that
-# budget, with a floor because the shortest delay it accepts is 60s and it was
-# measured 57s late on one of those.
-WAKEUP_GRACE_MIN_S = 60.0
-WAKEUP_GRACE_MAX_S = 900.0
-WAKEUP_GRACE_FRAC = 0.10
-
-
+# not coming. Read out of the CLI rather than guessed. ScheduleWakeup does not
+# arm a timer for `delaySeconds` at all — it converts the delay into a CRON
+# ENTRY, and quantises it:
+#
+#     function T(e){ let o=new Date(e);
+#       if(o.getSeconds()>0||o.getMilliseconds()>0) o.setMinutes(o.getMinutes()+1);
+#       return o.setSeconds(0,0), o.getTime() }          // round UP to the minute
+#     ...
+#     A = `${E.getMinutes()} ${E.getHours()} * * *`      // cron: minute + hour
+#
+# So the deadline is always pushed forward to the next whole minute, up to 60s,
+# and the scheduler ticks every second on top of that. Measured lateness across
+# probes: +30s, +31s, +55s — all inside one minute, none of it random. An
+# earlier version of this used "10% of the delay", taken from the jitter budget
+# CronCreate documents for RECURRING tasks; that paragraph does not apply to
+# this path, and for a 20-minute loop it waited twice as long as it needed to.
+WAKEUP_GRACE_S = 90.0
 def wakeup_grace(delay_s: float) -> float:
-    return min(max(delay_s * WAKEUP_GRACE_FRAC, WAKEUP_GRACE_MIN_S),
-               WAKEUP_GRACE_MAX_S)
+    """Constant: the CLI's own slippage is minute-quantisation, not a fraction
+    of the delay, so it does not grow with the delay."""
+    return WAKEUP_GRACE_S
 # How long an armed watcher stays worth reporting as lost when the client is
 # dropped. Past this it has most likely already fired and been dealt with.
 BG_STALE_S = float(os.environ.get("TGCLAUDE_BG_STALE_S", "3600"))
