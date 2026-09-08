@@ -16,7 +16,7 @@ import hashlib
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 from claude_agent_sdk import (
     ClaudeAgentOptions, ClaudeSDKClient, create_sdk_mcp_server, tool)
@@ -462,9 +462,15 @@ _WHISPER_OUTRO_RE = re.compile(
 # two agreed on every single window. That price difference is what makes it
 # affordable to look at the WHOLE recording instead of just the first 30s.
 _ASR_LANG_MODEL = os.environ.get("TGCLAUDE_ASR_LANG_MODEL", "tiny")
-_ASR_LANG_MAX_PROBES = 20   # ~10 min of audio at full resolution; beyond that,
-                            # spread the probes out rather than add cost
 _lang_model = None
+
+
+class _Seg(NamedTuple):
+    """A whisper segment re-timed onto the whole recording, so a span
+    transcribed on its own still lands in the right place for paragraphing."""
+    text: str
+    start: float
+    end: float
 
 
 def _get_lang_model():
@@ -476,31 +482,146 @@ def _get_lang_model():
     return _lang_model
 
 
-def _detect_language(audio) -> str:
-    """The dominant language of the WHOLE recording, by probability-weighted
-    vote over its 30s windows.
+_ASR_PROBE_S = 3        # probe hop. Measured against known switch points, 3s
+                        # scored 96-100% with and without a pause at the switch;
+                        # 8s scored 67% and missed whole sentences.
+_ASR_MIN_SPAN_S = 5.0   # a run shorter than this is folded into its neighbour
+_ASR_MAX_SPANS = 12     # past this it is noise, not code-switching
+_ASR_LANG_MIN_PROB = 0.7    # speech probes at 0.997; silence and noise never
+                            # got past 0.61, so this splits them cleanly
+_ASR_SILENCE_RATIO = 0.08   # of the loudest chunk. The quietest chunk of real
+                            # speech measured 0.37 of the loudest.
 
-    Judging by the first window alone gets "quick update, then let me switch to
-    Chinese" exactly backwards: a 43s English preamble in front of six minutes of
-    Chinese was called English, which costs the Chinese body every one of its
-    punctuation marks. Voting over the whole clip calls it Chinese, and the
-    English head survives anyway — whisper only drops the minority language
-    *within* a window, never a window it owns outright.
+
+def _probe_languages(audio) -> List[Optional[str]]:
+    """Language of each _ASR_PROBE_S seconds of audio; None where it cannot say.
+
+    The encoder always consumes a 30s window, so each probe is its own few
+    seconds padded with SILENCE — never with its neighbours. Handing it the
+    surrounding audio makes every probe report the majority language of the
+    recording, which is precisely the answer that hides an embedded sentence.
+
+    Silence has to be refused rather than guessed at. Digital silence probes as
+    English (p=0.31) and quiet noise as Norwegian (p=0.61), which is enough to
+    turn a pause into its own "English" span and stamp a stray "You" into the
+    middle of a Chinese note — measured, on a clip with an 8s gap in it. Real
+    speech comes back at p=0.997, so the two are trivially separable.
     """
-    step = 16000 * 30
-    starts = list(range(0, max(len(audio), 1), step))
-    if len(starts) > _ASR_LANG_MAX_PROBES:
-        starts = [starts[i * (len(starts) - 1) // (_ASR_LANG_MAX_PROBES - 1)]
-                  for i in range(_ASR_LANG_MAX_PROBES)]
+    import numpy as np
+
     model = _get_lang_model()
-    votes: Dict[str, float] = {}
-    for s in starts:
-        chunk = audio[s:s + step]
-        if len(chunk) < 16000 * 2:      # a scrap at the tail decides nothing
+    fe = model.feature_extractor
+    step = 16000 * _ASR_PROBE_S
+    chunks = [audio[s:s + step] for s in range(0, len(audio), step)]
+    chunks = [c for c in chunks if len(c) >= 16000]   # under 1s decides nothing
+    if not chunks:
+        return []
+    rms = [float(np.sqrt(np.mean(c.astype(np.float32) ** 2))) for c in chunks]
+    floor = max(rms) * _ASR_SILENCE_RATIO
+    out: List[Optional[str]] = []
+    for chunk, level in zip(chunks, rms):
+        if level < floor:
+            out.append(None)
             continue
-        lang, prob, _ = model.detect_language(audio=chunk)
-        votes[lang] = votes.get(lang, 0.0) + prob
-    return max(votes, key=votes.get)
+        feats = fe(np.pad(chunk, (0, 16000 * 30 - len(chunk))),
+                   padding=False)[..., :fe.nb_max_frames]
+        if feats.shape[-1] < fe.nb_max_frames:
+            feats = np.pad(feats, [(0, 0), (0, fe.nb_max_frames - feats.shape[-1])])
+        (lang, prob), *_ = model.model.detect_language(model.encode(feats[None]))[0]
+        out.append(lang[2:-2] if prob >= _ASR_LANG_MIN_PROB else None)
+    return out
+
+
+def _quietest(audio, pos: int) -> int:
+    """Nudge a span boundary to the quietest 100ms within +/-2s of it, so the
+    cut lands between words instead of through one."""
+    import numpy as np
+
+    lo, hi = max(0, pos - 32000), min(len(audio), pos + 32000)
+    n = 1600
+    if hi - lo < n * 4:
+        return pos
+    seg = audio[lo:hi].astype(np.float32)
+    k = (hi - lo) // n
+    rms = [float(np.sqrt(np.mean(seg[i * n:(i + 1) * n] ** 2))) for i in range(k)]
+    return lo + int(np.argmin(rms)) * n + n // 2
+
+
+def _language_spans(audio) -> List[Tuple[int, int, str]]:
+    """Split the recording into contiguous single-language spans.
+
+    This exists because of a silent data loss: a whole English sentence spoken
+    inside otherwise Chinese audio was DROPPED, not mistranscribed. Whisper
+    keeps the timestamps covering it and simply omits the words, so nothing
+    downstream can tell. It happens because the sentence is the minority
+    language inside its 30s window; give it a window of its own and it comes
+    back verbatim. Every alternative was tried first and each broke something
+    else: hotword phrasing (four variants) did nothing, multilingual=True
+    mislabelled Chinese windows and looped, condition_on_previous_text
+    hallucinated across silence, and there is no timestamp gap to repair from.
+
+    On monolingual audio this collapses to a single span and the caller takes
+    the ordinary one-pass route — measured zero false switches on pure Chinese
+    and pure English clips.
+    """
+    labels = _probe_languages(audio)
+    if not any(labels):
+        return []
+    # a pause decides nothing, so let it inherit from whichever side spoke
+    for rng in (range(len(labels)), reversed(range(len(labels)))):
+        seen = None
+        for i in rng:
+            if labels[i]:
+                seen = labels[i]
+            elif seen:
+                labels[i] = seen
+    # a lone flipped probe between two that agree is noise
+    smooth = list(labels)
+    for i in range(1, len(labels) - 1):
+        if labels[i - 1] == labels[i + 1] != labels[i]:
+            smooth[i] = labels[i - 1]
+    step = 16000 * _ASR_PROBE_S
+    runs: List[List] = []
+    for i, lab in enumerate(smooth):
+        end = min(len(audio), (i + 1) * step)
+        if runs and runs[-1][2] == lab:
+            runs[-1][1] = end
+        else:
+            runs.append([i * step, end, lab])
+    runs[-1][1] = len(audio)
+    # fold away runs too short to deserve their own pass, then re-merge
+    while len(runs) > 1:
+        short = [i for i, r in enumerate(runs)
+                 if (r[1] - r[0]) < 16000 * _ASR_MIN_SPAN_S]
+        if not short:
+            break
+        i = short[0]
+        j = i - 1 if i else 1
+        runs[j][0] = min(runs[j][0], runs[i][0])
+        runs[j][1] = max(runs[j][1], runs[i][1])
+        del runs[i]
+        k = 0
+        while k + 1 < len(runs):
+            if runs[k][2] == runs[k + 1][2]:
+                runs[k][1] = runs[k + 1][1]
+                del runs[k + 1]
+            else:
+                k += 1
+    for i in range(1, len(runs)):
+        cut = _quietest(audio, runs[i][0])
+        runs[i - 1][1] = runs[i][0] = cut
+    return [(int(a), int(b), c) for a, b, c in runs]
+
+
+def _detect_language(audio) -> str:
+    """Dominant language of the whole recording."""
+    spans = _language_spans(audio)
+    if not spans:
+        raise RuntimeError("no language probes")
+    weight: Dict[str, int] = {}
+    for a, b, lang in spans:
+        weight[lang] = weight.get(lang, 0) + (b - a)
+    return max(weight, key=weight.get)
 
 
 _ASR_ZH_PROMPT = "以下是简体中文普通话，可能夹杂英文。"
@@ -571,40 +692,55 @@ async def transcribe(path: str, progress=None) -> str:
         from faster_whisper.audio import decode_audio
 
         model = _get_whisper()
-        # Decode once and settle the language up front so the prompt can be
-        # chosen to match it; passing `language=` then skips whisper's own
-        # detection pass, which pays for most of the sampling above.
         audio = decode_audio(path, sampling_rate=16000)
+        state["total"] = len(audio) / 16000
+
+        def one(chunk, lang: str, offset: float) -> list:
+            segs, _info = model.transcribe(
+                chunk,
+                language=lang,
+                **_ASR_PROMPTS.get(lang, {}),
+                # vad_filter is OFF on purpose. Silero VAD was misclassifying
+                # whole clips as non-speech and returning ZERO segments, so a
+                # real 13.7s message transcribed to '' ("听不清，转写为空").
+                # Proven on the actual audio: vad on -> 0 chars, vad off -> full
+                # correct transcript. Losing silence-trimming is fine —
+                # condition_on_previous_text=False plus the outro blocklist keep
+                # hallucinations down without ever dropping real speech.
+                vad_filter=False,
+                condition_on_previous_text=False,
+            )
+            out = []
+            for seg in segs:            # a generator: this is where the work
+                out.append(_Seg(seg.text, seg.start + offset, seg.end + offset))
+                state["pos"] = seg.end + offset   # so progress lives here
+            return out
+
         try:
-            lang = _detect_language(audio)
+            spans = _language_spans(audio)
         except Exception:
-            # tiny missing or undownloadable: fall back to what this code did
-            # before, which is the main model's read of the first window.
-            log.exception("language sampling failed; using first-window detect")
+            # tiny missing or undownloadable: fall back to what this did before,
+            # which is one pass at the main model's read of the first window.
+            log.exception("language probing failed; using first-window detect")
             try:
                 lang, _p, _a = model.detect_language(audio=audio[:16000 * 30])
             except Exception:
                 log.exception("language detection failed; assuming zh")
                 lang = "zh"
-        segments, info = model.transcribe(
-            audio,
-            language=lang,
-            **_ASR_PROMPTS.get(lang, {}),
-            # vad_filter is OFF on purpose. Silero VAD was misclassifying whole
-            # clips as non-speech and returning ZERO segments, so a real 13.7s
-            # message transcribed to '' ("听不清，转写为空"). Proven on the actual
-            # audio: vad on -> 0 chars, vad off -> full correct transcript.
-            # Losing silence-trimming is fine — condition_on_previous_text=False
-            # plus the outro blocklist keep hallucinations down without ever
-            # dropping real speech.
-            vad_filter=False,
-            condition_on_previous_text=False,
-        )
-        state["total"] = getattr(info, "duration", 0.0) or 0.0
+            spans = [(0, len(audio), lang)]
+        if len(spans) > _ASR_MAX_SPANS:
+            # fragmented past the point of belief: trust the majority instead
+            log.warning("%d language spans, falling back to one pass", len(spans))
+            weight: Dict[str, int] = {}
+            for a, b, lang in spans:
+                weight[lang] = weight.get(lang, 0) + (b - a)
+            spans = [(0, len(audio), max(weight, key=weight.get))]
+        if len(spans) > 1:
+            log.info("voice: %s", " ".join(
+                f"{l}@{a / 16000:.0f}-{b / 16000:.0f}s" for a, b, l in spans))
         seg_list = []
-        for seg in segments:            # a generator: this is where the work
-            seg_list.append(seg)        # happens, so it is where progress lives
-            state["pos"] = seg.end
+        for a, b, lang in spans:
+            seg_list += one(audio[a:b], lang, a / 16000)
         # drop segments that ARE an outro (start with an outro head), then peel a
         # trailing outro fused onto the last real segment.
         text = _join_segments(
