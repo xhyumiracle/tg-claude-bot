@@ -55,7 +55,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatAction, ParseMode
-from telegram.error import RetryAfter
+from telegram.error import NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     BaseRateLimiter,
@@ -805,6 +805,7 @@ class Conversation:
     wake_at: Optional[float] = None
     wake_prompt: Optional[str] = None
     wake_delay: float = 0.0          # as asked for, before clamping
+    wake_revivals: int = 0           # consecutive backstop fires, no user word
     # When the CLI last started a turn WE did not send. That is what its own
     # wakeup looks like from here, so it is the signal that the timer worked.
     last_spontaneous: float = 0.0
@@ -1794,6 +1795,11 @@ async def send_long(update: Update, text: str, anchor=None) -> None:
                     chunk, do_quote=False)
 
 
+# A status bubble whose create failed is not re-created on the next tick;
+# see LiveStatus.update for why a retried create can duplicate the bubble.
+CREATE_RETRY_COOLDOWN = 60.0  # s
+
+
 class LiveStatus:
     """One status message per segment, edited in place; becomes the reply.
     The turn's reply anchor is consume-once (anchor_fn): the FIRST segment
@@ -1813,6 +1819,7 @@ class LiveStatus:
         self.anchor = self._UNSET  # resolved once: a Message, or None
         self._lock = asyncio.Lock()  # serialize update() vs finalize()
         self._done = False           # finalized: a late create/edit is a no-op
+        self._retry_create_at = 0.0  # cooldown after a failed bubble create
 
     def _resolve(self):
         if self.anchor is self._UNSET:
@@ -1831,19 +1838,35 @@ class LiveStatus:
         # finalize(). Without it, a create's send can still be in flight (msg
         # is None) when finalize runs — finalize then sends the reply as a
         # NEW message and this create lands afterward as an orphan "Working…"
-        # bubble. The lock also collapses the flood-era duplicate-bubble pile:
-        # a slow create holds the lock, so later calls edit instead of re-send.
+        # bubble.
+        #
+        # But never QUEUE on it. A status frame is worth sending only if it can
+        # be sent NOW: under flood control a single edit can sit in the limiter
+        # for minutes, and every frame produced meanwhile used to stack up
+        # behind the lock and then fire, one stale edit each, the instant the
+        # wait lifted — re-earning the ban it was waiting out. Drop the frame
+        # instead; the next tick renders fresher state anyway.
+        if self._lock.locked():
+            return
         async with self._lock:
             if self._done:  # already finalized — a late create would orphan
                 return
             now = time.time()
             if self.msg is None:
+                if now < self._retry_create_at:
+                    return
                 try:
                     self.msg = await self._send(
                         update_obj, text, disable_notification=True)
                     self.last, self.text = now, text
                 except Exception:
-                    pass
+                    # The send may well have LANDED — a ReadTimeout loses the
+                    # response, not the message. Re-creating on the very next
+                    # tick is how one timeout became a column of orphan
+                    # "Working…" bubbles, so sit out a cooldown. If the bubble
+                    # really is lost the turn just runs without a live status;
+                    # finalize() still delivers the reply on its own.
+                    self._retry_create_at = time.time() + CREATE_RETRY_COOLDOWN
                 return
             if now - self.last < 6.0 or text == self.text:
                 return
@@ -2052,6 +2075,17 @@ class _BotTarget:
 # the turn is alive even when the CLI streams nothing before the answer)
 _SPIN = ["✽", "✼", "✻", "✺"]
 
+# Live-status cadence (see _ticker). Every frame costs one editMessageText
+# against a per-chat budget Telegram meters over hours, so the interval tracks
+# how much the bubble actually has to say rather than running flat out.
+TICK_FAST = 7.0     # s between frames while the turn keeps changing
+TICK_SLOW = 30.0    # s between frames once it has gone quiet
+TICK_GROWTH = 1.6   # how fast the quiet cadence walks from FAST to SLOW
+
+# Grace before a FOLLOW-ON reply segment is given a "Working…" placeholder
+# (the turn's first one is never delayed — see show()).
+SEG_BUBBLE_DELAY = 12.0  # s
+
 
 async def _pump(conv: "Conversation") -> None:
     """The single continuous consumer of conv.client's message stream. Runs
@@ -2067,44 +2101,88 @@ async def _pump(conv: "Conversation") -> None:
     txt = ""            # accumulated streamed answer text (live preview)
     think_tokens = 0    # running total of thinking-token estimates (a sum)
     spin_i = 0
+    seg_since = 0.0     # when the current segment began; 0 = the turn's first
 
-    async def flush() -> None:
-        nonlocal status
+    async def flush(final: bool = False) -> None:
+        nonlocal status, seg_since
         seg = "\n".join(p for p in buf if p).strip()
         buf.clear()
         if seg.startswith("<pass>"):
             seg = ""
+        if not seg and not final:
+            # Nothing to say and the turn goes on: keep the bubble the ticker
+            # already has. Finalizing an empty segment deletes it and the next
+            # frame sends an identical one straight back — two calls to end up
+            # where we started — and under flood control the dropped delete
+            # strands the old bubble above the new one.
+            return
         await status.finalize(target, seg)  # raw md; finalize renders to HTML
         status = LiveStatus()
+        seg_since = time.time()
 
-    async def show(min_elapsed: float = 0.0) -> None:
-        # Live "working…" bubble driven by conv.working_since (an INPUT-side
-        # clock set by run_turn), so liveness shows even when the CLI streams
-        # nothing until the final answer. The ticker passes min_elapsed to
-        # skip quick turns; event-driven calls pass 0 to show immediately.
+    async def show(min_elapsed: float = 0.0) -> bool:
+        """One frame of the live "working…" bubble, driven by
+        conv.working_since (an INPUT-side clock set by run_turn) so liveness
+        shows even when the CLI streams nothing until the final answer.
+        min_elapsed skips quick turns; event-driven calls pass 0 to show
+        immediately. Returns whether a frame was actually rendered — the
+        ticker holds its cadence fast while frames are being skipped."""
         nonlocal spin_i
         ws = conv.working_since
         if ws is None:
-            return
+            return False
         elapsed = time.time() - ws
         if elapsed < min_elapsed:
-            return
+            return False
+        if (status.msg is None and seg_since
+                and time.time() - seg_since < SEG_BUBBLE_DELAY):
+            # A follow-on segment does not need a placeholder. The turn's FIRST
+            # bubble is the liveness signal and has to be quick, but by segment
+            # two the user is already reading this turn's output, and a
+            # "Working…" that appears only to be overwritten seconds later is
+            # flicker that costs a send the text would have paid for anyway.
+            # Sit out a grace window instead: a segment that finishes inside it
+            # is delivered by finalize() as one message, no bubble involved.
+            return False
         spin_i += 1
         eff = f" · {conv.effort}" if conv.effort else ""
         line = f"{_SPIN[spin_i % len(_SPIN)]} {head} ({int(elapsed)}s{eff})"
         await status.update(target, line + (f"\n{detail}" if detail else ""))
+        return True
 
     async def _ticker() -> None:
         # THE sole writer of the status bubble. CLI events only mutate state
         # (head/detail/tokens); this task renders at a controlled cadence, so a
         # tool-heavy or token-streaming turn can never machine-gun Telegram
-        # into flood control. First feedback at ~3s, then every 7s.
+        # into flood control. First feedback at ~4s.
+        #
+        # After that the cadence tracks how much the bubble has to SAY. A flat
+        # 7s tick spends the chat's edit budget on nothing: a 90-minute turn
+        # parked inside one long Bash burns ~770 edits redrawing an identical
+        # line with the next spinner frame, which is what earned a run of
+        # `Retry in 500s` flood bans. So render fast while the substance
+        # (head + detail) keeps changing — a tool firing, an answer streaming,
+        # the only frames that carry information — and back off to a TICK_SLOW
+        # liveness pulse once the turn goes quiet. Active turns look exactly as
+        # they did; a stalled one costs ~4× less.
         try:
             delay = 4.0   # first render at ~4s (quick turns clear before this)
+            prev = None
             while True:
                 await asyncio.sleep(delay)
-                delay = 7.0
-                await show()
+                if conv.working_since is None:
+                    # between turns nothing renders, so polling is free — stay
+                    # snappy, the next turn's first frame must not wait out a
+                    # backoff the previous one earned
+                    prev, delay = None, 4.0
+                    continue
+                rendered = await show()
+                sub = (head, detail)
+                # a skipped frame costs nothing, so it must not buy a backoff:
+                # the bubble it is holding back still has to land promptly
+                delay = (TICK_FAST if sub != prev or not rendered
+                         else min(delay * TICK_GROWTH, TICK_SLOW))
+                prev = sub
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -2182,8 +2260,9 @@ async def _pump(conv: "Conversation") -> None:
                                     or "unknown error")
                                 buf.append(f"⚠️ Turn failed: {str(err)[:500]}")
                         conv.interrupted = False  # one-shot: consumed this turn
-                        await flush()
+                        await flush(final=True)
                         n_tools = 0
+                        seg_since = 0.0  # next turn's first bubble: no grace
                         head, detail, txt, think_tokens = "Working…", "", "", 0
                         # a turn finished: clear the 👀 markers + inflight for
                         # every outstanding message (coarse — anchor next step)
@@ -2306,6 +2385,7 @@ async def _pump(conv: "Conversation") -> None:
                 status = LiveStatus()
                 buf.clear()
                 n_tools = 0
+                seg_since = 0.0
                 head, detail, txt, think_tokens = "Working…", "", "", 0
     except asyncio.CancelledError:
         raise
@@ -2415,6 +2495,7 @@ async def run_turn(
         # the user is driving now; a self-scheduled continuation would only
         # collide with whatever they just asked for
         conv.wake_at = conv.wake_prompt = None
+        conv.wake_revivals = 0
         _inflight_add(conv, msg, queued_text=(text or "").strip() or "[media]")
         conv.pending.append(msg)
         try:
@@ -4040,6 +4121,15 @@ def _own_file(p: Path) -> bool:
 # CronCreate documents for RECURRING tasks; that paragraph does not apply to
 # this path, and for a 20-minute loop it waited twice as long as it needed to.
 WAKEUP_GRACE_S = 90.0
+# OFF by default. Reviving a loop the CLI had stopped is not a neutral act: the
+# agent wakes, works, re-arms, and the backstop revives it again, so a loop the
+# user no longer wants bills forever with nobody having asked for it. The CLI's
+# own equivalent is bounded — its keepalive has a budget of one, after which it
+# ends the loop — and the first version of this had no budget at all.
+WAKEUP_BACKSTOP = os.environ.get("TGCLAUDE_WAKEUP_BACKSTOP", "0") == "1"
+# Even when enabled: consecutive revivals with no word from the user. Any user
+# message resets it, because that is the user taking the loop back.
+WAKEUP_BACKSTOP_BUDGET = int(os.environ.get("TGCLAUDE_WAKEUP_BUDGET", "2"))
 def wakeup_grace(delay_s: float) -> float:
     """Constant: the CLI's own slippage is minute-quantisation, not a fraction
     of the delay, so it does not grow with the delay."""
@@ -4102,6 +4192,9 @@ async def wakeup_watcher(app: Application) -> None:
     conv.last_spontaneous — so that, not a guess about timing, is what decides
     whether the backstop is needed.
     """
+    if not WAKEUP_BACKSTOP:
+        log.info("wakeup backstop disabled (TGCLAUDE_WAKEUP_BACKSTOP=1 enables)")
+        return
     while True:
         await asyncio.sleep(20)
         now = time.time()
@@ -4118,9 +4211,16 @@ async def wakeup_watcher(app: Application) -> None:
                 continue
             if conv.working_since is not None or conv.pending:
                 continue        # mid-turn: defer, exactly as the scheduler does
+            if conv.wake_revivals >= WAKEUP_BACKSTOP_BUDGET:
+                log.warning("wakeup backstop budget spent for %s (%d revivals, "
+                            "no user message); leaving the loop stopped",
+                            conv.key, conv.wake_revivals)
+                conv.wake_at = conv.wake_prompt = None
+                continue
             prompt, conv.wake_prompt = conv.wake_prompt, None
             late = now - conv.wake_at
             conv.wake_at = None
+            conv.wake_revivals += 1
             try:
                 client = await ensure_client(conv)
                 await client.query(prompt)
@@ -4760,9 +4860,12 @@ async def on_shutdown(app: Application) -> None:
 class FloodLimiter(BaseRateLimiter):
     """Wraps every bot API call (PTB applies it uniformly). Two jobs:
 
-    1. Auto-retry Telegram's "Flood control exceeded. Retry in Ns"
-       (RetryAfter) — sleep the required time and retry, so the error never
-       surfaces and no reply/reaction is lost.
+    1. Absorb Telegram's "Flood control exceeded. Retry in Ns" (RetryAfter)
+       — sleep the wait and retry, so the error never surfaces and no reply is
+       lost. Long waits are the exception, see EPHEMERAL: a redraw or a 👀 that
+       lands eight minutes late is worth less than not sending it at all, and
+       sleeping one out keeps the slot busy while fresher frames pile up
+       behind it. Those are dropped; the reply itself is always waited for.
     2. Gently pace the *expensive* per-chat calls (new messages, reactions)
        with a token bucket — bursts of `cap` go through instantly, then
        `rate`/sec — so a tool-heavy turn or a big forward/queue batch can't
@@ -4771,7 +4874,8 @@ class FloodLimiter(BaseRateLimiter):
     editMessageText (live status) is paced too: the status ticker is the only
     writer and self-throttles, but the shared bucket is the hard backstop that
     keeps a long streaming turn from ever hitting flood control. Callback
-    answers, typing and reactions stay EXEMPT — they must be instant.
+    answers, typing and reactions stay EXEMPT from pacing — they must be
+    instant.
     """
 
     # Only NEW-message endpoints are paced. Reactions are deliberately NOT
@@ -4782,6 +4886,16 @@ class FloodLimiter(BaseRateLimiter):
     PACED = {"sendMessage", "sendPhoto", "sendDocument", "sendVoice",
              "sendAudio", "sendAnimation", "sendMediaGroup",
              "forwardMessage", "copyMessage", "editMessageText"}
+
+    # Calls whose entire value is "right now". Under a multi-minute flood wait
+    # these are dropped rather than slept out: what they show is stale long
+    # before the wait ends, and whoever asked for one (the ticker, the 👀
+    # marker) will produce a fresher call soon enough. The send* endpoints are
+    # deliberately absent — losing a reply is never an improvement, so those
+    # keep the sleep-and-retry below.
+    EPHEMERAL = {"editMessageText", "setMessageReaction", "sendChatAction",
+                 "deleteMessage", "answerCallbackQuery"}
+    EPHEMERAL_MAX_WAIT = 10.0   # s: a short burst is still worth sleeping out
 
     def __init__(self, cap: int = 8, rate: float = 1.0,
                  max_retries: int = 3) -> None:
@@ -4826,11 +4940,31 @@ class FloodLimiter(BaseRateLimiter):
             try:
                 return await callback(*args, **kwargs)
             except RetryAfter as e:
+                if (endpoint in self.EPHEMERAL
+                        and e.retry_after > self.EPHEMERAL_MAX_WAIT):
+                    log.warning("flood control on %s (chat %s); retry in %ss "
+                                "— dropped, it is cosmetic",
+                                endpoint, chat_id, e.retry_after)
+                    raise
                 if attempt >= self.max_retries:
                     raise
                 log.warning("flood control on %s (chat %s); retry in %ss",
                             endpoint, chat_id, e.retry_after)
                 await asyncio.sleep(e.retry_after + 0.5)
+
+
+async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """PTB has no default error handler, so a NetworkError escaping the poller
+    printed a full traceback under "No error handlers are registered" — noise
+    for a hiccup the poller retries on its own. Log those as one line; keep
+    the traceback for everything else. BadRequest and Forbidden subclass
+    NetworkError in PTB, so the transport case is matched exactly, not by
+    isinstance on the base."""
+    err = ctx.error
+    if isinstance(err, TimedOut) or type(err) is NetworkError:
+        log.warning("telegram transport error: %s", err or type(err).__name__)
+        return
+    log.error("unhandled error while processing an update", exc_info=err)
 
 
 def main() -> None:
@@ -4895,6 +5029,7 @@ def main() -> None:
         filters.StatusUpdate.FORUM_TOPIC_CREATED, on_topic_created))
     app.add_handler(MessageHandler(
         filters.TEXT & (~filters.COMMAND | filters.FORWARDED), on_message))
+    app.add_error_handler(on_error)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
