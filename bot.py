@@ -487,6 +487,16 @@ _ASR_PROBE_S = 3        # probe hop. Measured against known switch points, 3s
                         # 8s scored 67% and missed whole sentences.
 _ASR_MIN_SPAN_S = 5.0   # a run shorter than this is folded into its neighbour
 _ASR_MAX_SPANS = 12     # past this it is noise, not code-switching
+# Languages this bot's users actually speak. A probe claiming anything else is
+# far likelier to be an artifact than a real switch: on real audio a 5s stretch
+# of Chinese came back "ru" with enough confidence to clear the gate below, and
+# got transcribed as Russian — five seconds of speech destroyed. A language
+# outside this set is treated as undecided and inherits from its neighbours,
+# exactly like silence. The clip's own dominant language is always allowed, so
+# setting this wrong degrades to the previous behaviour rather than breaking a
+# language nobody listed.
+_ASR_LANGS = {s.strip() for s in
+              os.environ.get("TGCLAUDE_ASR_LANGS", "zh,en").split(",") if s.strip()}
 _ASR_LANG_MIN_PROB = 0.7    # speech probes at 0.997; silence and noise never
                             # got past 0.61, so this splits them cleanly
 _ASR_SILENCE_RATIO = 0.08   # of the loudest chunk. The quietest chunk of real
@@ -565,6 +575,19 @@ def _language_spans(audio) -> List[Tuple[int, int, str]]:
     and pure English clips.
     """
     labels = _probe_languages(audio)
+    if not any(labels):
+        return []
+    # whichever language holds the most probes carries the clip
+    tally: Dict[str, int] = {}
+    for lab in labels:
+        if lab:
+            tally[lab] = tally.get(lab, 0) + 1
+    dominant = max(tally, key=tally.get)
+    for i, lab in enumerate(labels):
+        if lab and lab != dominant and lab not in _ASR_LANGS:
+            log.info("ignoring %r probe at %ds (not a language we expect)",
+                     lab, i * _ASR_PROBE_S)
+            labels[i] = None
     if not any(labels):
         return []
     # a pause decides nothing, so let it inherit from whichever side spoke
