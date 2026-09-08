@@ -805,7 +805,8 @@ class Conversation:
     wake_at: Optional[float] = None
     wake_prompt: Optional[str] = None
     wake_delay: float = 0.0          # as asked for, before clamping
-    wake_revivals: int = 0           # backstop fires since the user last spoke
+    wake_revivals: int = 0           # consecutive CLI-timer failures covered
+    wake_tool_id: Optional[str] = None   # ScheduleWakeup awaiting its result
     # When the CLI last started a turn WE did not send. That is what its own
     # wakeup looks like from here, so it is the signal that the timer worked.
     last_spontaneous: float = 0.0
@@ -2214,7 +2215,8 @@ async def _pump(conv: "Conversation") -> None:
                                 buf.append(block.text)
                             elif isinstance(block, ToolUseBlock):
                                 if block.name == "ScheduleWakeup":
-                                    _note_wakeup(conv, block.input or {})
+                                    _note_wakeup(conv, block.input or {},
+                                                 getattr(block, "id", ""))
                                 _note_background(conv, block)
                                 n_tools += 1
                                 if buf:
@@ -2316,8 +2318,15 @@ async def _pump(conv: "Conversation") -> None:
                             log.exception("model-switch notice for %s",
                                           conv.key)
                     elif isinstance(m, UserMessage):
-                        # relay CLI local-command output (/context, /cost, ...)
                         content = getattr(m, "content", None)
+                        if conv.wake_tool_id and isinstance(content, list):
+                            for b in content:
+                                if (getattr(b, "tool_use_id", None)
+                                        == conv.wake_tool_id):
+                                    c = getattr(b, "content", "")
+                                    _note_wakeup_result(
+                                        conv, c if isinstance(c, str) else str(c))
+                        # relay CLI local-command output (/context, /cost, ...)
                         texts = []
                         if isinstance(content, str):
                             texts.append(content)
@@ -2494,7 +2503,7 @@ async def run_turn(
         # this input's turn produces a ResultMessage
         # the user is driving now; a self-scheduled continuation would only
         # collide with whatever they just asked for
-        conv.wake_at = conv.wake_prompt = None
+        conv.wake_at = conv.wake_prompt = conv.wake_tool_id = None
         conv.wake_revivals = 0
         _inflight_add(conv, msg, queued_text=(text or "").strip() or "[media]")
         conv.pending.append(msg)
@@ -3559,7 +3568,7 @@ async def cmd_stop(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         # loop wakeup(s) on user abort"), so the backstop must let go too —
         # otherwise stop means stop on one side and revive on the other.
         had_wake = conv.wake_at is not None
-        conv.wake_at = conv.wake_prompt = None
+        conv.wake_at = conv.wake_prompt = conv.wake_tool_id = None
         conv.wake_revivals = 0
         await conv.client.interrupt()
         await update.effective_message.reply_text(
@@ -4112,23 +4121,11 @@ def _own_file(p: Path) -> bool:
 # gave up, so do not depend on that timer: record the deadline the agent set
 # for itself and, if nothing has happened well past it, send the prompt.
 # How long past the deadline to wait before concluding the CLI's own timer is
-# not coming. Read out of the CLI rather than guessed. ScheduleWakeup does not
-# arm a timer for `delaySeconds` at all — it converts the delay into a CRON
-# ENTRY, and quantises it:
-#
-#     function T(e){ let o=new Date(e);
-#       if(o.getSeconds()>0||o.getMilliseconds()>0) o.setMinutes(o.getMinutes()+1);
-#       return o.setSeconds(0,0), o.getTime() }          // round UP to the minute
-#     ...
-#     A = `${E.getMinutes()} ${E.getHours()} * * *`      // cron: minute + hour
-#
-# So the deadline is always pushed forward to the next whole minute, up to 60s,
-# and the scheduler ticks every second on top of that. Measured lateness across
-# probes: +30s, +31s, +55s — all inside one minute, none of it random. An
-# earlier version of this used "10% of the delay", taken from the jitter budget
-# CronCreate documents for RECURRING tasks; that paragraph does not apply to
-# this path, and for a 20-minute loop it waited twice as long as it needed to.
-WAKEUP_GRACE_S = 90.0
+# not coming. The deadline itself now comes from the CLI ("Next wakeup scheduled
+# for 18:47:00 (in 82s)"), so this no longer has to absorb the minute-rounding
+# it applies — that is already in its number. What is left is its scheduler tick
+# and delivery, plus this watcher's own 20s poll.
+WAKEUP_GRACE_S = 60.0
 # Reviving a loop is not a neutral act: the agent wakes, works, re-arms its own
 # wakeup, and the backstop revives it again. Unbounded, that is perpetual motion
 # — a /loop the user had walked away from billed for hours.
@@ -4154,17 +4151,45 @@ def wakeup_grace(delay_s: float) -> float:
 BG_STALE_S = float(os.environ.get("TGCLAUDE_BG_STALE_S", "3600"))
 
 
-def _note_wakeup(conv: "Conversation", inp: dict) -> None:
+# The CLI answers a ScheduleWakeup call with the time it actually settled on:
+#   "Next wakeup scheduled for 18:47:00 (in 82s). Nothing more to do this turn"
+# That is worth far more than the delay the agent asked for, because the two are
+# not the same — the CLI rounds the target UP to the next whole minute before
+# turning it into a cron entry, so a 60s request became 82s here. Take its
+# number and there is nothing left to estimate.
+_WAKE_RESULT_RE = re.compile(r"wakeup scheduled for\s*(\d{1,2}:\d{2}(?::\d{2})?)"
+                             r"\s*\(in\s*(\d+)\s*s", re.I)
+
+
+def _note_wakeup(conv: "Conversation", inp: dict, tool_id: str = "") -> None:
     if inp.get("stop"):
-        conv.wake_at = conv.wake_prompt = None
+        conv.wake_at = conv.wake_prompt = conv.wake_tool_id = None
         return
     delay, prompt = inp.get("delaySeconds"), inp.get("prompt")
     if not delay or not prompt:
         return
+    # Hold the intent; the deadline comes from the CLI's own reply below. Until
+    # then nothing is armed, so a call the CLI REFUSES (an aged-out loop returns
+    # null and ends the loop) never gets resurrected behind its back.
     conv.wake_delay = float(delay)
-    conv.wake_at = time.time() + min(max(float(delay), 60.0), 3600.0)
     conv.wake_prompt = prompt
-    log.info("wakeup armed for %s in %.0fs", conv.key, conv.wake_at - time.time())
+    conv.wake_tool_id = tool_id or None
+    conv.wake_at = None
+
+
+def _note_wakeup_result(conv: "Conversation", text: str) -> None:
+    """The CLI's reply to the ScheduleWakeup it was just asked for."""
+    conv.wake_tool_id = None
+    m = _WAKE_RESULT_RE.search(text or "")
+    if not m:
+        # It did not schedule anything. Do not invent a deadline for it.
+        log.info("wakeup NOT scheduled by the CLI for %s: %r",
+                 conv.key, (text or "")[:120])
+        conv.wake_prompt = conv.wake_at = None
+        return
+    conv.wake_at = time.time() + float(m.group(2))
+    log.info("wakeup armed for %s at %s (in %ss, CLI's own figure)",
+             conv.key, m.group(1), m.group(2))
 
 
 def _note_background(conv: "Conversation", block) -> None:
