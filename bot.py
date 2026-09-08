@@ -3133,9 +3133,22 @@ async def apply_effort(reply, conv: Conversation, e: str) -> None:
     conv.effort = None if e == "default" else e  # 'default' clears the override
     if not conv.fresh:  # same reasoning as apply_model
         persist_binding(conv)
-    # Effort only lands at client creation, so it needs a rebuild - but dropping
-    # the client mid-turn cancels the pump and kills that turn. Defer like
-    # apply_perm_mode does; ensure_client rebuilds once the turn is done.
+    # Effort has no SDK setter, but the CLI accepts `/effort <level>` as INPUT
+    # and applies it to the live session — it answers "Set effort level to high
+    # (this session only)" and the transcript then records effort:high. Use that
+    # rather than rebuilding: tearing the process down takes every monitor,
+    # background shell and background subagent in it along too, and /effort is
+    # far too routine a thing to cost that.
+    if conv.client is not None and conv.effort and conv.working_since is None:
+        try:
+            await conv.client.query(f"/effort {conv.effort}")
+            await reply(f"Effort set to {e} (live, this conversation).")
+            return
+        except Exception:
+            log.exception("live /effort failed for %s; rebuilding", conv.key)
+    # Clearing back to the settings default has no live equivalent, and a failed
+    # live switch must not leave the override unapplied, so both rebuild. Never
+    # mid-turn though: dropping the client cancels the pump and kills that turn.
     if conv.working_since is None:
         await drop_client(conv)
         when = "from the next message"
