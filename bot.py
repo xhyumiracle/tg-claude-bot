@@ -805,7 +805,8 @@ class Conversation:
     wake_at: Optional[float] = None
     wake_prompt: Optional[str] = None
     wake_delay: float = 0.0          # as asked for, before clamping
-    wake_revivals: int = 0           # consecutive backstop fires, no user word
+    wake_revivals: int = 0           # backstop fires since the user last spoke
+    last_user_at: float = 0.0        # when the user last drove this topic
     # When the CLI last started a turn WE did not send. That is what its own
     # wakeup looks like from here, so it is the signal that the timer worked.
     last_spontaneous: float = 0.0
@@ -2496,6 +2497,7 @@ async def run_turn(
         # collide with whatever they just asked for
         conv.wake_at = conv.wake_prompt = None
         conv.wake_revivals = 0
+        conv.last_user_at = time.time()
         _inflight_add(conv, msg, queued_text=(text or "").strip() or "[media]")
         conv.pending.append(msg)
         try:
@@ -3555,8 +3557,16 @@ async def cmd_stop(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         if conv.working_since is not None:  # a turn is live: its abort is ours
             conv.interrupted = True
+        # interrupt cancels the CLI's pending loop wakeups ("cancelled N pending
+        # loop wakeup(s) on user abort"), so the backstop must let go too —
+        # otherwise stop means stop on one side and revive on the other.
+        had_wake = conv.wake_at is not None
+        conv.wake_at = conv.wake_prompt = None
+        conv.wake_revivals = 0
         await conv.client.interrupt()
-        await update.effective_message.reply_text("⏹ Interrupt sent.")
+        await update.effective_message.reply_text(
+            "⏹ Interrupt sent." + (" Pending loop wakeup cancelled."
+                                   if had_wake else ""))
     except Exception as e:
         conv.interrupted = False
         await update.effective_message.reply_text(f"Interrupt failed: {e}")
@@ -4121,15 +4131,15 @@ def _own_file(p: Path) -> bool:
 # CronCreate documents for RECURRING tasks; that paragraph does not apply to
 # this path, and for a 20-minute loop it waited twice as long as it needed to.
 WAKEUP_GRACE_S = 90.0
-# OFF by default. Reviving a loop the CLI had stopped is not a neutral act: the
-# agent wakes, works, re-arms, and the backstop revives it again, so a loop the
-# user no longer wants bills forever with nobody having asked for it. The CLI's
-# own equivalent is bounded — its keepalive has a budget of one, after which it
-# ends the loop — and the first version of this had no budget at all.
-WAKEUP_BACKSTOP = os.environ.get("TGCLAUDE_WAKEUP_BACKSTOP", "0") == "1"
-# Even when enabled: consecutive revivals with no word from the user. Any user
-# message resets it, because that is the user taking the loop back.
-WAKEUP_BACKSTOP_BUDGET = int(os.environ.get("TGCLAUDE_WAKEUP_BUDGET", "2"))
+# Reviving a loop is not a neutral act: the agent wakes, works, re-arms its own
+# wakeup, and the backstop revives it again. Left unbounded that is perpetual
+# motion, and a /loop the user had walked away from billed forever. So it is
+# bounded the way the CLI bounds its own loops — by AGE, not by a count of
+# iterations (recurringMaxAgeMs, 7 days). The clock here is time since the user
+# last said anything in that topic: a loop somebody is watching keeps going, a
+# forgotten one stops. Every revival is announced, so it can never burn quietly.
+WAKEUP_BACKSTOP = os.environ.get("TGCLAUDE_WAKEUP_BACKSTOP", "1") == "1"
+WAKEUP_MAX_QUIET_S = float(os.environ.get("TGCLAUDE_WAKEUP_MAX_QUIET_S", "14400"))
 def wakeup_grace(delay_s: float) -> float:
     """Constant: the CLI's own slippage is minute-quantisation, not a fraction
     of the delay, so it does not grow with the delay."""
@@ -4166,6 +4176,19 @@ def _note_background(conv: "Conversation", block) -> None:
         return
     conv.bg_armed.append((time.time(), label))
     del conv.bg_armed[:-20]
+
+
+async def _say(app, conv: "Conversation", text: str) -> None:
+    """A revival must never be silent — that is how the first version of this
+    managed to bill for hours without anyone noticing."""
+    if app is None:
+        return
+    try:
+        await app.bot.send_message(
+            conv.key[0], text, disable_notification=True,
+            **({"message_thread_id": conv.key[1]} if conv.key[1] else {}))
+    except Exception:
+        log.exception("wakeup notice failed for %s", conv.key)
 
 
 async def wakeup_watcher(app: Application) -> None:
@@ -4211,11 +4234,13 @@ async def wakeup_watcher(app: Application) -> None:
                 continue
             if conv.working_since is not None or conv.pending:
                 continue        # mid-turn: defer, exactly as the scheduler does
-            if conv.wake_revivals >= WAKEUP_BACKSTOP_BUDGET:
-                log.warning("wakeup backstop budget spent for %s (%d revivals, "
-                            "no user message); leaving the loop stopped",
-                            conv.key, conv.wake_revivals)
+            quiet = now - (conv.last_user_at or conv.wake_at)
+            if quiet > WAKEUP_MAX_QUIET_S:
+                log.warning("wakeup backstop giving up for %s (%.1fh since the "
+                            "user last spoke)", conv.key, quiet / 3600)
                 conv.wake_at = conv.wake_prompt = None
+                await _say(app, conv, "⏹ Loop stopped — nobody has been here for "
+                           f"{quiet / 3600:.0f}h. Send anything to resume it.")
                 continue
             prompt, conv.wake_prompt = conv.wake_prompt, None
             late = now - conv.wake_at
@@ -4227,6 +4252,8 @@ async def wakeup_watcher(app: Application) -> None:
                 conv.working_since = time.time()
                 log.info("wakeup backstop fired for %s (%.0fs past deadline)",
                          conv.key, late)
+                await _say(app, conv, f"⏱ Loop wakeup #{conv.wake_revivals} — "
+                           "the CLI's own timer did not fire. /esc to stop.")
             except Exception:
                 log.exception("wakeup backstop failed for %s", conv.key)
 
