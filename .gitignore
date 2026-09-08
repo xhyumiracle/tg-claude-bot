@@ -11,7 +11,7 @@ wheels/
 
 # Secrets & local-only config
 .env
-*.local.md
+*.local.md*
 
 # Runtime artifacts
 .tgclaude-restart-requested
