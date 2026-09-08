@@ -806,7 +806,6 @@ class Conversation:
     wake_prompt: Optional[str] = None
     wake_delay: float = 0.0          # as asked for, before clamping
     wake_revivals: int = 0           # backstop fires since the user last spoke
-    last_user_at: float = 0.0        # when the user last drove this topic
     # When the CLI last started a turn WE did not send. That is what its own
     # wakeup looks like from here, so it is the signal that the timer worked.
     last_spontaneous: float = 0.0
@@ -2497,7 +2496,6 @@ async def run_turn(
         # collide with whatever they just asked for
         conv.wake_at = conv.wake_prompt = None
         conv.wake_revivals = 0
-        conv.last_user_at = time.time()
         _inflight_add(conv, msg, queued_text=(text or "").strip() or "[media]")
         conv.pending.append(msg)
         try:
@@ -4132,14 +4130,21 @@ def _own_file(p: Path) -> bool:
 # this path, and for a 20-minute loop it waited twice as long as it needed to.
 WAKEUP_GRACE_S = 90.0
 # Reviving a loop is not a neutral act: the agent wakes, works, re-arms its own
-# wakeup, and the backstop revives it again. Left unbounded that is perpetual
-# motion, and a /loop the user had walked away from billed forever. So it is
-# bounded the way the CLI bounds its own loops — by AGE, not by a count of
-# iterations (recurringMaxAgeMs, 7 days). The clock here is time since the user
-# last said anything in that topic: a loop somebody is watching keeps going, a
-# forgotten one stops. Every revival is announced, so it can never burn quietly.
+# wakeup, and the backstop revives it again. Unbounded, that is perpetual motion
+# — a /loop the user had walked away from billed for hours.
+#
+# What it counts is CONSECUTIVE FAILURES OF THE CLI'S TIMER, and the count is
+# reset by either of the two things that mean the situation is not that:
+#   * the CLI delivers a wakeup itself — its timer is alive, the backstop is
+#     covering the occasional miss, which is what it is for;
+#   * the user says anything in the topic — they are here, watching it.
+# So an intermittently-flaky timer never accumulates a count, and a dead one
+# gets a bounded number of revivals with nobody around before the loop is left
+# stopped. An earlier version of this bounded it by wall-clock time instead
+# ("4h since the user last spoke"), which was a number I made up: elapsed time
+# says nothing about whether the loop is worth continuing.
 WAKEUP_BACKSTOP = os.environ.get("TGCLAUDE_WAKEUP_BACKSTOP", "1") == "1"
-WAKEUP_MAX_QUIET_S = float(os.environ.get("TGCLAUDE_WAKEUP_MAX_QUIET_S", "14400"))
+WAKEUP_BUDGET = int(os.environ.get("TGCLAUDE_WAKEUP_BUDGET", "3"))
 def wakeup_grace(delay_s: float) -> float:
     """Constant: the CLI's own slippage is minute-quantisation, not a fraction
     of the delay, so it does not grow with the delay."""
@@ -4229,18 +4234,21 @@ async def wakeup_watcher(app: Application) -> None:
                 log.info("wakeup delivered by the CLI for %s; backstop stood down",
                          conv.key)
                 conv.wake_at = conv.wake_prompt = None
+                conv.wake_revivals = 0   # its timer is alive; nothing to count
                 continue
             if now < conv.wake_at + wakeup_grace(conv.wake_delay):
                 continue
             if conv.working_since is not None or conv.pending:
                 continue        # mid-turn: defer, exactly as the scheduler does
-            quiet = now - (conv.last_user_at or conv.wake_at)
-            if quiet > WAKEUP_MAX_QUIET_S:
-                log.warning("wakeup backstop giving up for %s (%.1fh since the "
-                            "user last spoke)", conv.key, quiet / 3600)
+            if conv.wake_revivals >= WAKEUP_BUDGET:
+                log.warning("wakeup backstop spent for %s (%d consecutive CLI "
+                            "timer failures, nobody here)", conv.key,
+                            conv.wake_revivals)
                 conv.wake_at = conv.wake_prompt = None
-                await _say(app, conv, "⏹ Loop stopped — nobody has been here for "
-                           f"{quiet / 3600:.0f}h. Send anything to resume it.")
+                await _say(app, conv,
+                           f"⏹ Loop stopped — covered {conv.wake_revivals} missed "
+                           "wakeups in a row and nobody has been here. Send "
+                           "anything to pick it back up.")
                 continue
             prompt, conv.wake_prompt = conv.wake_prompt, None
             late = now - conv.wake_at
@@ -4252,7 +4260,8 @@ async def wakeup_watcher(app: Application) -> None:
                 conv.working_since = time.time()
                 log.info("wakeup backstop fired for %s (%.0fs past deadline)",
                          conv.key, late)
-                await _say(app, conv, f"⏱ Loop wakeup #{conv.wake_revivals} — "
+                await _say(app, conv,
+                           f"⏱ Loop wakeup {conv.wake_revivals}/{WAKEUP_BUDGET} — "
                            "the CLI's own timer did not fire. /esc to stop.")
             except Exception:
                 log.exception("wakeup backstop failed for %s", conv.key)
