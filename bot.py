@@ -926,6 +926,11 @@ def persist_binding(conv: "Conversation") -> None:
         entry["effort"] = conv.effort
     if conv.perm_mode:
         entry["perm_mode"] = conv.perm_mode
+    if conv.bg_lost:
+        # Survives a PROCESS restart, which is the case that matters: the notice
+        # lives on the Conversation, and on a systemd restart that object dies
+        # with everything else, so the agent was never told what it lost.
+        entry["bg_lost"] = conv.bg_lost[-20:]
     _state.setdefault("bindings", {})[f"{conv.key[0]}:{conv.key[1]}"] = entry
     _state_save()
 
@@ -1247,6 +1252,7 @@ def apply_binding(conv: "Conversation", stored: dict) -> None:
     conv.model = stored.get("model") or conv.model
     conv.effort = stored.get("effort") or conv.effort
     conv.perm_mode = stored.get("perm_mode") or conv.perm_mode
+    conv.bg_lost = list(stored.get("bg_lost") or [])
 
 
 def get_conv(update: Update) -> Conversation:
@@ -1307,7 +1313,9 @@ async def drop_client(conv: Conversation) -> None:
     if conv.wake_at and conv.wake_at > time.time():
         conv.bg_lost.append(
             f"scheduled wakeup in {int(conv.wake_at - time.time())}s")
-        conv.wake_at = conv.wake_prompt = None
+    conv.wake_at = conv.wake_prompt = conv.wake_tool_id = None
+    if conv.bg_lost and not conv.fresh:
+        persist_binding(conv)
     del conv.bg_lost[:-20]
     conv.bg_armed.clear()
 
@@ -2544,6 +2552,8 @@ async def run_turn(
         client = await ensure_client(conv)
         if conv.bg_lost:
             lost, conv.bg_lost = conv.bg_lost, []
+            if not conv.fresh:
+                persist_binding(conv)   # told once, not on every restart after
             text = ("[system] The CLI process was restarted, which killed "
                     + str(len(lost)) + " background watcher(s) you had armed: "
                     + "; ".join(lost)
