@@ -490,9 +490,11 @@ def _get_lang_model():
     return _lang_model
 
 
-_ASR_PROBE_S = 3        # probe hop. Measured against known switch points, 3s
-                        # scored 96-100% with and without a pause at the switch;
-                        # 8s scored 67% and missed whole sentences.
+# Probe hop. Measured against known switch points, 3s scored 96-100% with and
+# without a pause at the switch; 8s scored 67% and missed whole sentences. It is
+# not free — on a 223s clip the probes cost 28.7s, 29% of the whole job — so it
+# is tunable for anyone who never code-switches and would rather have the time.
+_ASR_PROBE_S = int(os.environ.get("TGCLAUDE_ASR_PROBE_S", "3"))
 _ASR_MIN_SPAN_S = 5.0   # a run shorter than this is folded into its neighbour
 _ASR_MAX_SPANS = 12     # past this it is noise, not code-switching
 # Languages this bot's users actually speak. A probe claiming anything else is
@@ -710,8 +712,16 @@ def _join_segments(segs) -> str:
 # transcriptions just make both crawl.
 _ASR_SEM = asyncio.Semaphore(1)
 
-# Measured on this box with large-v3-turbo/int8: ~0.35x realtime. Used only to
-# tell the user what they are in for; the real clock comes from progress.
+# Beam search width. faster-whisper defaults to 5, i.e. five candidate
+# transcriptions carried at every step. Measured on a 223s Chinese clip: beam 5
+# took 70.9s, beam 1 took 50.1s — 29% faster — and the two differed by 1.07% of
+# the hanzi, the odd homophone, with the same punctuation count. Not a trade
+# worth 20 seconds of somebody's time on every recording.
+ASR_BEAM_SIZE = int(os.environ.get("TGCLAUDE_ASR_BEAM_SIZE", "1"))
+
+# Measured on this box with large-v3-turbo/int8, end to end including the
+# language probes: 0.45x realtime at beam 5, 0.35x at beam 1. Used only to tell
+# the user what they are in for; the real clock comes from progress.
 ASR_REALTIME_FACTOR = 0.4
 
 
@@ -740,6 +750,7 @@ async def transcribe(path: str, progress=None) -> str:
                 # hallucinations down without ever dropping real speech.
                 vad_filter=False,
                 condition_on_previous_text=False,
+                beam_size=ASR_BEAM_SIZE,
             )
             out = []
             for seg in segs:            # a generator: this is where the work
@@ -827,6 +838,12 @@ class Conversation:
     # message. `voice_active` counts notes still downloading/transcribing for
     # this conv; whoever brings it to zero fires the whole batch.
     voice_active: int = 0
+    # in-flight voice jobs, so /esc can call one off. Cancelling while whisper
+    # is inside asyncio.to_thread abandons the result rather than killing the
+    # thread — the CPU work finishes unseen and _ASR_SEM is released early. That
+    # is the honest cost of being able to stop at all, and it only happens when
+    # somebody explicitly asks.
+    voice_tasks: list = field(default_factory=list)
     voice_pending: list = field(default_factory=list)
     # Set when an approved plan took the CLI out of plan mode. Kept separate
     # from perm_mode so the user's own setting is never silently rewritten.
@@ -3590,6 +3607,17 @@ async def cmd_stop(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         await _login_cancel(conv)
         await update.effective_message.reply_text("⏹ /login cancelled.")
         return
+    if conv.voice_tasks:
+        n = len(conv.voice_tasks)
+        for t in conv.voice_tasks[:]:
+            t.cancel()
+        conv.voice_tasks.clear()
+        conv.voice_active = 0
+        await update.effective_message.reply_text(
+            f"⏹ Cancelled {n} transcription{'s' if n > 1 else ''}. "
+            "The recordings are still on Telegram — reply to one and press "
+            "Transcribe again if you want it after all.")
+        return
     if conv.bash_proc is not None:  # `!cmd` holds no lock and no client
         try:
             conv.bash_proc.kill()
@@ -4754,6 +4782,9 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     conv = get_conv(update)
     conv.voice_active += 1
+    task = asyncio.current_task()
+    if task is not None:
+        conv.voice_tasks.append(task)
     text = ""
     failed = False
     tmp = Path(f"/tmp/tgvoice-{uuid.uuid4().hex}.oga")
@@ -4775,6 +4806,12 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
         text = await transcribe(str(tmp), progress=on_progress if secs > 120
                                 else None)
+    except asyncio.CancelledError:
+        conv.voice_active = max(0, conv.voice_active - 1)
+        if task is not None and task in conv.voice_tasks:
+            conv.voice_tasks.remove(task)
+        await show("⏹ Transcription cancelled.", retry_msg=msg)
+        raise
     except Exception as e:
         log.exception("voice transcription failed")
         failed = True
@@ -4788,6 +4825,8 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         # sees the count reach zero flushes, success or not. Otherwise a note
         # that blew up leaves its neighbour's transcript held forever.
         conv.voice_active = max(0, conv.voice_active - 1)
+        if task is not None and task in conv.voice_tasks:
+            conv.voice_tasks.remove(task)
 
     user = update.effective_user
     name = user.full_name if user else "unknown"
