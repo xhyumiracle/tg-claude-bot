@@ -16,7 +16,7 @@ import hashlib
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 from claude_agent_sdk import (
     ClaudeAgentOptions, ClaudeSDKClient, create_sdk_mcp_server, tool)
@@ -55,7 +55,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatAction, ParseMode
-from telegram.error import RetryAfter
+from telegram.error import NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     BaseRateLimiter,
@@ -89,6 +89,19 @@ TARGET_GROUP_IDS = {
     for x in os.environ.get(key, "").replace(",", " ").split()
 }
 DEFAULT_RESUME = os.environ.get("RESUME_SESSION_ID", "")
+# Groups whose topics count as the owner's own workspace, i.e. the same full
+# trust as the owner's DM. Defaults to every allowed group: TARGET_GROUP_IDS is
+# already an allowlist the owner maintains by hand, and treating your own
+# project topics as visiting strangers is what forced bypass mode everywhere.
+# Set TGCLAUDE_TRUSTED_GROUP_IDS to a narrower list (or "none") to sandbox the
+# rest - that is the setting to reach for once a group has people in it who
+# should not get an unsandboxed shell.
+_trusted_env = os.environ.get("TGCLAUDE_TRUSTED_GROUP_IDS")
+TRUSTED_GROUP_IDS = (
+    set() if (_trusted_env or "").strip().lower() in ("none", "0")
+    else {int(x) for x in _trusted_env.replace(",", " ").split()} if _trusted_env
+    else set(TARGET_GROUP_IDS)
+)
 
 HOME = Path.home()
 OWNER_DEFAULT_CWD = os.environ.get("OWNER_DEFAULT_CWD", str(HOME))
@@ -382,6 +395,16 @@ def _chunk_md(text: str, limit: int = 3500) -> list:
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "large-v3-turbo")
+# Sanity ceiling only (1h). Long recordings are transcribed, not rejected: a
+# re-record costs the user far more than the CPU minutes cost us.
+VOICE_MAX_SEC = int(os.environ.get("TGCLAUDE_VOICE_MAX_SEC", "3600"))
+TG_TEXT_LIMIT = 4096  # Telegram's hard per-message cap
+# Permission mode for a topic that has never picked one. Kept OUT of the stored
+# binding (bindings hold overrides only), so changing it here moves every topic
+# that never chose, and never rewrites one that did. Picking "default" from
+# /mode is an explicit choice and still means the CLI's ask-for-everything.
+DEFAULT_PERM_MODE = os.environ.get("TGCLAUDE_DEFAULT_PERM_MODE",
+                                   "bypassPermissions")
 _whisper_model = None
 
 
@@ -422,30 +445,350 @@ _WHISPER_OUTRO_RE = re.compile(
 )
 
 
-async def transcribe(path: str) -> str:
+# Whisper only sees `initial_prompt` inside its FIRST 30s window: with
+# condition_on_previous_text=False, faster-whisper sets prompt_reset_since past
+# the initial prompt after every window (transcribe.py:1383), so from window two
+# on it decodes with no prompt at all — and for Chinese that means it stops
+# emitting punctuation. That is exactly what long voice notes looked like: a
+# punctuated opening, then a seven-minute wall of unbroken text. `hotwords` is
+# the one knob re-injected into EVERY window's prompt (transcribe.py:1542), so
+# it keeps the punctuation prior alive to the end. Measured on a 94s clip:
+# 6 -> 49 marks, hanzi output character-for-character identical.
+# Phrase it as a DESCRIPTION of the transcript, never as a sample sentence: a
+# sample ("你觉得呢？") leaked into the output verbatim, dropped a real sentence
+# and sent the tail into a hallucination loop.
+# Language ID runs on `tiny`, not on the transcription model: one probe with
+# large-v3-turbo costs 5.3s, tiny costs 0.25s, and across every clip tested the
+# two agreed on every single window. That price difference is what makes it
+# affordable to look at the WHOLE recording instead of just the first 30s.
+_ASR_LANG_MODEL = os.environ.get("TGCLAUDE_ASR_LANG_MODEL", "tiny")
+_lang_model = None
+
+
+class _Seg(NamedTuple):
+    """A whisper segment re-timed onto the whole recording, so a span
+    transcribed on its own still lands in the right place for paragraphing."""
+    text: str
+    start: float
+    end: float
+
+
+def _get_lang_model():
+    global _lang_model
+    if _lang_model is None:
+        from faster_whisper import WhisperModel
+        _lang_model = WhisperModel(_ASR_LANG_MODEL, device="cpu",
+                                   compute_type="int8")
+    return _lang_model
+
+
+_ASR_PROBE_S = 3        # probe hop. Measured against known switch points, 3s
+                        # scored 96-100% with and without a pause at the switch;
+                        # 8s scored 67% and missed whole sentences.
+_ASR_MIN_SPAN_S = 5.0   # a run shorter than this is folded into its neighbour
+_ASR_MAX_SPANS = 12     # past this it is noise, not code-switching
+# Languages this bot's users actually speak. A probe claiming anything else is
+# far likelier to be an artifact than a real switch: on real audio a 5s stretch
+# of Chinese came back "ru" with enough confidence to clear the gate below, and
+# got transcribed as Russian — five seconds of speech destroyed. A language
+# outside this set is treated as undecided and inherits from its neighbours,
+# exactly like silence. The clip's own dominant language is always allowed, so
+# setting this wrong degrades to the previous behaviour rather than breaking a
+# language nobody listed.
+_ASR_LANGS = {s.strip() for s in
+              os.environ.get("TGCLAUDE_ASR_LANGS", "zh,en").split(",") if s.strip()}
+_ASR_LANG_MIN_PROB = 0.7    # speech probes at 0.997; silence and noise never
+                            # got past 0.61, so this splits them cleanly
+_ASR_SILENCE_RATIO = 0.08   # of the loudest chunk. The quietest chunk of real
+                            # speech measured 0.37 of the loudest.
+
+
+def _probe_languages(audio) -> List[Optional[str]]:
+    """Language of each _ASR_PROBE_S seconds of audio; None where it cannot say.
+
+    The encoder always consumes a 30s window, so each probe is its own few
+    seconds padded with SILENCE — never with its neighbours. Handing it the
+    surrounding audio makes every probe report the majority language of the
+    recording, which is precisely the answer that hides an embedded sentence.
+
+    Silence has to be refused rather than guessed at. Digital silence probes as
+    English (p=0.31) and quiet noise as Norwegian (p=0.61), which is enough to
+    turn a pause into its own "English" span and stamp a stray "You" into the
+    middle of a Chinese note — measured, on a clip with an 8s gap in it. Real
+    speech comes back at p=0.997, so the two are trivially separable.
+    """
+    import numpy as np
+
+    model = _get_lang_model()
+    fe = model.feature_extractor
+    step = 16000 * _ASR_PROBE_S
+    chunks = [audio[s:s + step] for s in range(0, len(audio), step)]
+    chunks = [c for c in chunks if len(c) >= 16000]   # under 1s decides nothing
+    if not chunks:
+        return []
+    rms = [float(np.sqrt(np.mean(c.astype(np.float32) ** 2))) for c in chunks]
+    floor = max(rms) * _ASR_SILENCE_RATIO
+    out: List[Optional[str]] = []
+    for chunk, level in zip(chunks, rms):
+        if level < floor:
+            out.append(None)
+            continue
+        feats = fe(np.pad(chunk, (0, 16000 * 30 - len(chunk))),
+                   padding=False)[..., :fe.nb_max_frames]
+        if feats.shape[-1] < fe.nb_max_frames:
+            feats = np.pad(feats, [(0, 0), (0, fe.nb_max_frames - feats.shape[-1])])
+        (lang, prob), *_ = model.model.detect_language(model.encode(feats[None]))[0]
+        out.append(lang[2:-2] if prob >= _ASR_LANG_MIN_PROB else None)
+    return out
+
+
+def _quietest(audio, pos: int) -> int:
+    """Nudge a span boundary to the quietest 100ms within +/-2s of it, so the
+    cut lands between words instead of through one."""
+    import numpy as np
+
+    lo, hi = max(0, pos - 32000), min(len(audio), pos + 32000)
+    n = 1600
+    if hi - lo < n * 4:
+        return pos
+    seg = audio[lo:hi].astype(np.float32)
+    k = (hi - lo) // n
+    rms = [float(np.sqrt(np.mean(seg[i * n:(i + 1) * n] ** 2))) for i in range(k)]
+    return lo + int(np.argmin(rms)) * n + n // 2
+
+
+def _language_spans(audio) -> List[Tuple[int, int, str]]:
+    """Split the recording into contiguous single-language spans.
+
+    This exists because of a silent data loss: a whole English sentence spoken
+    inside otherwise Chinese audio was DROPPED, not mistranscribed. Whisper
+    keeps the timestamps covering it and simply omits the words, so nothing
+    downstream can tell. It happens because the sentence is the minority
+    language inside its 30s window; give it a window of its own and it comes
+    back verbatim. Every alternative was tried first and each broke something
+    else: hotword phrasing (four variants) did nothing, multilingual=True
+    mislabelled Chinese windows and looped, condition_on_previous_text
+    hallucinated across silence, and there is no timestamp gap to repair from.
+
+    On monolingual audio this collapses to a single span and the caller takes
+    the ordinary one-pass route — measured zero false switches on pure Chinese
+    and pure English clips.
+    """
+    labels = _probe_languages(audio)
+    if not any(labels):
+        return []
+    # whichever language holds the most probes carries the clip
+    tally: Dict[str, int] = {}
+    for lab in labels:
+        if lab:
+            tally[lab] = tally.get(lab, 0) + 1
+    dominant = max(tally, key=tally.get)
+    for i, lab in enumerate(labels):
+        if lab and lab != dominant and lab not in _ASR_LANGS:
+            log.info("ignoring %r probe at %ds (not a language we expect)",
+                     lab, i * _ASR_PROBE_S)
+            labels[i] = None
+    if not any(labels):
+        return []
+    # a pause decides nothing, so let it inherit from whichever side spoke
+    for rng in (range(len(labels)), reversed(range(len(labels)))):
+        seen = None
+        for i in rng:
+            if labels[i]:
+                seen = labels[i]
+            elif seen:
+                labels[i] = seen
+    # a lone flipped probe between two that agree is noise
+    smooth = list(labels)
+    for i in range(1, len(labels) - 1):
+        if labels[i - 1] == labels[i + 1] != labels[i]:
+            smooth[i] = labels[i - 1]
+    step = 16000 * _ASR_PROBE_S
+    runs: List[List] = []
+    for i, lab in enumerate(smooth):
+        end = min(len(audio), (i + 1) * step)
+        if runs and runs[-1][2] == lab:
+            runs[-1][1] = end
+        else:
+            runs.append([i * step, end, lab])
+    runs[-1][1] = len(audio)
+    # fold away runs too short to deserve their own pass, then re-merge
+    while len(runs) > 1:
+        short = [i for i, r in enumerate(runs)
+                 if (r[1] - r[0]) < 16000 * _ASR_MIN_SPAN_S]
+        if not short:
+            break
+        i = short[0]
+        j = i - 1 if i else 1
+        runs[j][0] = min(runs[j][0], runs[i][0])
+        runs[j][1] = max(runs[j][1], runs[i][1])
+        del runs[i]
+        k = 0
+        while k + 1 < len(runs):
+            if runs[k][2] == runs[k + 1][2]:
+                runs[k][1] = runs[k + 1][1]
+                del runs[k + 1]
+            else:
+                k += 1
+    for i in range(1, len(runs)):
+        cut = _quietest(audio, runs[i][0])
+        runs[i - 1][1] = runs[i][0] = cut
+    return [(int(a), int(b), c) for a, b, c in runs]
+
+
+def _detect_language(audio) -> str:
+    """Dominant language of the whole recording."""
+    spans = _language_spans(audio)
+    if not spans:
+        raise RuntimeError("no language probes")
+    weight: Dict[str, int] = {}
+    for a, b, lang in spans:
+        weight[lang] = weight.get(lang, 0) + (b - a)
+    return max(weight, key=weight.get)
+
+
+_ASR_ZH_PROMPT = "以下是简体中文普通话，可能夹杂英文。"
+_ASR_ZH_HOTWORDS = ("以下是简体中文普通话的转写，可能夹杂英文，"
+                    "需要包含逗号、句号、问号等标点符号。")
+# Keyed on the language whisper detects, because the prompt is NOT language
+# neutral: feeding the Chinese one to English audio makes the model flip
+# language at the window-two boundary and start paraphrasing in Chinese
+# ("I lean toward the second one. It hurts, but it solves the problem" came back
+# as "我看起来的第二个问题。它封了,但它其实解决了这个问题的问题。") — measured
+# 46 stray hanzi and a quarter of the words gone. Whisper punctuates English
+# natively, so every other language gets no prompt at all, which is also exactly
+# what it got before this change.
+_ASR_PROMPTS = {"zh": {"initial_prompt": _ASR_ZH_PROMPT,
+                       "hotwords": _ASR_ZH_HOTWORDS}}
+_SENT_END = "。！？!?.…"
+# A paragraph has to cover this much speech before a break is allowed, otherwise
+# a short sentence ends up alone on a line and the whole thing reads like
+# subtitles. Measured in SECONDS rather than characters so it means the same
+# thing in Chinese and in English — 60 characters is a full Chinese sentence but
+# only about ten English words.
+_PARA_MIN_S = 25.0
+
+
+def _join_segments(segs) -> str:
+    """Whisper's segment boundaries are the speaker's breath groups, so start a
+    new paragraph at each one — but only where the previous segment actually
+    closed a sentence and the paragraph has some body to it.
+
+    Segment text is concatenated RAW, never stripped: whisper carries the
+    inter-word space as a leading space on the next segment, so stripping it
+    welds English words together across the seam ("users definitely noticeit").
+    """
+    out: List[str] = []
+    line = ""
+    start = 0.0
+    for s in segs:
+        if not s.text.strip():
+            continue
+        if not line:
+            line, start = s.text.lstrip(), s.start
+        elif (line.rstrip()[-1] in _SENT_END
+                and s.start - start >= _PARA_MIN_S):
+            out.append(line.strip())
+            line, start = s.text.lstrip(), s.start
+        else:
+            line += s.text
+    if line.strip():
+        out.append(line.strip())
+    return "\n".join(out)
+
+
+# One whisper job at a time. The model is CPU-int8 on 4 cores and already
+# saturates them (measured: 8 threads is SLOWER than 4), so two concurrent long
+# transcriptions just make both crawl.
+_ASR_SEM = asyncio.Semaphore(1)
+
+# Measured on this box with large-v3-turbo/int8: ~0.35x realtime. Used only to
+# tell the user what they are in for; the real clock comes from progress.
+ASR_REALTIME_FACTOR = 0.4
+
+
+async def transcribe(path: str, progress=None) -> str:
+    """progress: optional async fn(done_s, total_s) called while decoding."""
+    state = {"pos": 0.0, "total": 0.0}
+
     def _run() -> str:
-        segments, _info = _get_whisper().transcribe(
-            path,
-            # vad_filter is OFF on purpose. Silero VAD was misclassifying whole
-            # clips as non-speech and returning ZERO segments, so a real 13.7s
-            # message transcribed to '' ("听不清，转写为空"). Proven on the actual
-            # audio: vad on -> 0 chars, vad off -> full correct transcript.
-            # Losing silence-trimming is fine — condition_on_previous_text=False
-            # plus the outro blocklist keep hallucinations down without ever
-            # dropping real speech.
-            vad_filter=False,
-            condition_on_previous_text=False,
-            initial_prompt="以下是简体中文普通话，可能夹杂英文。",
-        )
-        seg_list = list(segments)
+        from faster_whisper.audio import decode_audio
+
+        model = _get_whisper()
+        audio = decode_audio(path, sampling_rate=16000)
+        state["total"] = len(audio) / 16000
+
+        def one(chunk, lang: str, offset: float) -> list:
+            segs, _info = model.transcribe(
+                chunk,
+                language=lang,
+                **_ASR_PROMPTS.get(lang, {}),
+                # vad_filter is OFF on purpose. Silero VAD was misclassifying
+                # whole clips as non-speech and returning ZERO segments, so a
+                # real 13.7s message transcribed to '' ("听不清，转写为空").
+                # Proven on the actual audio: vad on -> 0 chars, vad off -> full
+                # correct transcript. Losing silence-trimming is fine —
+                # condition_on_previous_text=False plus the outro blocklist keep
+                # hallucinations down without ever dropping real speech.
+                vad_filter=False,
+                condition_on_previous_text=False,
+            )
+            out = []
+            for seg in segs:            # a generator: this is where the work
+                out.append(_Seg(seg.text, seg.start + offset, seg.end + offset))
+                state["pos"] = seg.end + offset   # so progress lives here
+            return out
+
+        try:
+            spans = _language_spans(audio)
+        except Exception:
+            # tiny missing or undownloadable: fall back to what this did before,
+            # which is one pass at the main model's read of the first window.
+            log.exception("language probing failed; using first-window detect")
+            try:
+                lang, _p, _a = model.detect_language(audio=audio[:16000 * 30])
+            except Exception:
+                log.exception("language detection failed; assuming zh")
+                lang = "zh"
+            spans = [(0, len(audio), lang)]
+        if len(spans) > _ASR_MAX_SPANS:
+            # fragmented past the point of belief: trust the majority instead
+            log.warning("%d language spans, falling back to one pass", len(spans))
+            weight: Dict[str, int] = {}
+            for a, b, lang in spans:
+                weight[lang] = weight.get(lang, 0) + (b - a)
+            spans = [(0, len(audio), max(weight, key=weight.get))]
+        if len(spans) > 1:
+            log.info("voice: %s", " ".join(
+                f"{l}@{a / 16000:.0f}-{b / 16000:.0f}s" for a, b, l in spans))
+        seg_list = []
+        for a, b, lang in spans:
+            seg_list += one(audio[a:b], lang, a / 16000)
         # drop segments that ARE an outro (start with an outro head), then peel a
         # trailing outro fused onto the last real segment.
-        text = "".join(
-            s.text for s in seg_list
-            if not _WHISPER_OUTRO_RE.match(s.text.strip())).strip()
-        text = _WHISPER_OUTRO_RE.sub("", text).strip()
-        return text
-    return await asyncio.to_thread(_run)
+        text = _join_segments(
+            s for s in seg_list
+            if not _WHISPER_OUTRO_RE.match(s.text.strip()))
+        # the outro is always fused onto the tail, so peel it off the last
+        # paragraph only — the regex ends in `.*$`, which no longer spans the
+        # paragraph breaks we now insert.
+        paras = text.split("\n")
+        paras[-1] = _WHISPER_OUTRO_RE.sub("", paras[-1])
+        return "\n".join(p for p in paras if p.strip()).strip()
+
+    async def _ticker() -> None:
+        while True:
+            await asyncio.sleep(20)
+            if state["total"]:
+                await progress(state["pos"], state["total"])
+
+    async with _ASR_SEM:
+        tick = asyncio.create_task(_ticker()) if progress else None
+        try:
+            return await asyncio.to_thread(_run)
+        finally:
+            if tick is not None:
+                tick.cancel()
 
 
 ConvKey = Tuple[int, int]
@@ -471,6 +814,33 @@ class Conversation:
     effort: Optional[str] = None
     perm_mode: Optional[str] = None  # native CLI permission mode override
     current_model: Optional[str] = None
+    current_perm_mode: Optional[str] = None  # what init last reported
+    # A burst of voice notes is ONE thought, so it must reach the model as one
+    # message. `voice_active` counts notes still downloading/transcribing for
+    # this conv; whoever brings it to zero fires the whole batch.
+    voice_active: int = 0
+    voice_pending: list = field(default_factory=list)
+    # Set when an approved plan took the CLI out of plan mode. Kept separate
+    # from perm_mode so the user's own setting is never silently rewritten.
+    plan_exited: bool = False
+    # Deadline the agent set itself via ScheduleWakeup (/loop), and the prompt
+    # to send if the CLI's own timer does not deliver it.
+    wake_at: Optional[float] = None
+    wake_prompt: Optional[str] = None
+    wake_delay: float = 0.0          # as asked for, before clamping
+    wake_revivals: int = 0           # consecutive CLI-timer failures covered
+    wake_tool_id: Optional[str] = None   # ScheduleWakeup awaiting its result
+    # When the CLI last started a turn WE did not send. That is what its own
+    # wakeup looks like from here, so it is the signal that the timer worked.
+    last_spontaneous: float = 0.0
+    # Background work the agent armed inside the CURRENT CLI process — monitors,
+    # background shells, background subagents. All of it dies with the process,
+    # so dropping the client (a restart, /model, /effort, /mode, /resume,
+    # /project, /reset) silently kills every watcher the agent was counting on.
+    # `bg_armed` is what is live; drop_client moves it to `bg_lost`, and the
+    # next turn tells the agent so it can re-arm instead of waiting forever.
+    bg_armed: list = field(default_factory=list)   # (time, label)
+    bg_lost: list = field(default_factory=list)    # labels
     ctx_warned: int = 0
     # continuous-consumer model: `pump` is the single task draining the CLI
     # stream for this conv's whole client lifetime; `pending` holds messages
@@ -542,6 +912,11 @@ def _state_save() -> None:
 
 
 def persist_binding(conv: "Conversation") -> None:
+    # A saved binding means the topic is now explicitly directed, so it is no
+    # longer "fresh" (fresh == no stored binding; see get_conv). Clearing it
+    # here stops the project picker from re-firing on the first message after an
+    # explicit /resume or /project, which bind but used to leave fresh=True.
+    conv.fresh = False
     entry: dict = {"session_id": conv.session_id}
     if conv.cwd:  # persist cwd so a fresh custom-cwd session survives a restart
         entry["cwd"] = conv.cwd
@@ -551,6 +926,11 @@ def persist_binding(conv: "Conversation") -> None:
         entry["effort"] = conv.effort
     if conv.perm_mode:
         entry["perm_mode"] = conv.perm_mode
+    if conv.bg_lost:
+        # Survives a PROCESS restart, which is the case that matters: the notice
+        # lives on the Conversation, and on a systemd restart that object dies
+        # with everything else, so the agent was never told what it lost.
+        entry["bg_lost"] = conv.bg_lost[-20:]
     _state.setdefault("bindings", {})[f"{conv.key[0]}:{conv.key[1]}"] = entry
     _state_save()
 
@@ -846,6 +1226,35 @@ def conv_key_of(update: Update) -> ConvKey:
     return (update.effective_chat.id, thread)
 
 
+def profile_for(chat_id: int, thread: int) -> str:
+    """The trust profile for a topic. It is keyed on the ROOM, not the speaker,
+    because one client serves a whole topic and a room can have several people
+    in it - a per-message profile would let a guest ride a client that was
+    built for the owner. "owner" = full tools, no path scoping; "guest" = a
+    read/write/web allowlist confined to GUEST_*_DIRS, anything else asks."""
+    if chat_id == OWNER_ID and thread == 0:
+        return "owner"
+    return "owner" if chat_id in TRUSTED_GROUP_IDS else "guest"
+
+
+def apply_binding(conv: "Conversation", stored: dict) -> None:
+    """Restore a topic's stored settings onto a conv. ONE function, called from
+    both the normal path and the crash-recovery path, because recovery used to
+    hand-restore its own subset: it forgot perm_mode, so every unclean restart
+    silently dropped every recovered topic back to asking for everything."""
+    if stored.get("cwd"):         # restored for a fresh session; a resumed
+        conv.cwd = stored["cwd"]  # session's own file cwd overrides below
+    ssid = stored.get("session_id")
+    meta = find_session(ssid) if ssid else None
+    if meta:
+        conv.session_id = ssid
+        conv.cwd = meta["cwd"] or conv.cwd
+    conv.model = stored.get("model") or conv.model
+    conv.effort = stored.get("effort") or conv.effort
+    conv.perm_mode = stored.get("perm_mode") or conv.perm_mode
+    conv.bg_lost = list(stored.get("bg_lost") or [])
+
+
 def get_conv(update: Update) -> Conversation:
     key = conv_key_of(update)
     if key not in conversations:
@@ -867,7 +1276,7 @@ def get_conv(update: Update) -> Conversation:
             # dir), NOT a configured project — use /project to switch into one.
             # Pathless Glob/Grep stay scoped to an empty dir (nothing to leak).
             conv = Conversation(
-                key=key, profile="guest",
+                key=key, profile=profile_for(*key),
                 cwd=str(PLAYGROUND_DIR),
             )
         # Restart continuity: a topic keeps pointing at the session it was on.
@@ -875,16 +1284,7 @@ def get_conv(update: Update) -> Conversation:
         # cwd comes from the CLI's own session file, not from our state.
         stored = stored_binding(key)
         if stored:
-            if stored.get("cwd"):     # restored for a fresh session; a resumed
-                conv.cwd = stored["cwd"]  # session's own file cwd overrides below
-            ssid = stored.get("session_id")
-            meta = find_session(ssid) if ssid else None
-            if meta:
-                conv.session_id = ssid
-                conv.cwd = meta["cwd"] or conv.cwd
-            conv.model = stored.get("model") or conv.model
-            conv.effort = stored.get("effort") or conv.effort
-            conv.perm_mode = stored.get("perm_mode") or conv.perm_mode
+            apply_binding(conv, stored)
         conv.fresh = not stored  # no prior binding → a genuinely new topic
         conversations[key] = conv
     return conversations[key]
@@ -900,6 +1300,24 @@ async def drop_client(conv: Conversation) -> None:
         except Exception:
             log.exception("disconnect error for %s", conv.key)
         conv.client = None
+    # current_* is "what the live client reports". Without a client there is
+    # nothing to report, and a stale value would be read back as the effective
+    # setting - /status falls back to the transcript / the override instead.
+    conv.current_model = None
+    conv.current_perm_mode = None
+    # Anything the agent armed lived inside that process. Keep only what was
+    # armed recently enough to plausibly still have been running, so a monitor
+    # that finished an hour ago is not re-reported as lost.
+    cutoff = time.time() - BG_STALE_S
+    conv.bg_lost += [lab for t, lab in conv.bg_armed if t >= cutoff]
+    if conv.wake_at and conv.wake_at > time.time():
+        conv.bg_lost.append(
+            f"scheduled wakeup in {int(conv.wake_at - time.time())}s")
+    conv.wake_at = conv.wake_prompt = conv.wake_tool_id = None
+    if conv.bg_lost and not conv.fresh:
+        persist_binding(conv)
+    del conv.bg_lost[:-20]
+    conv.bg_armed.clear()
 
 
 # Prefer the system CLI over the SDK's bundled one: sessions created in the
@@ -995,7 +1413,7 @@ def build_options(conv: Conversation) -> ClaudeAgentOptions:
             },
             cwd=conv.cwd,
             resume=conv.session_id,
-            permission_mode=conv.perm_mode or "default",
+            permission_mode=effective_perm_mode(conv),
             can_use_tool=make_owner_cb(conv),
             model=conv.model,
             effort=conv.effort,
@@ -1014,7 +1432,7 @@ def build_options(conv: Conversation) -> ClaudeAgentOptions:
         allowed_tools=sorted(READ_TOOLS | WRITE_TOOLS | WEB_TOOLS) + [TG_SEND_TOOL],
         mcp_servers={"tgclaude": _tg_mcp_server(conv)},  # send_file (scope-checked)
         can_use_tool=make_permission_cb(conv),
-        permission_mode=conv.perm_mode or "default",
+        permission_mode=effective_perm_mode(conv),
         resume=conv.session_id,
         include_partial_messages=True,  # live thinking/text stream for status
         setting_sources=["user", "project"],
@@ -1179,6 +1597,14 @@ async def handle_exit_plan(conv: Conversation, tool_input: dict):
         ["✅ Approve plan", "❌ Keep planning"],
     )
     if idx == 0:
+        # Approving a plan takes the CLI out of plan mode for good (verified:
+        # edits land on this turn AND the next). Record that, but do NOT
+        # rewrite conv.perm_mode - that is the user's standing choice for this
+        # topic and ours to read, not to edit. plan_exited keeps the next
+        # client from re-imposing plan mode on a plan they already approved.
+        if conv.perm_mode == "plan":
+            conv.plan_exited = True
+            conv.current_perm_mode = "default"
         return PermissionResultAllow(updated_input=tool_input)
     return PermissionResultDeny(
         message="User wants to keep planning (or did not respond); "
@@ -1401,6 +1827,11 @@ async def send_long(update: Update, text: str, anchor=None) -> None:
                     chunk, do_quote=False)
 
 
+# A status bubble whose create failed is not re-created on the next tick;
+# see LiveStatus.update for why a retried create can duplicate the bubble.
+CREATE_RETRY_COOLDOWN = 60.0  # s
+
+
 class LiveStatus:
     """One status message per segment, edited in place; becomes the reply.
     The turn's reply anchor is consume-once (anchor_fn): the FIRST segment
@@ -1420,6 +1851,7 @@ class LiveStatus:
         self.anchor = self._UNSET  # resolved once: a Message, or None
         self._lock = asyncio.Lock()  # serialize update() vs finalize()
         self._done = False           # finalized: a late create/edit is a no-op
+        self._retry_create_at = 0.0  # cooldown after a failed bubble create
 
     def _resolve(self):
         if self.anchor is self._UNSET:
@@ -1438,19 +1870,35 @@ class LiveStatus:
         # finalize(). Without it, a create's send can still be in flight (msg
         # is None) when finalize runs — finalize then sends the reply as a
         # NEW message and this create lands afterward as an orphan "Working…"
-        # bubble. The lock also collapses the flood-era duplicate-bubble pile:
-        # a slow create holds the lock, so later calls edit instead of re-send.
+        # bubble.
+        #
+        # But never QUEUE on it. A status frame is worth sending only if it can
+        # be sent NOW: under flood control a single edit can sit in the limiter
+        # for minutes, and every frame produced meanwhile used to stack up
+        # behind the lock and then fire, one stale edit each, the instant the
+        # wait lifted — re-earning the ban it was waiting out. Drop the frame
+        # instead; the next tick renders fresher state anyway.
+        if self._lock.locked():
+            return
         async with self._lock:
             if self._done:  # already finalized — a late create would orphan
                 return
             now = time.time()
             if self.msg is None:
+                if now < self._retry_create_at:
+                    return
                 try:
                     self.msg = await self._send(
                         update_obj, text, disable_notification=True)
                     self.last, self.text = now, text
                 except Exception:
-                    pass
+                    # The send may well have LANDED — a ReadTimeout loses the
+                    # response, not the message. Re-creating on the very next
+                    # tick is how one timeout became a column of orphan
+                    # "Working…" bubbles, so sit out a cooldown. If the bubble
+                    # really is lost the turn just runs without a live status;
+                    # finalize() still delivers the reply on its own.
+                    self._retry_create_at = time.time() + CREATE_RETRY_COOLDOWN
                 return
             if now - self.last < 6.0 or text == self.text:
                 return
@@ -1659,6 +2107,17 @@ class _BotTarget:
 # the turn is alive even when the CLI streams nothing before the answer)
 _SPIN = ["✽", "✼", "✻", "✺"]
 
+# Live-status cadence (see _ticker). Every frame costs one editMessageText
+# against a per-chat budget Telegram meters over hours, so the interval tracks
+# how much the bubble actually has to say rather than running flat out.
+TICK_FAST = 7.0     # s between frames while the turn keeps changing
+TICK_SLOW = 30.0    # s between frames once it has gone quiet
+TICK_GROWTH = 1.6   # how fast the quiet cadence walks from FAST to SLOW
+
+# Grace before a FOLLOW-ON reply segment is given a "Working…" placeholder
+# (the turn's first one is never delayed — see show()).
+SEG_BUBBLE_DELAY = 12.0  # s
+
 
 async def _pump(conv: "Conversation") -> None:
     """The single continuous consumer of conv.client's message stream. Runs
@@ -1674,44 +2133,88 @@ async def _pump(conv: "Conversation") -> None:
     txt = ""            # accumulated streamed answer text (live preview)
     think_tokens = 0    # running total of thinking-token estimates (a sum)
     spin_i = 0
+    seg_since = 0.0     # when the current segment began; 0 = the turn's first
 
-    async def flush() -> None:
-        nonlocal status
+    async def flush(final: bool = False) -> None:
+        nonlocal status, seg_since
         seg = "\n".join(p for p in buf if p).strip()
         buf.clear()
         if seg.startswith("<pass>"):
             seg = ""
+        if not seg and not final:
+            # Nothing to say and the turn goes on: keep the bubble the ticker
+            # already has. Finalizing an empty segment deletes it and the next
+            # frame sends an identical one straight back — two calls to end up
+            # where we started — and under flood control the dropped delete
+            # strands the old bubble above the new one.
+            return
         await status.finalize(target, seg)  # raw md; finalize renders to HTML
         status = LiveStatus()
+        seg_since = time.time()
 
-    async def show(min_elapsed: float = 0.0) -> None:
-        # Live "working…" bubble driven by conv.working_since (an INPUT-side
-        # clock set by run_turn), so liveness shows even when the CLI streams
-        # nothing until the final answer. The ticker passes min_elapsed to
-        # skip quick turns; event-driven calls pass 0 to show immediately.
+    async def show(min_elapsed: float = 0.0) -> bool:
+        """One frame of the live "working…" bubble, driven by
+        conv.working_since (an INPUT-side clock set by run_turn) so liveness
+        shows even when the CLI streams nothing until the final answer.
+        min_elapsed skips quick turns; event-driven calls pass 0 to show
+        immediately. Returns whether a frame was actually rendered — the
+        ticker holds its cadence fast while frames are being skipped."""
         nonlocal spin_i
         ws = conv.working_since
         if ws is None:
-            return
+            return False
         elapsed = time.time() - ws
         if elapsed < min_elapsed:
-            return
+            return False
+        if (status.msg is None and seg_since
+                and time.time() - seg_since < SEG_BUBBLE_DELAY):
+            # A follow-on segment does not need a placeholder. The turn's FIRST
+            # bubble is the liveness signal and has to be quick, but by segment
+            # two the user is already reading this turn's output, and a
+            # "Working…" that appears only to be overwritten seconds later is
+            # flicker that costs a send the text would have paid for anyway.
+            # Sit out a grace window instead: a segment that finishes inside it
+            # is delivered by finalize() as one message, no bubble involved.
+            return False
         spin_i += 1
         eff = f" · {conv.effort}" if conv.effort else ""
         line = f"{_SPIN[spin_i % len(_SPIN)]} {head} ({int(elapsed)}s{eff})"
         await status.update(target, line + (f"\n{detail}" if detail else ""))
+        return True
 
     async def _ticker() -> None:
         # THE sole writer of the status bubble. CLI events only mutate state
         # (head/detail/tokens); this task renders at a controlled cadence, so a
         # tool-heavy or token-streaming turn can never machine-gun Telegram
-        # into flood control. First feedback at ~3s, then every 7s.
+        # into flood control. First feedback at ~4s.
+        #
+        # After that the cadence tracks how much the bubble has to SAY. A flat
+        # 7s tick spends the chat's edit budget on nothing: a 90-minute turn
+        # parked inside one long Bash burns ~770 edits redrawing an identical
+        # line with the next spinner frame, which is what earned a run of
+        # `Retry in 500s` flood bans. So render fast while the substance
+        # (head + detail) keeps changing — a tool firing, an answer streaming,
+        # the only frames that carry information — and back off to a TICK_SLOW
+        # liveness pulse once the turn goes quiet. Active turns look exactly as
+        # they did; a stalled one costs ~4× less.
         try:
             delay = 4.0   # first render at ~4s (quick turns clear before this)
+            prev = None
             while True:
                 await asyncio.sleep(delay)
-                delay = 7.0
-                await show()
+                if conv.working_since is None:
+                    # between turns nothing renders, so polling is free — stay
+                    # snappy, the next turn's first frame must not wait out a
+                    # backoff the previous one earned
+                    prev, delay = None, 4.0
+                    continue
+                rendered = await show()
+                sub = (head, detail)
+                # a skipped frame costs nothing, so it must not buy a backoff:
+                # the bubble it is holding back still has to land promptly
+                delay = (TICK_FAST if sub != prev or not rendered
+                         else min(delay * TICK_GROWTH, TICK_SLOW))
+                prev = sub
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1731,11 +2234,21 @@ async def _pump(conv: "Conversation") -> None:
                             and isinstance(getattr(m, "data", None), dict)):
                         conv.current_model = (m.data.get("model")
                                               or conv.current_model)
+                        conv.current_perm_mode = (m.data.get("permissionMode")
+                                                  or conv.current_perm_mode)
                     if isinstance(m, AssistantMessage):
+                        if conv.working_since is None:
+                            # a turn nobody here started: the CLI woke itself,
+                            # for a cron/wakeup or a background task report
+                            conv.last_spontaneous = time.time()
                         for block in m.content:
                             if isinstance(block, TextBlock):
                                 buf.append(block.text)
                             elif isinstance(block, ToolUseBlock):
+                                if block.name == "ScheduleWakeup":
+                                    _note_wakeup(conv, block.input or {},
+                                                 getattr(block, "id", ""))
+                                _note_background(conv, block)
                                 n_tools += 1
                                 if buf:
                                     await flush()
@@ -1780,8 +2293,9 @@ async def _pump(conv: "Conversation") -> None:
                                     or "unknown error")
                                 buf.append(f"⚠️ Turn failed: {str(err)[:500]}")
                         conv.interrupted = False  # one-shot: consumed this turn
-                        await flush()
+                        await flush(final=True)
                         n_tools = 0
+                        seg_since = 0.0  # next turn's first bubble: no grace
                         head, detail, txt, think_tokens = "Working…", "", "", 0
                         # a turn finished: clear the 👀 markers + inflight for
                         # every outstanding message (coarse — anchor next step)
@@ -1820,9 +2334,30 @@ async def _pump(conv: "Conversation") -> None:
                             except Exception:
                                 log.exception("compact-hold release(boundary) "
                                               "%s", conv.key)
+                    elif (isinstance(m, SystemMessage)
+                          and getattr(m, "subtype", "") in _MODEL_SWITCH_SUBS):
+                        # The CLI can move a session onto a different model on
+                        # its own (Fable safeguards flagging a message, a dead
+                        # primary, a consent swap) and, for the refusal case,
+                        # KEEP it there. It emits a system event for that and we
+                        # used to drop it, so the switch was invisible: /status
+                        # kept showing the requested override while another
+                        # model answered for two days. Relay it.
+                        try:
+                            await _notify_model_switch(target, conv, m)
+                        except Exception:
+                            log.exception("model-switch notice for %s",
+                                          conv.key)
                     elif isinstance(m, UserMessage):
-                        # relay CLI local-command output (/context, /cost, ...)
                         content = getattr(m, "content", None)
+                        if conv.wake_tool_id and isinstance(content, list):
+                            for b in content:
+                                if (getattr(b, "tool_use_id", None)
+                                        == conv.wake_tool_id):
+                                    c = getattr(b, "content", "")
+                                    _note_wakeup_result(
+                                        conv, c if isinstance(c, str) else str(c))
+                        # relay CLI local-command output (/context, /cost, ...)
                         texts = []
                         if isinstance(content, str):
                             texts.append(content)
@@ -1890,6 +2425,7 @@ async def _pump(conv: "Conversation") -> None:
                 status = LiveStatus()
                 buf.clear()
                 n_tools = 0
+                seg_since = 0.0
                 head, detail, txt, think_tokens = "Working…", "", "", 0
     except asyncio.CancelledError:
         raise
@@ -1996,6 +2532,10 @@ async def run_turn(
                 asyncio.create_task(_release_compact_hold(conv))
         # persist first (recovery), then the 👀 marker the pump clears when
         # this input's turn produces a ResultMessage
+        # the user is driving now; a self-scheduled continuation would only
+        # collide with whatever they just asked for
+        conv.wake_at = conv.wake_prompt = conv.wake_tool_id = None
+        conv.wake_revivals = 0
         _inflight_add(conv, msg, queued_text=(text or "").strip() or "[media]")
         conv.pending.append(msg)
         try:
@@ -2010,6 +2550,15 @@ async def run_turn(
         pass
     try:
         client = await ensure_client(conv)
+        if conv.bg_lost:
+            lost, conv.bg_lost = conv.bg_lost, []
+            if not conv.fresh:
+                persist_binding(conv)   # told once, not on every restart after
+            text = ("[system] The CLI process was restarted, which killed "
+                    + str(len(lost)) + " background watcher(s) you had armed: "
+                    + "; ".join(lost)
+                    + ". They will never report back. Re-arm any that still "
+                      "matter before continuing.\n\n" + text)
         if blocks:
             content = list(blocks) + [{"type": "text", "text": text}]
 
@@ -2072,6 +2621,7 @@ async def cmd_reset(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     async with conv.lock:
         await drop_client(conv)
         conv.session_id = None
+        conv.plan_exited = False
         persist_binding(conv)
     await update.effective_message.reply_text("Fresh session on next message.")
 
@@ -2285,6 +2835,72 @@ async def fetch_models() -> list:
     return data
 
 
+# System subtypes that mean "something other than your chosen model answered".
+# Wire shape is snake_case (the camelCase spelling only exists in the transcript
+# records, so read both); the semantics differ per subtype and getting them
+# wrong turns this notice into a new lie:
+#   model_refusal_fallback  scope "session" (or absent, older CLIs) -> the
+#                           session model is swapped and STAYS swapped;
+#                           scope "local" -> only a subagent/side-question fell
+#                           back, the session is untouched.
+#   model_fallback          turn-scoped; the primary is retried next turn.
+#   model_consent_fallback  a consent prompt produced the swap.
+#   model_refusal_no_fallback  the model refused and NOTHING retried - the turn
+#                           just produces nothing, which looks like a bug from
+#                           the chat side unless we say what happened.
+_MODEL_SWITCH_SUBS = ("model_refusal_fallback", "model_fallback",
+                      "model_consent_fallback", "model_refusal_no_fallback")
+
+
+def _wire(d: dict, name: str):
+    """Read a field that is snake_case on the wire, camelCase in transcripts."""
+    if name in d:
+        return d[name]
+    head, *rest = name.split("_")
+    return d.get(head + "".join(w.capitalize() for w in rest))
+
+
+async def _notify_model_switch(target, conv: "Conversation", m) -> None:
+    d = getattr(m, "data", None) or {}
+    sub = getattr(m, "subtype", "")
+    was = _norm_model(_wire(d, "original_model")) or "?"
+    now = _norm_model(_wire(d, "fallback_model")) or "?"
+    if sub == "model_refusal_no_fallback":  # refused, nothing took over
+        why = _wire(d, "api_refusal_category")
+        await target.effective_message.reply_text(
+            f"⚠️ {was} refused this message"
+            + (f" [{why}]" if why else "")
+            + " and no fallback model ran — the turn produced nothing.\n"
+              "(/model to switch, or rephrase)",
+            disable_notification=True)
+        return
+    scope = _wire(d, "scope") or ("session" if sub != "model_fallback"
+                                  else "turn")
+    if scope == "local":  # a subagent/side-question only; session unchanged
+        note = "that subagent/side-question only — session model unchanged"
+    elif scope == "session":
+        conv.current_model = _wire(d, "fallback_model") or conv.current_model
+        note = ("session-wide and sticky — re-pick /model to go back"
+                if _wire(d, "direction") != "revert" else "session-wide")
+    else:
+        note = "this turn only — your model is retried on the next one"
+    why = _wire(d, "api_refusal_category")
+    verb = "reverted" if _wire(d, "direction") == "revert" else "switched"
+    line = f"⚠️ Model {verb}: {was} → {now}"
+    if why:
+        line += f" [{why}]"
+    await target.effective_message.reply_text(
+        f"{line}\n({note})", disable_notification=True)
+
+
+def effective_perm_mode(conv: "Conversation") -> str:
+    """The mode a new client should start in: the user's setting, unless this
+    session has already left plan mode by approving a plan."""
+    if conv.perm_mode == "plan" and conv.plan_exited:
+        return "default"
+    return conv.perm_mode or DEFAULT_PERM_MODE
+
+
 def _norm_model(mid: Optional[str]) -> str:
     """claude-fable-5[1m] and claude-fable-5 are the same model."""
     return re.sub(r"\[[^\]]*\]$", "", mid or "")
@@ -2304,7 +2920,13 @@ def _session_model(sid: Optional[str]) -> Optional[str]:
                 tail = fh.read().decode("utf-8", errors="ignore")
         except OSError:
             return None
-        hits = re.findall(r'"model"\s*:\s*"([^"]+)"', tail)
+        # Anchored on the record shape ("message":{"model":...}) so that prose
+        # merely MENTIONING a model id (this bot's own chat about models ends up
+        # in the transcript) can't be mistaken for the model that answered.
+        hits = re.findall(r'"message"\s*:\s*\{\s*"model"\s*:\s*"([^"]+)"',
+                          tail)
+        if not hits:  # older/other record shapes
+            hits = re.findall(r'"model"\s*:\s*"([^"]+)"', tail)
         hits = [h for h in hits if h.startswith("claude")]
         return hits[-1] if hits else None
     return None
@@ -2615,13 +3237,24 @@ async def refresh_effort_choices(app: Application) -> None:
 
 async def apply_model(reply, conv: Conversation, m: str) -> None:
     conv.model = None if m == "default" else m
+    # Persist it: a memory-only override silently died on every restart and the
+    # session quietly reverted to the account default. Not on a still-fresh
+    # topic though - writing a binding there would suppress the project picker
+    # (see get_conv); its first turn persists the override anyway.
+    if not conv.fresh:
+        persist_binding(conv)
     if conv.client is not None:
         try:
             await conv.client.set_model(conv.model)
         except Exception as e:
-            await reply(f"set_model failed: {e}")
+            # the override is set but the live client never took it: schedule
+            # the rebuild, or it would quietly keep answering as the old model
+            conv.mode_rebuild_pending = True
+            await reply(f"set_model failed: {e}\nApplying on the next message "
+                        "instead (session resumes, context preserved).")
             return
-        await reply(f"Model set to {m} (live).")
+        conv.current_model = conv.model  # else /status reads the pre-switch
+        await reply(f"Model set to {m} (live).")  # transcript and cries wolf
     else:
         await reply(f"Model set to {m}; applies on next message.")
 
@@ -2633,9 +3266,32 @@ async def apply_effort(reply, conv: Conversation, e: str) -> None:
                     + ", ".join(EFFORT_CHOICES))
         return
     conv.effort = None if e == "default" else e  # 'default' clears the override
-    await drop_client(conv)
+    if not conv.fresh:  # same reasoning as apply_model
+        persist_binding(conv)
+    # Effort has no SDK setter, but the CLI accepts `/effort <level>` as INPUT
+    # and applies it to the live session — it answers "Set effort level to high
+    # (this session only)" and the transcript then records effort:high. Use that
+    # rather than rebuilding: tearing the process down takes every monitor,
+    # background shell and background subagent in it along too, and /effort is
+    # far too routine a thing to cost that.
+    if conv.client is not None and conv.effort and conv.working_since is None:
+        try:
+            await conv.client.query(f"/effort {conv.effort}")
+            await reply(f"Effort set to {e} (live, this conversation).")
+            return
+        except Exception:
+            log.exception("live /effort failed for %s; rebuilding", conv.key)
+    # Clearing back to the settings default has no live equivalent, and a failed
+    # live switch must not leave the override unapplied, so both rebuild. Never
+    # mid-turn though: dropping the client cancels the pump and kills that turn.
+    if conv.working_since is None:
+        await drop_client(conv)
+        when = "from the next message"
+    else:
+        conv.mode_rebuild_pending = True
+        when = "after this turn finishes"
     await reply(
-        f"Effort set to {e}; applies from the next message "
+        f"Effort set to {e}; applies {when} "
         "(session resumes, context preserved)."
     )
 
@@ -2814,7 +3470,7 @@ _PERM_ALIASES = {
 @menu("pm")
 async def _menu_perm_mode(update: Update):
     conv = get_conv(update)
-    active = conv.perm_mode or "default"
+    active = effective_perm_mode(conv)  # ✓ on what is in force, chosen or not
     # ✓ marks the active choice — same convention as /model, /effort, /whisper.
     items = [[InlineKeyboardButton(
         f"{'✓ ' if m == active else ''}{label}",
@@ -2837,12 +3493,18 @@ async def apply_perm_mode(reply, conv: Conversation, mode: str) -> None:
                     "plan, or bypass.")
         return
     mode = canon
-    conv.perm_mode = None if mode == "default" else mode
-    persist_binding(conv)
+    # Store "default" literally rather than as None: None now means "never
+    # chose" and resolves to DEFAULT_PERM_MODE, so clearing to None would hand
+    # back bypass to someone who just explicitly asked to be asked.
+    conv.perm_mode = mode
+    conv.plan_exited = False  # an explicit choice overrides the session's drift
+    if not conv.fresh:  # same reasoning as apply_model
+        persist_binding(conv)
     label = PERM_MODE_LABEL.get(mode, mode)
     if conv.client is not None:
         try:
             await conv.client.set_permission_mode(mode)
+            conv.current_perm_mode = mode  # the switch took: don't warn on it
             conv.mode_rebuild_pending = False
             await reply(f"{label} (live, this conversation).")
             return
@@ -2935,8 +3597,16 @@ async def cmd_stop(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         if conv.working_since is not None:  # a turn is live: its abort is ours
             conv.interrupted = True
+        # interrupt cancels the CLI's pending loop wakeups ("cancelled N pending
+        # loop wakeup(s) on user abort"), so the backstop must let go too —
+        # otherwise stop means stop on one side and revive on the other.
+        had_wake = conv.wake_at is not None
+        conv.wake_at = conv.wake_prompt = conv.wake_tool_id = None
+        conv.wake_revivals = 0
         await conv.client.interrupt()
-        await update.effective_message.reply_text("⏹ Interrupt sent.")
+        await update.effective_message.reply_text(
+            "⏹ Interrupt sent." + (" Pending loop wakeup cancelled."
+                                   if had_wake else ""))
     except Exception as e:
         conv.interrupted = False
         await update.effective_message.reply_text(f"Interrupt failed: {e}")
@@ -2967,14 +3637,35 @@ async def cmd_status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         lines.append("📄 (new session on next message)")
     lines.append(f"📁 {conv.cwd}")
-    model = _norm_model(conv.model or conv.current_model
-                        or _session_model(conv.session_id))
+    # Report what actually answered, not what we asked for. The CLI reroutes a
+    # whole session to another model when a safety classifier or a usage limit
+    # trips (scope:"session", it never switches back) - showing the override
+    # alone once hid a two-day Fable -> Opus 4.8 fallback.
+    want = _norm_model(conv.model)
+    # current_model first: it is maintained by init, by a successful live
+    # /model, and by the fallback events, so it is never behind. The transcript
+    # is the fallback for when no client is live (after a restart, say) - which
+    # is exactly the case that has to keep warning.
+    actual = _norm_model(conv.current_model or _session_model(conv.session_id))
+    model = actual or want
     mline = f"🤖 {model or 'default model'}"
-    if conv.model:
+    if want and actual and actual != want:
+        mline += f" ⚠️ (fell back from {want}; re-pick /model)"
+    elif conv.model:
         mline += " (override)"
-    if conv.effort:
-        mline += f" · effort: {conv.effort}"
+    if conv.effort:  # no readback channel exists for effort - init omits it,
+        mline += f" · effort: {conv.effort}"  # so this is the requested value
     lines.append(mline)
+    want_pm = effective_perm_mode(conv)
+    act_pm = conv.current_perm_mode or (want_pm if conv.client is None else None)
+    pline = f"🔐 {PERM_MODE_LABEL.get(act_pm or want_pm, act_pm or want_pm)}"
+    if conv.perm_mode == "plan" and conv.plan_exited:
+        pline += " · plan approved — your ⏸ plan setting resumes on /clear"
+    elif act_pm and act_pm != want_pm:
+        pline += f" ⚠️ (you set {want_pm})"
+    if conv.mode_rebuild_pending:
+        pline += " · pending: applies on the next message"
+    lines.append(pline)
     total = await asyncio.to_thread(_session_context_tokens, conv.session_id)
     limit = await _context_limit(conv, total)
     pct = total * 100 / limit if total else 0
@@ -3455,6 +4146,185 @@ def _own_file(p: Path) -> bool:
         return False
 
 
+# The CLI schedules /loop wakeups inside its own process. That works in a
+# short-lived client (verified three ways: fresh, resumed, and with this bot's
+# exact options) but has been observed NOT firing in the long-lived sessions
+# this bot keeps - 4 scheduled, 0 fired, with no turn in the transcript and no
+# error anywhere. A loop that silently stops looks exactly like an agent that
+# gave up, so do not depend on that timer: record the deadline the agent set
+# for itself and, if nothing has happened well past it, send the prompt.
+# How long past the deadline to wait before concluding the CLI's own timer is
+# not coming. The deadline itself now comes from the CLI ("Next wakeup scheduled
+# for 18:47:00 (in 82s)"), so this no longer has to absorb the minute-rounding
+# it applies — that is already in its number. What is left is its scheduler tick
+# and delivery, plus this watcher's own 20s poll.
+WAKEUP_GRACE_S = 60.0
+# Reviving a loop is not a neutral act: the agent wakes, works, re-arms its own
+# wakeup, and the backstop revives it again. Unbounded, that is perpetual motion
+# — a /loop the user had walked away from billed for hours.
+#
+# What it counts is CONSECUTIVE FAILURES OF THE CLI'S TIMER, and the count is
+# reset by either of the two things that mean the situation is not that:
+#   * the CLI delivers a wakeup itself — its timer is alive, the backstop is
+#     covering the occasional miss, which is what it is for;
+#   * the user says anything in the topic — they are here, watching it.
+# So an intermittently-flaky timer never accumulates a count, and a dead one
+# gets a bounded number of revivals with nobody around before the loop is left
+# stopped. An earlier version of this bounded it by wall-clock time instead
+# ("4h since the user last spoke"), which was a number I made up: elapsed time
+# says nothing about whether the loop is worth continuing.
+WAKEUP_BACKSTOP = os.environ.get("TGCLAUDE_WAKEUP_BACKSTOP", "1") == "1"
+WAKEUP_BUDGET = int(os.environ.get("TGCLAUDE_WAKEUP_BUDGET", "3"))
+def wakeup_grace(delay_s: float) -> float:
+    """Constant: the CLI's own slippage is minute-quantisation, not a fraction
+    of the delay, so it does not grow with the delay."""
+    return WAKEUP_GRACE_S
+# How long an armed watcher stays worth reporting as lost when the client is
+# dropped. Past this it has most likely already fired and been dealt with.
+BG_STALE_S = float(os.environ.get("TGCLAUDE_BG_STALE_S", "3600"))
+
+
+# The CLI answers a ScheduleWakeup call with the time it actually settled on:
+#   "Next wakeup scheduled for 18:47:00 (in 82s). Nothing more to do this turn"
+# That is worth far more than the delay the agent asked for, because the two are
+# not the same — the CLI rounds the target UP to the next whole minute before
+# turning it into a cron entry, so a 60s request became 82s here. Take its
+# number and there is nothing left to estimate.
+_WAKE_RESULT_RE = re.compile(r"wakeup scheduled for\s*(\d{1,2}:\d{2}(?::\d{2})?)"
+                             r"\s*\(in\s*(\d+)\s*s", re.I)
+
+
+def _note_wakeup(conv: "Conversation", inp: dict, tool_id: str = "") -> None:
+    if inp.get("stop"):
+        conv.wake_at = conv.wake_prompt = conv.wake_tool_id = None
+        return
+    delay, prompt = inp.get("delaySeconds"), inp.get("prompt")
+    if not delay or not prompt:
+        return
+    # Hold the intent; the deadline comes from the CLI's own reply below. Until
+    # then nothing is armed, so a call the CLI REFUSES (an aged-out loop returns
+    # null and ends the loop) never gets resurrected behind its back.
+    conv.wake_delay = float(delay)
+    conv.wake_prompt = prompt
+    conv.wake_tool_id = tool_id or None
+    conv.wake_at = None
+
+
+def _note_wakeup_result(conv: "Conversation", text: str) -> None:
+    """The CLI's reply to the ScheduleWakeup it was just asked for."""
+    conv.wake_tool_id = None
+    m = _WAKE_RESULT_RE.search(text or "")
+    if not m:
+        # It did not schedule anything. Do not invent a deadline for it.
+        log.info("wakeup NOT scheduled by the CLI for %s: %r",
+                 conv.key, (text or "")[:120])
+        conv.wake_prompt = conv.wake_at = None
+        return
+    conv.wake_at = time.time() + float(m.group(2))
+    log.info("wakeup armed for %s at %s (in %ss, CLI's own figure)",
+             conv.key, m.group(1), m.group(2))
+
+
+def _note_background(conv: "Conversation", block) -> None:
+    """Remember watchers armed inside this CLI process, so a restart can say
+    what it killed instead of leaving the agent waiting on a dead monitor."""
+    inp = block.input or {}
+    if block.name == "Monitor":
+        label = f"monitor: {inp.get('description') or 'watch'}"
+    elif block.name == "Bash" and inp.get("run_in_background"):
+        label = f"background shell: {(inp.get('description') or inp.get('command') or '')[:60]}"
+    elif block.name == "Agent" and inp.get("run_in_background", True):
+        label = f"background agent: {(inp.get('description') or '')[:60]}"
+    else:
+        return
+    conv.bg_armed.append((time.time(), label))
+    del conv.bg_armed[:-20]
+
+
+async def _say(app, conv: "Conversation", text: str) -> None:
+    """A revival must never be silent — that is how the first version of this
+    managed to bill for hours without anyone noticing."""
+    if app is None:
+        return
+    try:
+        await app.bot.send_message(
+            conv.key[0], text, disable_notification=True,
+            **({"message_thread_id": conv.key[1]} if conv.key[1] else {}))
+    except Exception:
+        log.exception("wakeup notice failed for %s", conv.key)
+
+
+async def wakeup_watcher(app: Application) -> None:
+    """A stand-in for the CLI's own one-shot cron, matching its semantics.
+
+    ScheduleWakeup is not its own mechanism: the CLI describes these as
+    "session-scoped cron tasks (CronCreate, ScheduleWakeup, /loop)", i.e. a
+    one-shot cron that enqueues `prompt` at the deadline. Measured behaviour of
+    that scheduler, which this copies rather than invents:
+
+      * the delay is clamped to [60s, 3600s]  (done in _note_wakeup)
+      * a deadline that falls mid-turn is DEFERRED, not dropped — verified: due
+        at +70s during a turn that ran to +181.7s, delivered at +183.4s
+      * `stop: true` cancels it            (done in _note_wakeup)
+
+    What it does not do reliably is fire at all in a long-lived session. In one
+    real session every deadline of 720s or more passed with the session idle and
+    nothing whatsoever happening, while 60s deadlines and every short probe
+    fired. So this fires the agent's own prompt itself once the deadline plus
+    the scheduler's own documented jitter budget has passed.
+
+    It only does that if the CLI has not already done it. A wakeup delivered by
+    the CLI arrives as a turn nobody here sent, which the pump records as
+    conv.last_spontaneous — so that, not a guess about timing, is what decides
+    whether the backstop is needed.
+    """
+    if not WAKEUP_BACKSTOP:
+        log.info("wakeup backstop disabled (TGCLAUDE_WAKEUP_BACKSTOP=1 enables)")
+        return
+    while True:
+        await asyncio.sleep(20)
+        now = time.time()
+        for conv in list(conversations.values()):
+            if not conv.wake_at:
+                continue
+            # the CLI delivered it after all: stand down
+            if conv.last_spontaneous >= conv.wake_at - 5:
+                log.info("wakeup delivered by the CLI for %s; backstop stood down",
+                         conv.key)
+                conv.wake_at = conv.wake_prompt = None
+                conv.wake_revivals = 0   # its timer is alive; nothing to count
+                continue
+            if now < conv.wake_at + wakeup_grace(conv.wake_delay):
+                continue
+            if conv.working_since is not None or conv.pending:
+                continue        # mid-turn: defer, exactly as the scheduler does
+            if conv.wake_revivals >= WAKEUP_BUDGET:
+                log.warning("wakeup backstop spent for %s (%d consecutive CLI "
+                            "timer failures, nobody here)", conv.key,
+                            conv.wake_revivals)
+                conv.wake_at = conv.wake_prompt = None
+                await _say(app, conv,
+                           f"⏹ Loop stopped — covered {conv.wake_revivals} missed "
+                           "wakeups in a row and nobody has been here. Send "
+                           "anything to pick it back up.")
+                continue
+            prompt, conv.wake_prompt = conv.wake_prompt, None
+            late = now - conv.wake_at
+            conv.wake_at = None
+            conv.wake_revivals += 1
+            try:
+                client = await ensure_client(conv)
+                await client.query(prompt)
+                conv.working_since = time.time()
+                log.info("wakeup backstop fired for %s (%.0fs past deadline)",
+                         conv.key, late)
+                await _say(app, conv,
+                           f"⏱ Loop wakeup {conv.wake_revivals}/{WAKEUP_BUDGET} — "
+                           "the CLI's own timer did not fire. /esc to stop.")
+            except Exception:
+                log.exception("wakeup backstop failed for %s", conv.key)
+
+
 async def restart_watcher(app: Application) -> None:
     """Graceful deploy: restart only when no conversation is mid-turn.
     Drain is an optimization — the durable-state reconcile at startup is the
@@ -3586,13 +4456,17 @@ async def _recover_conv(app: Application, key: ConvKey, ent: dict) -> None:
     if conv is None:
         conv = Conversation(
             key=key,
-            profile="owner" if (chat_id == OWNER_ID and thread == 0) else "guest",
+            profile=profile_for(chat_id, thread),
             cwd=meta["cwd"] or str(PLAYGROUND_DIR),
             session_id=sid,
         )
-        conv.model = binding.get("model")
-        conv.effort = binding.get("effort")
+        apply_binding(conv, binding)   # model, effort AND perm_mode
         conversations[key] = conv
+    # Recovery has no incoming message to attribute, so last_user_id stayed 0
+    # and the guest bridge's "escalate to the owner" branch could never fire:
+    # an out-of-scope tool was flat-denied with no button to approve it. The
+    # only person who can answer that prompt is the owner, so ask them.
+    conv.last_user_id = conv.last_user_id or OWNER_ID
     prompt = ("[bridge] The bot process restarted mid-turn. The transcript "
               "above is complete up to the interruption; completed tool "
               "calls are recorded there. Continue the work exactly where it "
@@ -3714,6 +4588,7 @@ async def post_init(app: Application) -> None:
     except Exception:
         log.exception("failed to register command menu")
     app.create_task(restart_watcher(app))
+    app.create_task(wakeup_watcher(app))
     app.create_task(refresh_effort_choices(app))
     # transform the pre-restart notice in place; only send a new message on cold boot
     edited = False
@@ -3743,49 +4618,131 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     media = msg.voice or msg.audio
     if media is None:
         return
-    if media.duration and media.duration > 600:
-        await msg.reply_text("Voice message too long (>10 min).")
+    # Whisper itself has no length limit - it decodes in 30s windows - so the
+    # old hard reject at 10 min threw away recordings for no technical reason.
+    # (Speeding the audio up does NOT help: cost tracks decoded TOKENS, not
+    # seconds. Measured 1.5x atempo on a 50s clip: 18.6s vs 16.7s, i.e. slower,
+    # and the text came back scrambled.) Keep only a sanity ceiling.
+    # The Bot API refuses to serve a file over 20 MB, with an error that reads
+    # like a transcription failure. A voice note stays well under that even at
+    # an hour (opus ~16-32 kbps), but an attached mp3/m4a easily does not.
+    if (media.file_size or 0) > 20_000_000:
+        await msg.reply_text(
+            f"That file is {media.file_size / 1_000_000:.0f} MB; Telegram only "
+            "lets bots download up to 20 MB. Voice notes are fine at any "
+            "length — it's attached audio files that hit this."
+        )
         return
-    placeholder = ("🎙 Preparing speech model… (first use may download it)"
-                   if _whisper_model is None else "🎤 Transcribing…")
+    secs = media.duration or 0
+    if secs > VOICE_MAX_SEC:
+        await msg.reply_text(
+            f"That's {secs // 60} min of audio; the ceiling is "
+            f"{VOICE_MAX_SEC // 60} min (TGCLAUDE_VOICE_MAX_SEC). "
+            "Nothing was lost — send it in parts, or raise the ceiling."
+        )
+        return
+    if _whisper_model is None:
+        placeholder = "🎙 Preparing speech model… (first use may download it)"
+    elif secs > 120:  # long enough that silence would read as a hang
+        placeholder = (f"🎤 Transcribing {secs // 60}m{secs % 60:02d}s"
+                       f" — roughly {max(1, round(secs * ASR_REALTIME_FACTOR / 60))}"
+                       f" min, progress below.")
+    else:
+        placeholder = "🎤 Transcribing…"
     try:
         notice = await msg.reply_text(placeholder, disable_notification=True)
     except Exception:
         notice = None
 
     async def show(text_: str) -> None:
+        # The echo must never kill the turn. A long transcript blows past
+        # Telegram's 4096-char message limit, and the send here used to be
+        # unguarded: it raised straight out of on_voice, losing the recording
+        # it had just spent minutes transcribing. Trim the echo (the full text
+        # still goes to the model) and swallow whatever Telegram says.
+        if len(text_) > TG_TEXT_LIMIT:
+            n = len(text_)
+            text_ = (text_[:TG_TEXT_LIMIT - 120]
+                     + f"\n\n…(echo trimmed — all {n} chars went to the model)")
         if notice is not None:
             try:
                 await notice.edit_text(text_)
                 return
             except Exception:
                 pass
-        await msg.reply_text(text_, disable_notification=True)
+        try:
+            await msg.reply_text(text_, disable_notification=True)
+        except Exception:
+            log.exception("voice echo failed for %s", conv_key_of(update))
 
+    conv = get_conv(update)
+    conv.voice_active += 1
+    text = ""
+    failed = False
     tmp = Path(f"/tmp/tgvoice-{uuid.uuid4().hex}.oga")
     try:
         f = await ctx.bot.get_file(media.file_id)
         await f.download_to_drive(custom_path=str(tmp))
-        text = await transcribe(str(tmp))
+        async def on_progress(done: float, total: float) -> None:
+            # edit-only, and silent on failure: show() would fall back to a NEW
+            # message, i.e. a fresh notification every 20s for a long recording
+            if notice is None:
+                return
+            pct = min(99, int(done * 100 / total)) if total else 0
+            left = max(0, (total - done)) * ASR_REALTIME_FACTOR
+            try:
+                await notice.edit_text(
+                    f"🎤 Transcribing… {pct}% {_bar(pct)}"
+                    f"  (~{max(1, round(left / 60))} min left)")
+            except Exception:
+                pass
+
+        text = await transcribe(str(tmp), progress=on_progress if secs > 120
+                                else None)
     except Exception as e:
         log.exception("voice transcription failed")
+        failed = True
         await show(f"Transcription failed: {e}")
-        return
     finally:
         tmp.unlink(missing_ok=True)
-    if not text:
-        await show("(听不清，转写为空)")
-        return
+        # Decrement here so a FAILED note still releases the batch: whoever
+        # sees the count reach zero flushes, success or not. Otherwise a note
+        # that blew up leaves its neighbour's transcript held forever.
+        conv.voice_active = max(0, conv.voice_active - 1)
+
     user = update.effective_user
     name = user.full_name if user else "unknown"
     uid = user.id if user else 0
-    log.info("voice %s user=%s -> %r", conv_key_of(update), uid, text[:120])
-    await show(f"🎤 {text}")
-    await run_turn(
-        update, ctx,
-        f"[{name} ({uid})] (voice): {forward_context(msg)}"
-        f"{reply_context(msg)}{text}"
-    )
+    if text:
+        log.info("voice %s user=%s -> %r", conv_key_of(update), uid, text[:120])
+        # Splitting one long thought across several notes must not reach the
+        # model as several messages: hold the transcript while another note is
+        # still being transcribed. No artificial settle delay - the window IS
+        # the other note's transcription, so a lone note fires immediately.
+        conv.voice_pending.append(
+            (uid, name, msg.message_id,
+             f"{forward_context(msg)}{reply_context(msg)}", text))
+        await show(f"🎤 {text}" + ("\n\n⏳ held — sending together with your "
+                                  "other note" if conv.voice_active else ""))
+    elif not failed:
+        await show("(听不清，转写为空)")
+    if conv.voice_active:      # someone else is still going; they will flush
+        return
+    await _flush_voice_batch(conv, update, ctx)
+
+
+async def _flush_voice_batch(conv, update, ctx) -> None:
+    """Send every held transcript, ordered by ARRIVAL (message id) rather than
+    by whichever transcription happened to finish first - the fast note is
+    often the second one. One turn per speaker: merging a burst is the point,
+    merging two people is not."""
+    batch, conv.voice_pending = conv.voice_pending, []
+    batch.sort(key=lambda r: r[2])
+    for uid in dict.fromkeys(r[0] for r in batch):        # first-seen order
+        mine = [r for r in batch if r[0] == uid]
+        name, prefix = mine[0][1], mine[0][3]
+        await run_turn(update, ctx, f"[{name} ({uid})] (voice): {prefix}"
+                       + "\n\n".join(r[4] for r in mine))
 
 
 MEDIA_TTL_DAYS = float(
@@ -3997,9 +4954,12 @@ async def on_shutdown(app: Application) -> None:
 class FloodLimiter(BaseRateLimiter):
     """Wraps every bot API call (PTB applies it uniformly). Two jobs:
 
-    1. Auto-retry Telegram's "Flood control exceeded. Retry in Ns"
-       (RetryAfter) — sleep the required time and retry, so the error never
-       surfaces and no reply/reaction is lost.
+    1. Absorb Telegram's "Flood control exceeded. Retry in Ns" (RetryAfter)
+       — sleep the wait and retry, so the error never surfaces and no reply is
+       lost. Long waits are the exception, see EPHEMERAL: a redraw or a 👀 that
+       lands eight minutes late is worth less than not sending it at all, and
+       sleeping one out keeps the slot busy while fresher frames pile up
+       behind it. Those are dropped; the reply itself is always waited for.
     2. Gently pace the *expensive* per-chat calls (new messages, reactions)
        with a token bucket — bursts of `cap` go through instantly, then
        `rate`/sec — so a tool-heavy turn or a big forward/queue batch can't
@@ -4008,7 +4968,8 @@ class FloodLimiter(BaseRateLimiter):
     editMessageText (live status) is paced too: the status ticker is the only
     writer and self-throttles, but the shared bucket is the hard backstop that
     keeps a long streaming turn from ever hitting flood control. Callback
-    answers, typing and reactions stay EXEMPT — they must be instant.
+    answers, typing and reactions stay EXEMPT from pacing — they must be
+    instant.
     """
 
     # Only NEW-message endpoints are paced. Reactions are deliberately NOT
@@ -4019,6 +4980,16 @@ class FloodLimiter(BaseRateLimiter):
     PACED = {"sendMessage", "sendPhoto", "sendDocument", "sendVoice",
              "sendAudio", "sendAnimation", "sendMediaGroup",
              "forwardMessage", "copyMessage", "editMessageText"}
+
+    # Calls whose entire value is "right now". Under a multi-minute flood wait
+    # these are dropped rather than slept out: what they show is stale long
+    # before the wait ends, and whoever asked for one (the ticker, the 👀
+    # marker) will produce a fresher call soon enough. The send* endpoints are
+    # deliberately absent — losing a reply is never an improvement, so those
+    # keep the sleep-and-retry below.
+    EPHEMERAL = {"editMessageText", "setMessageReaction", "sendChatAction",
+                 "deleteMessage", "answerCallbackQuery"}
+    EPHEMERAL_MAX_WAIT = 10.0   # s: a short burst is still worth sleeping out
 
     def __init__(self, cap: int = 8, rate: float = 1.0,
                  max_retries: int = 3) -> None:
@@ -4063,11 +5034,31 @@ class FloodLimiter(BaseRateLimiter):
             try:
                 return await callback(*args, **kwargs)
             except RetryAfter as e:
+                if (endpoint in self.EPHEMERAL
+                        and e.retry_after > self.EPHEMERAL_MAX_WAIT):
+                    log.warning("flood control on %s (chat %s); retry in %ss "
+                                "— dropped, it is cosmetic",
+                                endpoint, chat_id, e.retry_after)
+                    raise
                 if attempt >= self.max_retries:
                     raise
                 log.warning("flood control on %s (chat %s); retry in %ss",
                             endpoint, chat_id, e.retry_after)
                 await asyncio.sleep(e.retry_after + 0.5)
+
+
+async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """PTB has no default error handler, so a NetworkError escaping the poller
+    printed a full traceback under "No error handlers are registered" — noise
+    for a hiccup the poller retries on its own. Log those as one line; keep
+    the traceback for everything else. BadRequest and Forbidden subclass
+    NetworkError in PTB, so the transport case is matched exactly, not by
+    isinstance on the base."""
+    err = ctx.error
+    if isinstance(err, TimedOut) or type(err) is NetworkError:
+        log.warning("telegram transport error: %s", err or type(err).__name__)
+        return
+    log.error("unhandled error while processing an update", exc_info=err)
 
 
 def main() -> None:
@@ -4132,6 +5123,7 @@ def main() -> None:
         filters.StatusUpdate.FORUM_TOPIC_CREATED, on_topic_created))
     app.add_handler(MessageHandler(
         filters.TEXT & (~filters.COMMAND | filters.FORWARDED), on_message))
+    app.add_error_handler(on_error)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
