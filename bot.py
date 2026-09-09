@@ -192,7 +192,9 @@ RESTART_GRACE_S = 180
 HTTP_READ_TIMEOUT = float(os.environ.get("TGCLAUDE_HTTP_READ_TIMEOUT", "30"))
 HTTP_MEDIA_TIMEOUT = float(os.environ.get("TGCLAUDE_HTTP_MEDIA_TIMEOUT", "120"))
 HTTP_CONNECT_TIMEOUT = float(os.environ.get("TGCLAUDE_HTTP_CONNECT_TIMEOUT", "20"))
-MEDIA_FETCH_TRIES = int(os.environ.get("TGCLAUDE_MEDIA_FETCH_TRIES", "4"))
+MEDIA_FETCH_TRIES = int(os.environ.get("TGCLAUDE_MEDIA_FETCH_TRIES", "8"))
+MEDIA_BACKOFF_BASE_S = 1.0
+MEDIA_BACKOFF_CAP_S = 30.0   # 8 tries under Full Jitter: up to ~2 min of trying
 
 _LOCAL_OUT_RE = re.compile(
     r"<local-command-stdout>(.*?)</local-command-stdout>", re.S
@@ -488,9 +490,11 @@ def _get_lang_model():
     return _lang_model
 
 
-_ASR_PROBE_S = 3        # probe hop. Measured against known switch points, 3s
-                        # scored 96-100% with and without a pause at the switch;
-                        # 8s scored 67% and missed whole sentences.
+# Probe hop. Measured against known switch points, 3s scored 96-100% with and
+# without a pause at the switch; 8s scored 67% and missed whole sentences. It is
+# not free — on a 223s clip the probes cost 28.7s, 29% of the whole job — so it
+# is tunable for anyone who never code-switches and would rather have the time.
+_ASR_PROBE_S = int(os.environ.get("TGCLAUDE_ASR_PROBE_S", "3"))
 _ASR_MIN_SPAN_S = 5.0   # a run shorter than this is folded into its neighbour
 _ASR_MAX_SPANS = 12     # past this it is noise, not code-switching
 # Languages this bot's users actually speak. A probe claiming anything else is
@@ -708,8 +712,16 @@ def _join_segments(segs) -> str:
 # transcriptions just make both crawl.
 _ASR_SEM = asyncio.Semaphore(1)
 
-# Measured on this box with large-v3-turbo/int8: ~0.35x realtime. Used only to
-# tell the user what they are in for; the real clock comes from progress.
+# Beam search width. faster-whisper defaults to 5, i.e. five candidate
+# transcriptions carried at every step. Measured on a 223s Chinese clip: beam 5
+# took 70.9s, beam 1 took 50.1s — 29% faster — and the two differed by 1.07% of
+# the hanzi, the odd homophone, with the same punctuation count. Not a trade
+# worth 20 seconds of somebody's time on every recording.
+ASR_BEAM_SIZE = int(os.environ.get("TGCLAUDE_ASR_BEAM_SIZE", "1"))
+
+# Measured on this box with large-v3-turbo/int8, end to end including the
+# language probes: 0.45x realtime at beam 5, 0.35x at beam 1. Used only to tell
+# the user what they are in for; the real clock comes from progress.
 ASR_REALTIME_FACTOR = 0.4
 
 
@@ -738,6 +750,7 @@ async def transcribe(path: str, progress=None) -> str:
                 # hallucinations down without ever dropping real speech.
                 vad_filter=False,
                 condition_on_previous_text=False,
+                beam_size=ASR_BEAM_SIZE,
             )
             out = []
             for seg in segs:            # a generator: this is where the work
@@ -825,6 +838,12 @@ class Conversation:
     # message. `voice_active` counts notes still downloading/transcribing for
     # this conv; whoever brings it to zero fires the whole batch.
     voice_active: int = 0
+    # in-flight voice jobs, so /esc can call one off. Cancelling while whisper
+    # is inside asyncio.to_thread abandons the result rather than killing the
+    # thread — the CPU work finishes unseen and _ASR_SEM is released early. That
+    # is the honest cost of being able to stop at all, and it only happens when
+    # somebody explicitly asks.
+    voice_tasks: list = field(default_factory=list)
     voice_pending: list = field(default_factory=list)
     # Set when an approved plan took the CLI out of plan mode. Kept separate
     # from perm_mode so the user's own setting is never silently rewritten.
@@ -3588,6 +3607,17 @@ async def cmd_stop(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         await _login_cancel(conv)
         await update.effective_message.reply_text("⏹ /login cancelled.")
         return
+    if conv.voice_tasks:
+        n = len(conv.voice_tasks)
+        for t in conv.voice_tasks[:]:
+            t.cancel()
+        conv.voice_tasks.clear()
+        conv.voice_active = 0
+        await update.effective_message.reply_text(
+            f"⏹ Cancelled {n} transcription{'s' if n > 1 else ''}. "
+            "The recordings are still on Telegram — reply to one and press "
+            "Transcribe again if you want it after all.")
+        return
     if conv.bash_proc is not None:  # `!cmd` holds no lock and no client
         try:
             conv.bash_proc.kill()
@@ -3825,6 +3855,18 @@ async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         await q.answer()
         conv = get_conv(update)
         await apply_perm_mode(_q_editor(q), conv, data[3:])
+    elif data.startswith("vr:"):
+        await q.answer("Fetching it again…")
+        try:
+            original = _voice_retry[int(data[3:])]
+        except (ValueError, IndexError):
+            await _q_editor(q)("That recording is no longer queued for retry.")
+            return
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await on_voice(Update(update_id=0, message=original), _)
     elif data.startswith("pr:"):
         try:
             _, idx_s, sig = data.split(":", 2)
@@ -4617,23 +4659,53 @@ async def post_init(app: Application) -> None:
         await notify_owner(app, "✅ Online")
 
 
+# Voice notes whose transcription failed, kept so the user can ask again without
+# re-recording. Bounded; an index into it is the callback payload because a
+# file_id does not fit in Telegram's 64-byte callback_data.
+_voice_retry: list = []
+VOICE_RETRY_KEEP = 20
+
+
+def _backoff(attempt: int) -> float:
+    """Full Jitter, the standard exponential-backoff-with-jitter schedule:
+    sleep = uniform(0, min(cap, base * 2**attempt)).
+
+    Telegram states a wait only for flood control (RetryAfter), honoured
+    directly below. For a transport timeout the API says nothing and there is
+    no header to read, so the wait has to be chosen — and a fixed one is how a
+    retry storm starts when the box is already the overloaded thing. The jitter
+    is the point: it spreads retries instead of lining them up.
+    """
+    import random
+    return random.uniform(0, min(MEDIA_BACKOFF_CAP_S,
+                                 MEDIA_BACKOFF_BASE_S * (2 ** attempt)))
+
+
 async def fetch_media(ctx, file_id: str, dest: Path) -> None:
     """Download a Telegram file, retrying transport failures.
 
     download_to_drive talks to the transport directly and so never sees the
     rate limiter's retry. One 5s read timeout used to destroy a voice note
-    outright — the user re-records minutes of speech because the box was busy.
+    outright, and a voice note is the one thing here that cannot be recreated
+    cheaply — the user has to say all of it again.
     """
     for attempt in range(MEDIA_FETCH_TRIES):
         try:
             f = await ctx.bot.get_file(file_id)
             await f.download_to_drive(custom_path=str(dest))
             return
+        except RetryAfter as e:
+            if attempt == MEDIA_FETCH_TRIES - 1:
+                raise
+            log.warning("media download rate-limited; waiting %ss", e.retry_after)
+            await asyncio.sleep(e.retry_after + 0.5)
         except (TimedOut, NetworkError) as e:
             if attempt == MEDIA_FETCH_TRIES - 1:
                 raise
-            log.warning("media download failed (%s); retry %d", e, attempt + 1)
-            await asyncio.sleep(2.0 * (attempt + 1))
+            wait = _backoff(attempt)
+            log.warning("media download failed (%s); retry %d in %.1fs",
+                        e, attempt + 1, wait)
+            await asyncio.sleep(wait)
 
 
 async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4679,7 +4751,7 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception:
         notice = None
 
-    async def show(text_: str) -> None:
+    async def show(text_: str, retry_msg=None) -> None:
         # The echo must never kill the turn. A long transcript blows past
         # Telegram's 4096-char message limit, and the send here used to be
         # unguarded: it raised straight out of on_voice, losing the recording
@@ -4689,19 +4761,30 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             n = len(text_)
             text_ = (text_[:TG_TEXT_LIMIT - 120]
                      + f"\n\n…(echo trimmed — all {n} chars went to the model)")
+        kb = None
+        if retry_msg is not None:
+            _voice_retry.append(retry_msg)
+            del _voice_retry[:-VOICE_RETRY_KEEP]
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+                "🔁 Transcribe again",
+                callback_data=f"vr:{len(_voice_retry) - 1}")]])
         if notice is not None:
             try:
-                await notice.edit_text(text_)
+                await notice.edit_text(text_, reply_markup=kb)
                 return
             except Exception:
                 pass
         try:
-            await msg.reply_text(text_, disable_notification=True)
+            await msg.reply_text(text_, disable_notification=True,
+                                 reply_markup=kb)
         except Exception:
             log.exception("voice echo failed for %s", conv_key_of(update))
 
     conv = get_conv(update)
     conv.voice_active += 1
+    task = asyncio.current_task()
+    if task is not None:
+        conv.voice_tasks.append(task)
     text = ""
     failed = False
     tmp = Path(f"/tmp/tgvoice-{uuid.uuid4().hex}.oga")
@@ -4723,16 +4806,27 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
         text = await transcribe(str(tmp), progress=on_progress if secs > 120
                                 else None)
+    except asyncio.CancelledError:
+        conv.voice_active = max(0, conv.voice_active - 1)
+        if task is not None and task in conv.voice_tasks:
+            conv.voice_tasks.remove(task)
+        await show("⏹ Transcription cancelled.", retry_msg=msg)
+        raise
     except Exception as e:
         log.exception("voice transcription failed")
         failed = True
-        await show(f"Transcription failed: {e}")
+        # The recording is NOT gone: Telegram keeps the file and the file_id
+        # stays valid, so all that was lost is our copy of it. Offer to fetch it
+        # again rather than making the user say the whole thing over.
+        await show(f"Transcription failed: {e}", retry_msg=msg)
     finally:
         tmp.unlink(missing_ok=True)
         # Decrement here so a FAILED note still releases the batch: whoever
         # sees the count reach zero flushes, success or not. Otherwise a note
         # that blew up leaves its neighbour's transcript held forever.
         conv.voice_active = max(0, conv.voice_active - 1)
+        if task is not None and task in conv.voice_tasks:
+            conv.voice_tasks.remove(task)
 
     user = update.effective_user
     name = user.full_name if user else "unknown"
