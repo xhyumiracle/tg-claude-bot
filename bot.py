@@ -187,6 +187,12 @@ RESTART_NOTICE = TGCLAUDE_DIR / "restart-notice.json"
 # transcript. Keeps a busy (or self-absorbed) conversation from blocking its
 # own requested restart indefinitely.
 RESTART_GRACE_S = 180
+# Telegram HTTP timeouts. Generous on purpose: waiting costs a slow reply,
+# giving up costs a recording.
+HTTP_READ_TIMEOUT = float(os.environ.get("TGCLAUDE_HTTP_READ_TIMEOUT", "30"))
+HTTP_MEDIA_TIMEOUT = float(os.environ.get("TGCLAUDE_HTTP_MEDIA_TIMEOUT", "120"))
+HTTP_CONNECT_TIMEOUT = float(os.environ.get("TGCLAUDE_HTTP_CONNECT_TIMEOUT", "20"))
+MEDIA_FETCH_TRIES = int(os.environ.get("TGCLAUDE_MEDIA_FETCH_TRIES", "4"))
 
 _LOCAL_OUT_RE = re.compile(
     r"<local-command-stdout>(.*?)</local-command-stdout>", re.S
@@ -4611,6 +4617,25 @@ async def post_init(app: Application) -> None:
         await notify_owner(app, "✅ Online")
 
 
+async def fetch_media(ctx, file_id: str, dest: Path) -> None:
+    """Download a Telegram file, retrying transport failures.
+
+    download_to_drive talks to the transport directly and so never sees the
+    rate limiter's retry. One 5s read timeout used to destroy a voice note
+    outright — the user re-records minutes of speech because the box was busy.
+    """
+    for attempt in range(MEDIA_FETCH_TRIES):
+        try:
+            f = await ctx.bot.get_file(file_id)
+            await f.download_to_drive(custom_path=str(dest))
+            return
+        except (TimedOut, NetworkError) as e:
+            if attempt == MEDIA_FETCH_TRIES - 1:
+                raise
+            log.warning("media download failed (%s); retry %d", e, attempt + 1)
+            await asyncio.sleep(2.0 * (attempt + 1))
+
+
 async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not chat_allowed(update):
         return
@@ -4681,8 +4706,7 @@ async def on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     failed = False
     tmp = Path(f"/tmp/tgvoice-{uuid.uuid4().hex}.oga")
     try:
-        f = await ctx.bot.get_file(media.file_id)
-        await f.download_to_drive(custom_path=str(tmp))
+        await fetch_media(ctx, media.file_id, tmp)
         async def on_progress(done: float, total: float) -> None:
             # edit-only, and silent on failure: show() would fall back to a NEW
             # message, i.e. a fresh notification every 20s for a long recording
@@ -4784,8 +4808,7 @@ async def _save_media(update: Update, ctx, media, filename: str) -> Optional[Pat
     conv = get_conv(update)
     path = media_dir_for(conv) / filename
     try:
-        f = await ctx.bot.get_file(media.file_id)
-        await f.download_to_drive(custom_path=str(path))
+        await fetch_media(ctx, media.file_id, path)
         return path
     except Exception as e:
         log.exception("media download failed")
@@ -4870,8 +4893,7 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = user.id if user else 0
     tmp = Path(f"/tmp/tgimg-{uuid.uuid4().hex}.{ext}")
     try:
-        f = await ctx.bot.get_file(media.file_id)
-        await f.download_to_drive(custom_path=str(tmp))
+        await fetch_media(ctx, media.file_id, tmp)
         data = tmp.read_bytes()
     except Exception as e:
         log.exception("image download failed")
@@ -5033,6 +5055,15 @@ class FloodLimiter(BaseRateLimiter):
         for attempt in range(self.max_retries + 1):
             try:
                 return await callback(*args, **kwargs)
+            except TimedOut:
+                # this loop only ever retried flood control, so a transport
+                # timeout — the common case while whisper has the CPU — went
+                # straight up to the caller
+                if attempt >= self.max_retries:
+                    raise
+                log.warning("timeout on %s (chat %s); retry %d",
+                            endpoint, chat_id, attempt + 1)
+                await asyncio.sleep(1.5 * (attempt + 1))
             except RetryAfter as e:
                 if (endpoint in self.EPHEMERAL
                         and e.retry_after > self.EPHEMERAL_MAX_WAIT):
@@ -5080,6 +5111,16 @@ def main() -> None:
         # a deleted reply-anchor must never cost the reply itself:
         # fall back to sending unquoted instead of raising
         .defaults(Defaults(allow_sending_without_reply=True))
+        # PTB defaults to a 5s read timeout, which a voice note loses a race
+        # against: whisper saturates all four cores, the event loop is starved
+        # for the length of a long transcription, and an unrelated get_file for
+        # the NEXT note reads nothing in time and throws that recording away.
+        # Measured: 24 TimedOut in one day, one of them costing a 63s note.
+        .read_timeout(HTTP_READ_TIMEOUT)
+        .write_timeout(HTTP_READ_TIMEOUT)
+        .media_write_timeout(HTTP_MEDIA_TIMEOUT)
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .pool_timeout(HTTP_CONNECT_TIMEOUT)
         # pace bursts + auto-retry flood control (see FloodLimiter)
         .rate_limiter(FloodLimiter())
         .post_init(post_init)
