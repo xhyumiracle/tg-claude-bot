@@ -511,6 +511,22 @@ _ASR_LANG_MIN_PROB = 0.7    # speech probes at 0.997; silence and noise never
                             # got past 0.61, so this splits them cleanly
 _ASR_SILENCE_RATIO = 0.08   # of the loudest chunk. The quietest chunk of real
                             # speech measured 0.37 of the loudest.
+# Absolute floor for "is there any signal at all", ~-60 dBFS. The quietest
+# 1s window of real speech measured 0.031 here, thirty times this; digital
+# silence is 0. Only used to refuse a recording outright, never to trim one.
+_ASR_SIGNAL_FLOOR = 0.001
+
+
+def _peak_level(audio) -> float:
+    """Loudest one-second window, so a short utterance inside a long silence
+    still registers as signal."""
+    import numpy as np
+
+    n = 16000
+    if len(audio) < n:
+        return float(np.sqrt(np.mean(audio.astype(np.float32) ** 2))) if len(audio) else 0.0
+    return max(float(np.sqrt(np.mean(audio[i:i + n].astype(np.float32) ** 2)))
+               for i in range(0, len(audio) - n + 1, n))
 
 
 def _probe_languages(audio) -> List[Optional[str]]:
@@ -758,18 +774,36 @@ async def transcribe(path: str, progress=None) -> str:
                 state["pos"] = seg.end + offset   # so progress lives here
             return out
 
-        try:
-            spans = _language_spans(audio)
-        except Exception:
-            # tiny missing or undownloadable: fall back to what this did before,
-            # which is one pass at the main model's read of the first window.
-            log.exception("language probing failed; using first-window detect")
+        def whole_clip(why: str) -> list:
+            """One pass over everything, language picked the way this code did
+            before probing existed. Reached whenever the probes cannot answer —
+            and the answer to "I cannot tell" must never be "then do not
+            transcribe it", which is how a recording gets silently discarded."""
+            log.info("language probing inconclusive (%s); one pass over all", why)
             try:
                 lang, _p, _a = model.detect_language(audio=audio[:16000 * 30])
             except Exception:
                 log.exception("language detection failed; assuming zh")
                 lang = "zh"
-            spans = [(0, len(audio), lang)]
+            return [(0, len(audio), lang)]
+
+        try:
+            spans = _language_spans(audio)
+        except Exception:
+            log.exception("language probing failed")
+            spans = whole_clip("tiny model unavailable")
+        if not spans:
+            # too short to probe (under one 3s chunk), or every chunk was too
+            # quiet or too ambiguous to name. Both used to reach whisper and
+            # come back with words; since probing arrived they returned an
+            # empty transcript and the user saw "听不清，转写为空".
+            if _peak_level(audio) < _ASR_SIGNAL_FLOOR:
+                # genuinely nothing there. Forcing a pass over silence makes
+                # whisper invent a line ("Thank you." on digital silence), which
+                # is worse than admitting it heard nothing.
+                log.info("no signal above the floor; not transcribing")
+                return ""
+            spans = whole_clip("no usable probe")
         if len(spans) > _ASR_MAX_SPANS:
             # fragmented past the point of belief: trust the majority instead
             log.warning("%d language spans, falling back to one pass", len(spans))
