@@ -741,7 +741,141 @@ ASR_BEAM_SIZE = int(os.environ.get("TGCLAUDE_ASR_BEAM_SIZE", "1"))
 ASR_REALTIME_FACTOR = 0.4
 
 
+# ---------- cloud transcription ----------
+# This box is a 2-physical-core VM with no GPU, where large-v3-turbo runs at
+# 0.4x realtime when idle and 2.6x when another agent has the CPU — an eight
+# minute note cost five minutes of waiting. The same audio comes back from a
+# hosted GPU in seconds, and it comes back BETTER: the hosted whisper-1 is the
+# full large-v2, while the only model that fits here is the distilled turbo
+# whose four-layer decoder is exactly the part that drops a sentence spoken in
+# the other language. Measured on a 38s Chinese clip with two English sentences
+# in it:
+#
+#     local turbo, zh pinned      EN 0/5  ZH 5/5   punctuated   ~95s
+#     gpt-4o-transcribe           EN 0/5  ZH 5/5   punctuated     2s
+#     whisper-1, no language pin  EN 5/5  ZH 5/5   NO punctuation 4s
+#     whisper-1, + this prompt    EN 5/5  ZH 5/5   punctuated     4s
+#
+# Hence: never pin the language (that is what drops the other one), and carry
+# the punctuation prompt (hosted whisper needs it just as the local one did).
+# Nothing leaves the machine unless a credential exists for it — adding one is
+# the user's own act, and is what turns this on.
+ASR_CLOUD = os.environ.get("TGCLAUDE_ASR_CLOUD", "auto")   # auto | off | <id>
+_CLOUD_ASR = {
+    # groq first: its free tier covers 8h of audio a day, and it serves the
+    # full large-v3 rather than the turbo.
+    "groq": ("https://api.groq.com/openai/v1/audio/transcriptions",
+             "__sc__groq__", "whisper-large-v3"),
+    "openai": ("https://api.openai.com/v1/audio/transcriptions",
+               "__sc__openai__", "whisper-1"),
+}
+_CLOUD_PROMPT = ("以下是中英文混合对话的逐字转写，中文用逗号、句号、问号等标点符号，"
+                 "英文句子保持英文原样。")
+_cloud_choice: Optional[str] = None   # resolved once, then cached
+
+
+def _safeclaw_env() -> dict:
+    """sc needs its agent identity, which systemd does not load for us."""
+    env = dict(os.environ)
+    try:
+        for line in Path.home().joinpath(".safeclaw/agent.env").read_text().splitlines():
+            line = line.strip().removeprefix("export ").strip()
+            if "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                env.setdefault(k.strip(), v.strip().strip("'\""))
+    except OSError:
+        pass
+    return env
+
+
+async def _sc(*args: str, timeout: float = 60.0) -> tuple[int, bytes]:
+    proc = await asyncio.create_subprocess_exec(
+        "sc", *args, env=_safeclaw_env(),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise
+    return proc.returncode or 0, out
+
+
+async def cloud_asr_provider() -> Optional[str]:
+    """Which hosted transcriber we may use, or None to stay local."""
+    global _cloud_choice
+    if ASR_CLOUD == "off":
+        return None
+    if _cloud_choice is not None:
+        return _cloud_choice or None
+    try:
+        rc, out = await _sc("connection", "ls", "--json", timeout=20)
+        have = {c.get("id") for c in json.loads(out or b"[]")} if rc == 0 else set()
+    except Exception:
+        log.exception("could not list SafeClaw connections; staying local")
+        have = set()
+    if ASR_CLOUD != "auto":
+        _cloud_choice = ASR_CLOUD if ASR_CLOUD in have else ""
+    else:
+        _cloud_choice = next((k for k in _CLOUD_ASR if k in have), "")
+    log.info("cloud transcription: %s", _cloud_choice or "none (local whisper)")
+    return _cloud_choice or None
+
+
+async def transcribe_cloud(path: str, provider: str) -> Optional[str]:
+    """Returns the transcript, or None to fall back to the local model."""
+    url, phantom, model = _CLOUD_ASR[provider]
+    out = Path(f"/tmp/tgasr-{uuid.uuid4().hex}.json")
+    try:
+        rc, _ = await _sc(
+            "run", "--", "curl", "-sS", "--max-time", str(int(CLOUD_ASR_TIMEOUT)),
+            "-X", "POST", url,
+            "-H", f"Authorization: Bearer {phantom}",
+            "-F", f"file=@{path}",
+            "-F", f"model={model}",
+            "-F", "response_format=verbose_json",
+            # deliberately NO language= : pinning it is what makes the model
+            # drop whole sentences spoken in the other language
+            "-F", f"prompt={_CLOUD_PROMPT}",
+            "-o", str(out), timeout=CLOUD_ASR_TIMEOUT + 15)
+        if rc != 0 or not out.exists():
+            log.warning("cloud transcription call failed (rc=%s)", rc)
+            return None
+        data = json.loads(out.read_text() or "{}")
+    except Exception:
+        log.exception("cloud transcription failed; falling back to local")
+        return None
+    finally:
+        out.unlink(missing_ok=True)
+    if "error" in data:
+        log.warning("cloud transcription refused: %s",
+                    str(data["error"])[:200])
+        return None
+    segs = [_Seg(s.get("text", ""), float(s.get("start", 0.0)),
+                 float(s.get("end", 0.0)))
+            for s in (data.get("segments") or [])]
+    if not segs:
+        text = (data.get("text") or "").strip()
+        return text or None
+    text = _join_segments(s for s in segs
+                          if not _WHISPER_OUTRO_RE.match(s.text.strip()))
+    paras = text.split("\n")
+    paras[-1] = _WHISPER_OUTRO_RE.sub("", paras[-1])
+    return "\n".join(x for x in paras if x.strip()).strip()
+
+
 async def transcribe(path: str, progress=None) -> str:
+    provider = await cloud_asr_provider()
+    if provider:
+        t0 = time.time()
+        text = await transcribe_cloud(path, provider)
+        if text is not None:
+            log.info("transcribed via %s in %.1fs", provider, time.time() - t0)
+            return text
+        log.info("falling back to local whisper")
+    return await transcribe_local(path, progress)
+
+
+async def transcribe_local(path: str, progress=None) -> str:
     """progress: optional async fn(done_s, total_s) called while decoding."""
     state = {"pos": 0.0, "total": 0.0}
 
@@ -4698,6 +4832,7 @@ async def post_init(app: Application) -> None:
 # file_id does not fit in Telegram's 64-byte callback_data.
 _voice_retry: list = []
 VOICE_RETRY_KEEP = 20
+CLOUD_ASR_TIMEOUT = float(os.environ.get("TGCLAUDE_CLOUD_ASR_TIMEOUT", "180"))
 
 
 def _backoff(attempt: int) -> float:
