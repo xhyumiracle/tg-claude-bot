@@ -821,41 +821,118 @@ async def cloud_asr_provider() -> Optional[str]:
     return _cloud_choice or None
 
 
-async def transcribe_cloud(path: str, provider: str) -> Optional[str]:
-    """Returns the transcript, or None to fall back to the local model."""
-    url, phantom, model = _CLOUD_ASR[provider]
-    out = Path(f"/tmp/tgasr-{uuid.uuid4().hex}.json")
+def _chunk_to_mp3(audio, lo: int, hi: int) -> Path:
+    """One chunk on disk. mp3 rather than wav because a 9 minute note is a
+    dozen-odd uploads and .oga is rejected outright by some of these models."""
+    import av
+
+    dest = Path(f"/tmp/tgasr-{uuid.uuid4().hex}.mp3")
+    out = av.open(str(dest), "w")
+    st = out.add_stream("libmp3lame", rate=16000)
+    st.layout = "mono"
+    fr = av.AudioFrame.from_ndarray(
+        (audio[lo:hi] * 32767).astype("int16").reshape(1, -1),
+        format="s16", layout="mono")
+    fr.rate = 16000
+    for pkt in st.encode(fr):
+        out.mux(pkt)
+    for pkt in st.encode(None):
+        out.mux(pkt)
+    out.close()
+    return dest
+
+
+async def _cloud_chunk(url: str, phantom: str, model: str,
+                       path: Path) -> Optional[dict]:
+    """One chunk, with retries. None means give up on the cloud entirely."""
+    out = Path(f"{path}.json")
     try:
-        rc, _ = await _sc(
-            "run", "--", "curl", "-sS", "--max-time", str(int(CLOUD_ASR_TIMEOUT)),
-            "-X", "POST", url,
-            "-H", f"Authorization: Bearer {phantom}",
-            "-F", f"file=@{path}",
-            "-F", f"model={model}",
-            "-F", "response_format=verbose_json",
-            # deliberately NO language= : pinning it is what makes the model
-            # drop whole sentences spoken in the other language
-            "-F", f"prompt={_CLOUD_PROMPT}",
-            "-o", str(out), timeout=CLOUD_ASR_TIMEOUT + 15)
-        if rc != 0 or not out.exists():
-            log.warning("cloud transcription call failed (rc=%s)", rc)
-            return None
-        data = json.loads(out.read_text() or "{}")
+        for attempt in range(CLOUD_ASR_TRIES):
+            rc, _ = await _sc(
+                "run", "--", "curl", "-sS", "--max-time",
+                str(int(CLOUD_ASR_TIMEOUT)), "-X", "POST", url,
+                "-H", f"Authorization: Bearer {phantom}",
+                "-F", f"file=@{path}", "-F", f"model={model}",
+                "-F", "response_format=verbose_json",
+                # deliberately NO language= : pinning it is what makes whisper
+                # drop whole sentences spoken in the other language
+                "-F", f"prompt={_CLOUD_PROMPT}",
+                "-o", str(out), timeout=CLOUD_ASR_TIMEOUT + 15)
+            if rc == 0 and out.exists():
+                data = json.loads(out.read_text() or "{}")
+                if "error" not in data:
+                    return data
+                err = str(data["error"])[:160]
+            else:
+                err = f"curl rc={rc}"
+            if attempt == CLOUD_ASR_TRIES - 1:
+                log.warning("cloud chunk failed for good: %s", err)
+                return None
+            wait = _backoff(attempt)
+            log.warning("cloud chunk failed (%s); retry %d in %.1fs",
+                        err, attempt + 1, wait)
+            await asyncio.sleep(wait)
     except Exception:
-        log.exception("cloud transcription failed; falling back to local")
+        log.exception("cloud chunk errored")
         return None
     finally:
         out.unlink(missing_ok=True)
-    if "error" in data:
-        log.warning("cloud transcription refused: %s",
-                    str(data["error"])[:200])
-        return None
-    segs = [_Seg(s.get("text", ""), float(s.get("start", 0.0)),
-                 float(s.get("end", 0.0)))
-            for s in (data.get("segments") or [])]
+    return None
+
+
+async def transcribe_cloud(path: str, provider: str) -> Optional[str]:
+    """Returns the transcript, or None to fall back to the local model.
+
+    The audio is cut into ~30s pieces and each is sent on its own. That is not
+    for parallelism (though it is faster: 12 pieces of a 6 minute note came back
+    in 7s against 24s for one call) — it is because the API's `prompt` reaches
+    only the FIRST 30s window of whatever you send it, exactly as
+    initial_prompt does locally. On clean speech whisper punctuates unaided and
+    this does not show; on a real unbroken monologue the punctuation decays to
+    nothing a minute in, which is what shipped and what the user saw. One prompt
+    per window is the same fix `hotwords` applies locally, and the local one was
+    already verified on real recordings.
+
+    Cut points land on the quietest moment near each boundary so a word is not
+    split. Measured on a 6.1 min clip: punctuation density 6.8/6.6/6.4% across
+    head/middle/tail, against 5.7/5.9/5.9% for a single call on clean TTS and
+    nothing at all on real speech.
+    """
+    from faster_whisper.audio import decode_audio
+
+    url, phantom, model = _CLOUD_ASR[provider]
+    audio = await asyncio.to_thread(decode_audio, path, sampling_rate=16000)
+    step = int(CLOUD_ASR_CHUNK_S * 16000)
+    cuts = [0]
+    while cuts[-1] + step < len(audio):
+        cuts.append(_quietest(audio, cuts[-1] + step))
+    cuts.append(len(audio))
+    files = [await asyncio.to_thread(_chunk_to_mp3, audio, cuts[i], cuts[i + 1])
+             for i in range(len(cuts) - 1)]
+    sem = asyncio.Semaphore(CLOUD_ASR_CONCURRENCY)
+
+    async def one(f: Path) -> Optional[dict]:
+        async with sem:
+            return await _cloud_chunk(url, phantom, model, f)
+
+    try:
+        results = await asyncio.gather(*(one(f) for f in files))
+    finally:
+        for f in files:
+            f.unlink(missing_ok=True)
+    if any(r is None for r in results):
+        return None            # partial transcripts are worse than none
+    segs: List[_Seg] = []
+    for i, data in enumerate(results):
+        off = cuts[i] / 16000
+        got = data.get("segments") or []
+        if got:
+            segs += [_Seg(s.get("text", ""), float(s.get("start", 0.0)) + off,
+                          float(s.get("end", 0.0)) + off) for s in got]
+        elif (data.get("text") or "").strip():
+            segs.append(_Seg(data["text"], off, cuts[i + 1] / 16000))
     if not segs:
-        text = (data.get("text") or "").strip()
-        return text or None
+        return None
     text = _join_segments(s for s in segs
                           if not _WHISPER_OUTRO_RE.match(s.text.strip()))
     paras = text.split("\n")
@@ -867,7 +944,13 @@ async def transcribe(path: str, progress=None) -> str:
     provider = await cloud_asr_provider()
     if provider:
         t0 = time.time()
-        text = await transcribe_cloud(path, provider)
+        try:
+            text = await transcribe_cloud(path, provider)
+        except Exception:
+            # the local model is always there; nothing the cloud path can throw
+            # is worth costing the user their recording
+            log.exception("cloud transcription raised; falling back to local")
+            text = None
         if text is not None:
             log.info("transcribed via %s in %.1fs", provider, time.time() - t0)
             return text
@@ -4833,6 +4916,12 @@ async def post_init(app: Application) -> None:
 _voice_retry: list = []
 VOICE_RETRY_KEEP = 20
 CLOUD_ASR_TIMEOUT = float(os.environ.get("TGCLAUDE_CLOUD_ASR_TIMEOUT", "180"))
+# One prompt reaches one 30s window, so a chunk is one window.
+CLOUD_ASR_CHUNK_S = float(os.environ.get("TGCLAUDE_CLOUD_ASR_CHUNK_S", "30"))
+# Kept low so a long note does not burst past a free tier's per-minute cap
+# (Groq's is 20 requests/min).
+CLOUD_ASR_CONCURRENCY = int(os.environ.get("TGCLAUDE_CLOUD_ASR_CONCURRENCY", "4"))
+CLOUD_ASR_TRIES = int(os.environ.get("TGCLAUDE_CLOUD_ASR_TRIES", "3"))
 
 
 def _backoff(attempt: int) -> float:
