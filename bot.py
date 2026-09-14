@@ -821,6 +821,40 @@ async def cloud_asr_provider() -> Optional[str]:
     return _cloud_choice or None
 
 
+# Long enough that ordinary speech will not collide with it: "标点符号" alone is
+# four characters and the user does discuss punctuation, but eight consecutive
+# characters shared with the prompt is the model reading it back.
+_PROMPT_ECHO_MIN = 8
+_PROMPT_ECHO_SHORT = 4
+
+
+def _strip_prompt_echo(text: str) -> str:
+    """Remove stretches the model copied out of the prompt.
+
+    Whisper answers a chunk it cannot hear by reciting whatever it was primed
+    with, and recites it recombined rather than verbatim — what reached the user
+    was "中文用逗号、句号、问号等逐字转写", the head of one clause welded to the
+    tail of another, three times over. So match against the prompt by longest
+    common run instead of by phrase, which keeps this correct if the prompt is
+    ever reworded.
+    """
+    import difflib
+
+    out, contaminated = text, False
+    for _ in range(12):         # a recitation repeats; each pass takes one run
+        m = difflib.SequenceMatcher(None, out, _CLOUD_PROMPT, autojunk=False)
+        a, _b, n = m.find_longest_match(0, len(out), 0, len(_CLOUD_PROMPT))
+        # The long run is what proves this text is a recitation. Once proved,
+        # clean the short remnants around it too — "逐字转写" left behind on its
+        # own is still the prompt, but four characters is far too low a bar to
+        # apply to a transcript that never showed any sign of contamination.
+        if n < (_PROMPT_ECHO_SHORT if contaminated else _PROMPT_ECHO_MIN):
+            return out
+        contaminated = True
+        out = (out[:a] + out[a + n:]).strip(" ，,。、")
+    return out
+
+
 def _chunk_to_mp3(audio, lo: int, hi: int) -> Path:
     """One chunk on disk. mp3 rather than wav because a 9 minute note is a
     dozen-odd uploads and .oga is rejected outright by some of these models."""
@@ -907,8 +941,19 @@ async def transcribe_cloud(path: str, provider: str) -> Optional[str]:
     while cuts[-1] + step < len(audio):
         cuts.append(_quietest(audio, cuts[-1] + step))
     cuts.append(len(audio))
+    # A chunk with nothing in it makes whisper emit boilerplate rather than
+    # nothing — the Amara subtitle credit, or the prompt read back at you. Both
+    # have been seen; the prompt echo reached the user three times in a row in
+    # the middle of a real transcript. Do not send silence in the first place.
+    live = [i for i in range(len(cuts) - 1)
+            if _peak_level(audio[cuts[i]:cuts[i + 1]]) >= _ASR_SIGNAL_FLOOR]
+    if not live:
+        return None
+    if len(live) < len(cuts) - 1:
+        log.info("skipping %d silent chunk(s) of %d",
+                 len(cuts) - 1 - len(live), len(cuts) - 1)
     files = [await asyncio.to_thread(_chunk_to_mp3, audio, cuts[i], cuts[i + 1])
-             for i in range(len(cuts) - 1)]
+             for i in live]
     sem = asyncio.Semaphore(CLOUD_ASR_CONCURRENCY)
 
     async def one(f: Path) -> Optional[dict]:
@@ -923,7 +968,7 @@ async def transcribe_cloud(path: str, provider: str) -> Optional[str]:
     if any(r is None for r in results):
         return None            # partial transcripts are worse than none
     segs: List[_Seg] = []
-    for i, data in enumerate(results):
+    for i, data in zip(live, results):
         off = cuts[i] / 16000
         got = data.get("segments") or []
         if got:
@@ -933,8 +978,10 @@ async def transcribe_cloud(path: str, provider: str) -> Optional[str]:
             segs.append(_Seg(data["text"], off, cuts[i + 1] / 16000))
     if not segs:
         return None
+    segs = [_Seg(_strip_prompt_echo(s.text), s.start, s.end) for s in segs]
     text = _join_segments(s for s in segs
-                          if not _WHISPER_OUTRO_RE.match(s.text.strip()))
+                          if s.text.strip()
+                          and not _WHISPER_OUTRO_RE.match(s.text.strip()))
     paras = text.split("\n")
     paras[-1] = _WHISPER_OUTRO_RE.sub("", paras[-1])
     return "\n".join(x for x in paras if x.strip()).strip()
