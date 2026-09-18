@@ -2139,8 +2139,10 @@ async def send_long(update: Update, text: str, anchor=None,
     `notify` only governs the push. Even silenced, a SEND still bumps the topic
     and marks it unread, which an edit never does — that difference is the
     whole reason answers go out this way."""
-    kw = {} if notify else {"disable_notification": True}
-    for chunk in _chunk_md(text):
+    for i, chunk in enumerate(_chunk_md(text)):
+        # one push per answer, not per chunk: a long reply splits into several
+        # messages and buzzing for each of them is the same answer, four times
+        kw = {} if (notify and i == 0) else {"disable_notification": True}
         rendered = _tg_html(chunk)
         if anchor is not None:
             try:
@@ -2254,17 +2256,20 @@ class LiveStatus:
         """
         async with self._lock:
             self._done = True  # from here, a late ticker update() is a no-op
+            # Order matters: the answer first, the tidying after. Both calls
+            # queue behind the same flood-control limiter, and under load
+            # whichever goes first is the one that survives — so it is never
+            # the delete. If the delete is then dropped, an orphan "Working…"
+            # line is left behind, which is cosmetic; a dropped answer is not.
+            if reply:
+                await send_long(update_obj, reply, anchor=self._resolve(),
+                                notify=notify)
             if self.msg is not None:
                 try:
                     await self.msg.delete()
                 except Exception:
-                    # deleteMessage is droppable under flood control; an orphan
-                    # "Working…" line is cosmetic, a lost answer is not
                     pass
                 self.msg = None
-            if reply:
-                await send_long(update_obj, reply, anchor=self._resolve(),
-                                notify=notify)
 
 
 def _tool_brief(block: ToolUseBlock) -> str:
