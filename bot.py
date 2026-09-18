@@ -2129,25 +2129,31 @@ def format_incoming(update: Update) -> str:
             f"{reply_context(msg)}{msg.text}")
 
 
-async def send_long(update: Update, text: str, anchor=None) -> None:
+async def send_long(update: Update, text: str, anchor=None,
+                    notify: bool = True) -> None:
     """anchor is a Message to quote, or None to send unquoted (do_quote=
     False) into the same chat/thread. `text` is Markdown; each chunk is
     rendered to Telegram HTML independently (chunking keeps fences whole so a
-    split never lands inside a tag), falling back to plain on any send error."""
+    split never lands inside a tag), falling back to plain on any send error.
+
+    `notify` only governs the push. Even silenced, a SEND still bumps the topic
+    and marks it unread, which an edit never does — that difference is the
+    whole reason answers go out this way."""
+    kw = {} if notify else {"disable_notification": True}
     for chunk in _chunk_md(text):
         rendered = _tg_html(chunk)
         if anchor is not None:
             try:
-                await anchor.reply_text(rendered, parse_mode=ParseMode.HTML)
+                await anchor.reply_text(rendered, parse_mode=ParseMode.HTML, **kw)
             except Exception:
-                await anchor.reply_text(chunk)
+                await anchor.reply_text(chunk, **kw)
         else:
             try:
                 await update.effective_message.reply_text(
-                    rendered, parse_mode=ParseMode.HTML, do_quote=False)
+                    rendered, parse_mode=ParseMode.HTML, do_quote=False, **kw)
             except Exception:
                 await update.effective_message.reply_text(
-                    chunk, do_quote=False)
+                    chunk, do_quote=False, **kw)
 
 
 # A status bubble whose create failed is not re-created on the next tick;
@@ -2231,35 +2237,34 @@ class LiveStatus:
             except Exception:
                 pass
 
-    async def finalize(self, update_obj: Update, reply: str) -> None:
+    async def finalize(self, update_obj: Update, reply: str,
+                       notify: bool = True) -> None:
+        """Deliver the segment and retire the bubble.
+
+        This used to write the answer INTO the bubble with edit_text, which is
+        how replies went missing. A Telegram edit raises no notification and
+        does not mark the topic unread, and it leaves the text wherever the
+        bubble was created rather than at the bottom of the chat — so an answer
+        delivered that way is invisible in a busy forum. It only showed up on
+        slow models because the ticker does not draw the bubble until 4s in:
+        under that, there was no bubble, finalize sent a real message, and the
+        reply arrived normally. Fable at high effort is never under 4s.
+
+        So the bubble is now always retired and the answer always sent.
+        """
         async with self._lock:
             self._done = True  # from here, a late ticker update() is a no-op
-            if self.msg is None:
-                if reply:
-                    await send_long(update_obj, reply, anchor=self._resolve())
-                return
-            if not reply:
+            if self.msg is not None:
                 try:
                     await self.msg.delete()
                 except Exception:
+                    # deleteMessage is droppable under flood control; an orphan
+                    # "Working…" line is cosmetic, a lost answer is not
                     pass
-                return
-            rendered = _tg_html(reply)
-            if len(reply) <= 4000 and len(rendered) <= 4096:
-                try:
-                    await self.msg.edit_text(rendered, parse_mode=ParseMode.HTML)
-                    return
-                except Exception:
-                    try:
-                        await self.msg.edit_text(reply)  # plain-markdown fallback
-                        return
-                    except Exception:
-                        pass
-            try:
-                await self.msg.delete()
-            except Exception:
-                pass
-            await send_long(update_obj, reply, anchor=self._resolve())
+                self.msg = None
+            if reply:
+                await send_long(update_obj, reply, anchor=self._resolve(),
+                                notify=notify)
 
 
 def _tool_brief(block: ToolUseBlock) -> str:
@@ -2471,7 +2476,10 @@ async def _pump(conv: "Conversation") -> None:
             # where we started — and under flood control the dropped delete
             # strands the old bubble above the new one.
             return
-        await status.finalize(target, seg)  # raw md; finalize renders to HTML
+        # Intermediate segments are narration mid-turn: they still land as real
+        # messages (so the topic lights up) but without a push. The segment that
+        # ends the turn is the answer, and that one buzzes.
+        await status.finalize(target, seg, notify=final)
         status = LiveStatus()
         seg_since = time.time()
 
