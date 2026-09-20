@@ -12,6 +12,7 @@ import struct
 import subprocess
 import termios
 import time
+import datetime
 import hashlib
 import uuid
 from dataclasses import dataclass, field
@@ -44,6 +45,16 @@ try:
     from claude_agent_sdk.types import StreamEvent
 except ImportError:
     class StreamEvent:  # sentinel, never matches
+        pass
+try:  # structured subagent-lifecycle events (drive the live agent map)
+    from claude_agent_sdk.types import (
+        TaskStartedMessage, TaskProgressMessage, TaskNotificationMessage)
+except ImportError:
+    class TaskStartedMessage:  # sentinels, never match
+        pass
+    class TaskProgressMessage:
+        pass
+    class TaskNotificationMessage:
         pass
 from dotenv import load_dotenv
 from telegram import (
@@ -1165,6 +1176,17 @@ class Conversation:
     bg_armed: list = field(default_factory=list)   # (time, label)
     bg_lost: list = field(default_factory=list)    # labels
     ctx_warned: int = 0
+    # cache_watcher's phase for this topic's prompt cache: "" unobserved,
+    # "warm", "cooling" (push sent), "cold" (silent breadcrumb sent). Ordered
+    # so a cold notice only ever follows a warm/cooling this process saw.
+    cache_phase: str = ""
+    # Live subagent map for the CURRENT turn, cleared on ResultMessage. Keyed
+    # by task_id, driven off the structured Task* events (start/progress/notify)
+    # so it never depends on scraping sidechain messages. agents_last keeps a
+    # one-line summary of the previous fan-out for /agents when idle.
+    agents: dict = field(default_factory=dict)
+    agents_order: list = field(default_factory=list)
+    agents_last: str = ""
     # continuous-consumer model: `pump` is the single task draining the CLI
     # stream for this conv's whole client lifetime; `pending` holds messages
     # showing a 👀 reaction that the pump clears on the next ResultMessage.
@@ -2281,6 +2303,116 @@ def _tool_brief(block: ToolUseBlock) -> str:
     return block.name
 
 
+# -------- live subagent (agent-map) rendering + breadcrumbs --------
+AGENT_BREADCRUMBS = os.environ.get("TGCLAUDE_AGENT_BREADCRUMBS", "1") == "1"
+_AGENT_ICON = {"running": "\U0001f7e2", "completed": "\u2705",
+               "failed": "\u274c", "stopped": "\u23f9"}
+
+
+def _dur(sec: float) -> str:
+    sec = int(max(0, sec))
+    return f"{sec // 60}m {sec % 60}s" if sec >= 60 else f"{sec}s"
+
+
+def _render_agent_map(conv: "Conversation") -> str:
+    ags = [conv.agents[i] for i in conv.agents_order if i in conv.agents]
+    if not ags:
+        return ""
+    run = sum(1 for a in ags if a["status"] == "running")
+    done = len(ags) - run
+    lines = [f"\U0001f5fa Agents \u00b7 {run} running \u00b7 {done} done"]
+    for a in ags[:12]:
+        dur = a["dur_ms"] / 1000 if a["dur_ms"] else (time.time() - a["start"])
+        seg = f"{_AGENT_ICON.get(a['status'], '\U0001f7e2')} {a['desc'][:46]}  {_dur(dur)}"
+        if a["tools"]:
+            seg += f" \u00b7 {a['tools']}\U0001f527"
+        if a["tokens"]:
+            seg += f" \u00b7 {a['tokens'] // 1000}k"
+        lines.append(seg)
+    if len(ags) > 12:
+        lines.append(f"\u2026+{len(ags) - 12} more")
+    return "\n".join(lines)
+
+
+async def _agent_breadcrumb(conv: "Conversation", text: str) -> None:
+    """A persistent, silent line in the topic (the scroll-back timeline of the
+    fan-out). Never touches the CLI."""
+    if app_ref is None:
+        return
+    try:
+        await app_ref.bot.send_message(
+            conv.key[0], text, disable_notification=True,
+            **({"message_thread_id": conv.key[1]} if conv.key[1] else {}))
+    except Exception:
+        log.exception("agent breadcrumb failed for %s", conv.key)
+
+
+def _agent_tid(m) -> str:
+    return getattr(m, "task_id", None) or getattr(m, "tool_use_id", None) or ""
+
+
+async def _agent_started(conv: "Conversation", m) -> None:
+    tid = _agent_tid(m)
+    if not tid:
+        return
+    if tid not in conv.agents:
+        conv.agents_order.append(tid)
+    desc = (getattr(m, "description", "") or "subagent").strip() or "subagent"
+    conv.agents[tid] = {"desc": desc, "start": time.time(), "tools": 0,
+                        "tokens": 0, "dur_ms": 0, "status": "running",
+                        "summary": ""}
+    if AGENT_BREADCRUMBS:
+        await _agent_breadcrumb(conv, f"\U0001f916 subagent \u8d77: {desc[:80]}")
+
+
+def _agent_apply_usage(a: dict, m) -> None:
+    u = getattr(m, "usage", None) or {}
+    if u.get("total_tokens"):
+        a["tokens"] = u["total_tokens"]
+    if u.get("tool_uses"):
+        a["tools"] = u["tool_uses"]
+    if u.get("duration_ms"):
+        a["dur_ms"] = u["duration_ms"]
+
+
+def _agent_progress(conv: "Conversation", m) -> None:
+    a = conv.agents.get(_agent_tid(m))
+    if a is None:
+        return
+    _agent_apply_usage(a, m)
+    lt = getattr(m, "last_tool_name", None)
+    if lt:
+        a["last_tool"] = lt
+
+
+async def _agent_finished(conv: "Conversation", m) -> None:
+    tid = _agent_tid(m)
+    a = conv.agents.get(tid)
+    if a is None:  # a notify with no start we saw: synthesize a row
+        if not tid:
+            return
+        conv.agents_order.append(tid)
+        a = conv.agents[tid] = {"desc": (getattr(m, "description", "")
+                                or "subagent").strip() or "subagent",
+                                "start": time.time(), "tools": 0, "tokens": 0,
+                                "dur_ms": 0, "status": "running", "summary": ""}
+    a["status"] = getattr(m, "status", "completed") or "completed"
+    _agent_apply_usage(a, m)
+    a["summary"] = (getattr(m, "summary", "") or "").strip()
+    if AGENT_BREADCRUMBS:
+        icon = _AGENT_ICON.get(a["status"], "\u2705")
+        dur = a["dur_ms"] / 1000 if a["dur_ms"] else (time.time() - a["start"])
+        bits = [f"{icon} {a['desc'][:80]} \u00b7 {_dur(dur)}"]
+        if a["tools"]:
+            bits.append(f"{a['tools']}\U0001f527")
+        if a["tokens"]:
+            bits.append(f"{a['tokens'] // 1000}k tok")
+        line = " \u00b7 ".join(bits)
+        if a["summary"]:
+            line += "\n" + a["summary"][:400]
+        await _agent_breadcrumb(conv, line)
+
+
 def _preview_tail(s: str, n: int = 160) -> str:
     """Single-line tail of a live stream (the answer text) for the bubble."""
     s = " ".join(s.split())
@@ -2380,6 +2512,81 @@ def _session_context_tokens(sid: Optional[str]) -> int:
             if total > 0:  # skip synthetic zero-usage records
                 return total
     return 0
+
+
+# TTL the CLI writes prompt-cache entries with. Verified from the transcript:
+# every usage record carries cache_creation.ephemeral_1h_input_tokens (5m=0),
+# i.e. a 1-hour cache. We read the actual breakdown per session rather than
+# assume it, so a session that drops to the 5-minute tier (usage overage) is
+# tracked honestly; the default only applies when no breakdown is recorded.
+CACHE_TTL_DEFAULT_S = int(os.environ.get("TGCLAUDE_CACHE_TTL_S", "3600"))
+
+
+def _session_cache_state(sid: Optional[str]):
+    """(last_activity_epoch, ttl_seconds, context_tokens) for a session from its
+    transcript tail, or (0.0, 0, 0) if unknown.
+
+    The prompt cache lives on Anthropic's servers keyed by the conversation
+    content, not by this bot process, and every turn refreshes its TTL. So the
+    authoritative "when does it go cold" anchor is the timestamp of the last API
+    call in the transcript (restart-proof), and the TTL is whichever tier that
+    call actually wrote (ephemeral_1h vs ephemeral_5m)."""
+    if not sid:
+        return (0.0, 0, 0)
+    for f in PROJECTS_ROOT.glob(f"*/{sid}.jsonl"):
+        try:
+            with f.open("rb") as fh:
+                try:
+                    fh.seek(-262144, os.SEEK_END)
+                except OSError:
+                    fh.seek(0)
+                tail = fh.read().decode("utf-8", errors="ignore")
+        except OSError:
+            return (0.0, 0, 0)
+        for line in reversed(tail.splitlines()):
+            if '"usage"' not in line:
+                continue
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            u = (o.get("message") or {}).get("usage") or {}
+            if u.get("input_tokens") is None:
+                continue
+            total = ((u.get("input_tokens") or 0)
+                     + (u.get("cache_read_input_tokens") or 0)
+                     + (u.get("cache_creation_input_tokens") or 0))
+            if total <= 0:  # skip synthetic zero-usage records
+                continue
+            cc = u.get("cache_creation") or {}
+            if cc.get("ephemeral_1h_input_tokens"):
+                ttl = 3600
+            elif cc.get("ephemeral_5m_input_tokens"):
+                ttl = 300
+            else:
+                ttl = CACHE_TTL_DEFAULT_S
+            try:
+                epoch = datetime.datetime.fromisoformat(
+                    (o.get("timestamp") or "").replace("Z", "+00:00")).timestamp()
+            except Exception:
+                epoch = 0.0
+            return (epoch, ttl, total)
+    return (0.0, 0, 0)
+
+
+def _fmt_warm(sid: Optional[str]) -> str:
+    """One-line prompt-cache warmth readout for /status and /warm."""
+    last_ts, ttl, total = _session_cache_state(sid)
+    if not last_ts or not total:
+        return "🌡 Cache: nothing cached yet"
+    remaining = ttl - (time.time() - last_ts)
+    ctx = f"{total // 1000}k ctx"
+    if remaining > 0:
+        m = max(1, round(remaining / 60))
+        icon = "🔥" if remaining > 600 else "⏳"
+        return f"{icon} Cache warm ~{m}m left (of {ttl // 60}m) · {ctx}"
+    cold = round(-remaining / 60)
+    return f"❄️ Cache cold, lapsed ~{cold}m ago · {ctx}; next message pays full price"
 
 
 async def check_context_usage(update: Update, conv: Conversation) -> None:
@@ -2512,6 +2719,10 @@ async def _pump(conv: "Conversation") -> None:
             # Sit out a grace window instead: a segment that finishes inside it
             # is delivered by finalize() as one message, no bubble involved.
             return False
+        # While subagents are running, the live bubble IS the agent map.
+        if any(a["status"] == "running" for a in conv.agents.values()):
+            await status.update(target, _render_agent_map(conv))
+            return True
         spin_i += 1
         eff = f" · {conv.effort}" if conv.effort else ""
         line = f"{_SPIN[spin_i % len(_SPIN)]} {head} ({int(elapsed)}s{eff})"
@@ -2562,6 +2773,13 @@ async def _pump(conv: "Conversation") -> None:
         while conv.client is not None:
             try:
                 async for m in conv.client.receive_messages():
+                    # Sidechain (subagent) messages carry the spawning Agent
+                    # tool_use id. They must never reach the reply buffer, the
+                    # ticker, or conv.session_id (their session_id is the
+                    # subagent's). The live map is driven off the structured
+                    # Task* events below, so drop the raw sidechain here.
+                    if getattr(m, "parent_tool_use_id", None):
+                        continue
                     sid = getattr(m, "session_id", None)
                     if sid and sid != conv.session_id:
                         conv.session_id = sid
@@ -2633,6 +2851,16 @@ async def _pump(conv: "Conversation") -> None:
                         n_tools = 0
                         seg_since = 0.0  # next turn's first bubble: no grace
                         head, detail, txt, think_tokens = "Working…", "", "", 0
+                        if conv.agents:
+                            ags = list(conv.agents.values())
+                            done = sum(1 for a in ags
+                                       if a["status"] != "running")
+                            tok = sum(a["tokens"] for a in ags)
+                            conv.agents_last = (
+                                f"\U0001f5fa Last fan-out: {len(ags)} agents "
+                                f"\u00b7 {done} done \u00b7 ~{tok // 1000}k tok")
+                            conv.agents.clear()
+                            conv.agents_order.clear()
                         # a turn finished: clear the 👀 markers + inflight for
                         # every outstanding message (coarse — anchor next step)
                         pend = conv.pending[:]
@@ -2656,6 +2884,12 @@ async def _pump(conv: "Conversation") -> None:
                             except Exception:
                                 log.exception("compact-hold release for %s",
                                               conv.key)
+                    elif isinstance(m, TaskStartedMessage):
+                        await _agent_started(conv, m)
+                    elif isinstance(m, TaskProgressMessage):
+                        _agent_progress(conv, m)
+                    elif isinstance(m, TaskNotificationMessage):
+                        await _agent_finished(conv, m)
                     elif (isinstance(m, SystemMessage)
                           and getattr(m, "subtype", "") == "compact_boundary"):
                         # the CLI's structured compaction-done signal (carries
@@ -3959,6 +4193,31 @@ async def cmd_stop(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text(f"Interrupt failed: {e}")
 
 
+async def cmd_agents(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    """The live agent map for this topic (running subagents), or the last
+    fan-out summary when idle. Pure read."""
+    if not chat_allowed(update):
+        return
+    conv = get_conv(update)
+    if conv.agents:
+        await update.effective_message.reply_text(_render_agent_map(conv))
+    elif conv.agents_last:
+        await update.effective_message.reply_text(conv.agents_last)
+    else:
+        await update.effective_message.reply_text(
+            "\U0001f5fa No subagents in this topic\u2019s current/last turn.")
+
+
+async def cmd_cache(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    """Prompt-cache warmth for this topic: how long until it lapses (and the
+    next message pays full price). Pure read — never touches the CLI."""
+    if not chat_allowed(update):
+        return
+    conv = get_conv(update)
+    line = await asyncio.to_thread(_fmt_warm, conv.session_id)
+    await update.effective_message.reply_text(line)
+
+
 async def cmd_status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     if not chat_allowed(update):
         return
@@ -4025,6 +4284,11 @@ async def cmd_status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     if not total and conv.pending:
         cline += " · first turn in progress"
     lines.append(cline)
+    lines.append(await asyncio.to_thread(_fmt_warm, conv.session_id))
+    if conv.agents:
+        _run = sum(1 for a in conv.agents.values() if a["status"] == "running")
+        lines.append(f"\U0001f5fa {_run} agents running \u00b7 "
+                     f"{len(conv.agents) - _run} done (/agents)")
     if conv.pending:
         lines.append(f"⏳ {len(conv.pending)} message(s) being worked on")
     await update.effective_message.reply_text("\n".join(lines))
@@ -4534,6 +4798,10 @@ WAKEUP_GRACE_S = 60.0
 # says nothing about whether the loop is worth continuing.
 WAKEUP_BACKSTOP = os.environ.get("TGCLAUDE_WAKEUP_BACKSTOP", "1") == "1"
 WAKEUP_BUDGET = int(os.environ.get("TGCLAUDE_WAKEUP_BUDGET", "3"))
+CACHE_WARN = os.environ.get("TGCLAUDE_CACHE_WARN", "1") == "1"
+CACHE_WARN_LEAD_S = int(os.environ.get("TGCLAUDE_CACHE_WARN_LEAD_S", "600"))
+CACHE_WARN_MIN_TOKENS = int(os.environ.get("TGCLAUDE_CACHE_WARN_MIN_TOKENS", "50000"))
+CACHE_WATCH_INTERVAL_S = int(os.environ.get("TGCLAUDE_CACHE_WATCH_INTERVAL_S", "45"))
 def wakeup_grace(delay_s: float) -> float:
     """Constant: the CLI's own slippage is minute-quantisation, not a fraction
     of the delay, so it does not grow with the delay."""
@@ -4682,6 +4950,88 @@ async def wakeup_watcher(app: Application) -> None:
                            "the CLI's own timer did not fire. /esc to stop.")
             except Exception:
                 log.exception("wakeup backstop failed for %s", conv.key)
+
+
+async def _cache_notice(app, conv: "Conversation", text: str,
+                        notify: bool) -> None:
+    """Send a prompt-cache notice into the topic. notify=True is the actionable
+    cooling push; notify=False is the silent went-cold breadcrumb the user asked
+    for (visible on scroll-back, no ping). Never touches the CLI."""
+    if app is None:
+        return
+    try:
+        await app.bot.send_message(
+            conv.key[0], text, disable_notification=not notify,
+            **({"message_thread_id": conv.key[1]} if conv.key[1] else {}))
+    except Exception:
+        log.exception("cache notice failed for %s", conv.key)
+
+
+async def cache_watcher(app: Application) -> None:
+    """Prompt-cache warmth reminder — the money-side twin of the context
+    warning. The cache (Anthropic-side, keyed by the conversation content, 1h
+    TTL) refreshes on every turn; once it lapses the next message re-writes the
+    whole prefix at full input price instead of the ~1/10 cache-read rate, and
+    for a near-full context that is the single most expensive thing that can
+    happen. So: one push shortly before it lapses (the actionable moment), then
+    one silent breadcrumb once it is cold (a marker to scroll back to), and let
+    the user decide.
+
+    Unlike the wakeup backstop this NEVER touches the CLI: it only reads the
+    transcript and sends a Telegram notice, so it cannot cost a token. That is
+    deliberate — re-warming a cold cache is the user's call to make (send
+    something, or let it die), never ours to make automatically on their bill.
+    """
+    if not CACHE_WARN:
+        log.info("cache-warm reminder disabled (TGCLAUDE_CACHE_WARN=1 enables)")
+        return
+    while True:
+        await asyncio.sleep(CACHE_WATCH_INTERVAL_S)
+        now = time.time()
+        for conv in list(conversations.values()):
+            if not conv.session_id:
+                continue
+            # mid-turn, or a /loop is driving this topic: warmth is being (or
+            # will be) refreshed, so treat it as warm and re-arm.
+            if conv.working_since is not None or conv.pending or conv.wake_at:
+                conv.cache_phase = "warm"
+                continue
+            try:
+                last_ts, ttl, total = await asyncio.to_thread(
+                    _session_cache_state, conv.session_id)
+            except Exception:
+                continue
+            # below the floor a cold miss is too cheap to be worth a word;
+            # forget it so a later grown session starts observing cleanly.
+            if not last_ts or total < CACHE_WARN_MIN_TOKENS:
+                conv.cache_phase = ""
+                continue
+            remaining = ttl - (now - last_ts)
+            ctx = total // 1000
+            if remaining > CACHE_WARN_LEAD_S:
+                conv.cache_phase = "warm"   # re-armed for the next cooldown
+                continue
+            if remaining > 0:
+                # still warm but cooling: one push, the actionable moment.
+                if conv.cache_phase not in ("cooling", "cold"):
+                    conv.cache_phase = "cooling"
+                    mins = max(1, round(remaining / 60))
+                    await _cache_notice(
+                        app, conv,
+                        f"⏳ Cache cools in ~{mins}m ({ctx}k ctx).",
+                        notify=True)
+                continue
+            # Cold. Speak only if we watched it go cold in this process
+            # (phase warm/cooling) — never for a session already stale at
+            # startup — and silently, per the user's ask: a breadcrumb, not
+            # a ping.
+            if conv.cache_phase in ("warm", "cooling"):
+                cold = round(-remaining / 60)
+                await _cache_notice(
+                    app, conv,
+                    f"❄️ Cache went cold ~{cold}m ago ({ctx}k ctx); next message pays full price.",
+                    notify=False)
+            conv.cache_phase = "cold"
 
 
 async def restart_watcher(app: Application) -> None:
@@ -4854,6 +5204,39 @@ async def _recover_conv(app: Application, key: ConvKey, ent: dict) -> None:
             pass
 
 
+def _rehydrate_bound_convs() -> int:
+    """Pre-build Conversation objects for every surviving bound topic so the
+    background watchers (prompt-cache warmth, wakeups) cover them the moment we
+    come back up, not only once a topic is next touched. Without this, a topic
+    that was warm before a restart and left alone after it silently goes cold
+    with no cooling ping, because cache_watcher only iterates live convs.
+
+    Safe and free: a Conversation is a dataclass; building it starts no CLI
+    process and spends no tokens (the client is still created lazily on the
+    first real message). Runs AFTER the dead-binding GC, so every binding here
+    already resolves to a real session; runs BEFORE crash recovery, which does
+    conversations.get(key) first and therefore reuses these."""
+    n = 0
+    for skey in list(_state.get("bindings", {})):
+        chat_s, _, thread_s = skey.partition(":")
+        try:
+            key = (int(chat_s), int(thread_s or 0))
+        except ValueError:
+            continue
+        if key in conversations:
+            continue
+        prof = profile_for(*key)
+        cwd = OWNER_DEFAULT_CWD if prof == "owner" else str(PLAYGROUND_DIR)
+        conv = Conversation(key=key, profile=prof, cwd=cwd)
+        stored = stored_binding(key)
+        if stored:
+            apply_binding(conv, stored)
+        conv.fresh = False
+        conversations[key] = conv
+        n += 1
+    return n
+
+
 async def _reconcile_state(app: Application) -> None:
     """Restart = reconcile from disk. Clean restarts (strict idle gate) leave
     nothing to do and stay silent. After an unclean death: clear in-progress
@@ -4871,6 +5254,10 @@ async def _reconcile_state(app: Application) -> None:
     legacy = _state.pop("reactions", None) or []  # pre-consolidation schema
     zombie_prompts = _state.pop("prompts", {})
     _state_save()
+    n_rehydrated = _rehydrate_bound_convs()
+    if n_rehydrated:
+        log.info("rehydrated %d bound topic(s) for background watchers",
+                 n_rehydrated)
     for chat_id, msg_id in zombie_prompts.values():
         try:  # dead process's button prompts: rewrite so they can't mislead
             await app.bot.edit_message_text(
@@ -4916,6 +5303,8 @@ async def post_init(app: Application) -> None:
         BotCommand("export", "Send this session's transcript file"),
         BotCommand("compact", "Clear history but keep a summary in context"),
         BotCommand("context", "Show current context usage"),
+        BotCommand("cache", "Prompt-cache warmth (time until it lapses)"),
+        BotCommand("agents", "Live subagent map for this topic"),
         BotCommand("cost", "Show session cost"),
         BotCommand("usage", "Subscription usage (5h / weekly / credits)"),
         BotCommand("ccusage", "Token stats from local logs (ccusage)"),
@@ -4948,6 +5337,7 @@ async def post_init(app: Application) -> None:
         log.exception("failed to register command menu")
     app.create_task(restart_watcher(app))
     app.create_task(wakeup_watcher(app))
+    app.create_task(cache_watcher(app))
     app.create_task(refresh_effort_choices(app))
     # transform the pre-restart notice in place; only send a new message on cold boot
     edited = False
@@ -5549,6 +5939,8 @@ def main() -> None:
     app.add_handler(CommandHandler("project", cmd_project, filters=~filters.FORWARDED))
     app.add_handler(CommandHandler("sessions", cmd_resume, filters=~filters.FORWARDED))
     app.add_handler(CommandHandler("status", cmd_status, filters=~filters.FORWARDED))
+    app.add_handler(CommandHandler("cache", cmd_cache, filters=~filters.FORWARDED))
+    app.add_handler(CommandHandler("agents", cmd_agents, filters=~filters.FORWARDED))
     app.add_handler(CommandHandler("stop", cmd_stop, filters=~filters.FORWARDED))
     app.add_handler(CommandHandler("esc", cmd_stop, filters=~filters.FORWARDED))
     app.add_handler(CommandHandler("model", cmd_model, filters=~filters.FORWARDED))
